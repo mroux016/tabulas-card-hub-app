@@ -1,0 +1,1 @@
+# Core package for Card Inventory & Tabulas Hub

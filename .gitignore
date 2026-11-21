@@ -1,0 +1,18 @@
+# Python bytecode & caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Tabulas local runtime & backup artifacts
+Runtime/
+.desktop_app_profile/
+Core/.verified_backups/
+Core/downloaded_files/
+
+# Temporary & OS files
+*.tmp
+*.log
+*.bak
+Thumbs.db
+.DS_Store
