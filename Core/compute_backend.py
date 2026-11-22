@@ -39,6 +39,8 @@ DEFAULT_COMPUTE_SETTINGS = {
     "enable_ocr_gpu": True,
     "enable_opencl_cv": True,
     "enable_neural_embeddings": True,
+    "enable_multiregion_neural": True,
+    "neural_batch_size": 32,
     "max_concurrent_gpu_workers": 2,
     "phase_b_shared_inference_server": False,
     "phase_b_endpoint_url": "http://127.0.0.1:5055",
@@ -88,6 +90,11 @@ def load_compute_settings() -> dict:
     out["enable_ocr_gpu"] = bool(out.get("enable_ocr_gpu", True))
     out["enable_opencl_cv"] = bool(out.get("enable_opencl_cv", True))
     out["enable_neural_embeddings"] = bool(out.get("enable_neural_embeddings", True))
+    out["enable_multiregion_neural"] = bool(out.get("enable_multiregion_neural", True))
+    try:
+        out["neural_batch_size"] = max(4, min(64, int(out.get("neural_batch_size", 32))))
+    except Exception:
+        out["neural_batch_size"] = 32
     try:
         out["preferred_gpu_device_id"] = max(-1, min(15, int(out.get("preferred_gpu_device_id", -1))))
     except Exception:
@@ -118,6 +125,11 @@ def save_compute_settings(updates: dict) -> dict:
         curr["enable_ocr_gpu"] = bool(curr.get("enable_ocr_gpu", True))
         curr["enable_opencl_cv"] = bool(curr.get("enable_opencl_cv", True))
         curr["enable_neural_embeddings"] = bool(curr.get("enable_neural_embeddings", True))
+        curr["enable_multiregion_neural"] = bool(curr.get("enable_multiregion_neural", True))
+        try:
+            curr["neural_batch_size"] = max(4, min(64, int(curr.get("neural_batch_size", 32))))
+        except Exception:
+            curr["neural_batch_size"] = 32
         curr["max_concurrent_gpu_workers"] = max(1, min(8, int(curr.get("max_concurrent_gpu_workers", 2))))
         try:
             atomic_write_text(COMPUTE_SETTINGS_FILE, json.dumps(curr, indent=2), encoding="utf-8")
@@ -583,6 +595,32 @@ def resolve_target_onnx_provider(
     if oi.get("has_directml"):
         return "DmlExecutionProvider"
     return "CPUExecutionProvider"
+
+
+def get_recommended_neural_batch_size(settings: Optional[dict] = None) -> int:
+    """
+    Returns the recommended micro-batch size for Win #2 neural inference:
+      - Honors user's `neural_batch_size` (default 32 for 16 GB RX 9070 XT).
+      - Caps at 8 when running on CPUExecutionProvider.
+      - Caps at 16 when target GPU reports 0 < vram_gb < 8.0.
+    """
+    cfg = settings or load_compute_settings()
+    try:
+        bs = int(cfg.get("neural_batch_size", 32))
+    except Exception:
+        bs = 32
+    prov = resolve_target_onnx_provider(cfg, purpose="neural")
+    if prov == "CPUExecutionProvider":
+        bs = min(bs, 8)
+    else:
+        try:
+            _, dev_info = resolve_target_gpu_device(cfg)
+            vram_gb = float(dev_info.get("vram_gb", 0.0) or 0.0)
+            if 0.0 < vram_gb < 8.0:
+                bs = min(bs, 16)
+        except Exception:
+            pass
+    return max(4, min(64, bs))
 
 
 def probe_system_hardware(force_refresh: bool = False) -> dict:
@@ -1111,10 +1149,10 @@ def run_compute_benchmark() -> dict:
     except Exception as e:
         results["notes"].append(f"RapidOCR benchmark note: {e}")
 
-    # 3. Win #2 Benchmark: DINOv2-small Batch-16 Deep Visual Embeddings (DirectML / CUDA vs CPU)
+    # 3. Win #2 Benchmark: DINOv2-small Deep Visual Embeddings (DirectML / CUDA vs CPU)
     try:
         from Core.neural_vision import benchmark_dinov2_gpu_vs_cpu
-        results["dinov2"] = benchmark_dinov2_gpu_vs_cpu(batch_size=16)
+        results["dinov2"] = benchmark_dinov2_gpu_vs_cpu(batch_size=get_recommended_neural_batch_size())
     except Exception as e:
         results["dinov2"] = {"installed": False, "note": str(e)}
 

@@ -24,8 +24,12 @@ from Core.neural_vision import (
     calibrate_neural_cosine_to_card_sim,
     flush_neural_embeddings_if_dirty,
     get_neural_embedding_engine,
+    get_or_compute_image_descriptor,
     get_or_compute_image_embedding,
     is_neural_embeddings_enabled,
+    precompute_batch_image_descriptors,
+    score_multiregion_parallel_pair,
+    score_parallel_group_vectorized,
     search_set_neural_embeddings,
 )
 
@@ -37,9 +41,11 @@ def _compute_hybrid_neural_sim(
     ref_crop_rgb: Optional[np.ndarray] = None,
     scan_emb: Optional[np.ndarray] = None,
     neural_weight: float = 0.55,
+    scan_desc: Optional[dict] = None,
+    match_mode: str = "identity",
 ) -> tuple[float, Optional[np.ndarray]]:
     """
-    Blends DINOv2-small semantic cosine similarity (`neural_weight`) with Classical ZNCC/SSIM/LAB
+    Blends DINOv2-small semantic/multi-region similarity (`neural_weight`) with Classical ZNCC/SSIM/LAB
     (`1 - neural_weight`) whenever DINOv2 is installed & enabled. Falls back cleanly to
     `classical_sim` with zero overhead when DINOv2 is not installed.
     """
@@ -49,20 +55,31 @@ def _compute_hybrid_neural_sim(
         eng = get_neural_embedding_engine(load_now=True)
         if eng is None or not eng.is_ready:
             return classical_sim, scan_emb
-        q_emb = scan_emb if scan_emb is not None else eng.extract_embedding(scan_crop_rgb)
-        if q_emb is None:
-            return classical_sim, None
 
-        r_emb = None
+        q_desc = scan_desc
+        if q_desc is None and scan_emb is not None:
+            q_desc = {"vec": scan_emb}
+        if q_desc is None:
+            q_desc = eng.extract_descriptor(scan_crop_rgb, include_color_foil=(match_mode != "identity"))
+        if not isinstance(q_desc, dict) or q_desc.get("vec") is None:
+            return classical_sim, None
+        q_emb = q_desc["vec"]
+
+        r_desc = None
         if ref_path:
-            r_emb = get_or_compute_image_embedding(ref_path)
-        if r_emb is None and ref_crop_rgb is not None:
-            r_emb = eng.extract_embedding(ref_crop_rgb)
-        if r_emb is None:
+            r_desc = get_or_compute_image_descriptor(ref_path, require_multiregion=(match_mode != "identity"))
+        if r_desc is None and ref_crop_rgb is not None:
+            r_desc = eng.extract_descriptor(ref_crop_rgb, include_color_foil=(match_mode != "identity"))
+        if not isinstance(r_desc, dict) or r_desc.get("vec") is None:
             return classical_sim, q_emb
 
-        raw_cos = float(np.dot(q_emb, r_emb))
-        n_sim = calibrate_neural_cosine_to_card_sim(raw_cos)
+        if match_mode != "identity" or (q_desc.get("center_vec") is not None and r_desc.get("center_vec") is not None):
+            mr_res = score_multiregion_parallel_pair(q_desc, r_desc, mode=match_mode)
+            n_sim = float(mr_res["score"])
+        else:
+            raw_cos = float(np.dot(q_emb, r_desc["vec"]))
+            n_sim = calibrate_neural_cosine_to_card_sim(raw_cos)
+
         blended = float(neural_weight) * n_sim + (1.0 - float(neural_weight)) * float(classical_sim)
         return round(float(np.clip(blended, 0.0, 1.0)), 4), q_emb
     except Exception:
@@ -2356,6 +2373,8 @@ def _verify_candidate_whole_image(
     template_catalog: dict,
     reviewed_by_card: dict,
     batch_visual_memory: Optional[dict] = None,
+    scan_front_desc: Optional[dict] = None,
+    scan_back_desc: Optional[dict] = None,
 ) -> dict:
     """
     Tier 2 Direct Whole-Image Confirmation:
@@ -2426,8 +2445,13 @@ def _verify_candidate_whole_image(
         except Exception:
             pass
 
-    q_front_neural_emb = None
-    q_back_neural_emb = None
+    q_front_neural_emb = scan_front_desc.get("vec") if isinstance(scan_front_desc, dict) else None
+    q_back_neural_emb = scan_back_desc.get("vec") if isinstance(scan_back_desc, dict) else None
+    if candidate_pairs and is_neural_embeddings_enabled():
+        batch_paths = [p for fp_s, bp_s, _ in candidate_pairs[:4] for p in (fp_s, bp_s) if p]
+        if batch_paths:
+            precompute_batch_image_descriptors(batch_paths, require_multiregion=False)
+
     for fp_s, bp_s, src_lbl in candidate_pairs[:4]:
         if not fp_s or not Path(fp_s).exists():
             continue
@@ -2436,7 +2460,7 @@ def _verify_candidate_whole_image(
                 tf_arr = np.array(tf_im.convert("RGB"))
             f_sim_cls = _compute_single_side_whole_image_similarity(scan_front_crop, tf_arr)
             f_sim, q_front_neural_emb = _compute_hybrid_neural_sim(
-                scan_front_crop, f_sim_cls, ref_path=fp_s, ref_crop_rgb=tf_arr, scan_emb=q_front_neural_emb, neural_weight=0.55
+                scan_front_crop, f_sim_cls, ref_path=fp_s, ref_crop_rgb=tf_arr, scan_emb=q_front_neural_emb, neural_weight=0.55, scan_desc=scan_front_desc, match_mode="identity"
             )
             b_sim = None
             if scan_back_crop is not None and bp_s and Path(bp_s).exists():
@@ -2444,7 +2468,7 @@ def _verify_candidate_whole_image(
                     tb_arr = np.array(tb_im.convert("RGB"))
                 b_sim_cls = _compute_single_side_whole_image_similarity(scan_back_crop, tb_arr)
                 b_sim, q_back_neural_emb = _compute_hybrid_neural_sim(
-                    scan_back_crop, b_sim_cls, ref_path=bp_s, ref_crop_rgb=tb_arr, scan_emb=q_back_neural_emb, neural_weight=0.50
+                    scan_back_crop, b_sim_cls, ref_path=bp_s, ref_crop_rgb=tb_arr, scan_emb=q_back_neural_emb, neural_weight=0.50, scan_desc=scan_back_desc, match_mode="identity"
                 )
             comb = ((0.45 * f_sim + 0.55 * b_sim) if is_back_diff else (0.65 * f_sim + 0.35 * b_sim)) if b_sim is not None else f_sim
             if not best["has_ref"] or comb > best["sim"]:
@@ -2476,6 +2500,7 @@ def _search_set_visually(
     reviewed_by_card: dict,
     batch_visual_memory: Optional[dict] = None,
     log_cb: Optional[Callable[[str], None]] = None,
+    scan_front_desc: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Tier 4 Full-Set Visual Search:
@@ -2604,12 +2629,15 @@ def _search_set_visually(
             break
 
     # 4. Instant (<2ms) Full-Set DINOv2 Semantic Vector Search across ALL indexed cards in the set (no 1,200 cap!)
-    q_t4_neural_emb = None
+    q_t4_neural_desc = scan_front_desc
+    q_t4_neural_emb = q_t4_neural_desc.get("vec") if isinstance(q_t4_neural_desc, dict) else None
     if is_neural_embeddings_enabled():
         try:
             eng_n = get_neural_embedding_engine(load_now=True)
             if eng_n is not None and eng_n.is_ready:
-                q_t4_neural_emb = eng_n.extract_embedding(scan_front_crop)
+                if q_t4_neural_desc is None:
+                    q_t4_neural_desc = eng_n.extract_descriptor(scan_front_crop, include_color_foil=False)
+                    q_t4_neural_emb = q_t4_neural_desc.get("vec") if isinstance(q_t4_neural_desc, dict) else None
                 if q_t4_neural_emb is not None:
                     n_hits = search_set_neural_embeddings(q_t4_neural_emb, set_name=set_name, side="F", top_k=10)
                     for n_cos, n_meta in n_hits:
@@ -2641,6 +2669,11 @@ def _search_set_visually(
         if len(top_unique) >= 6:
             break
 
+    if top_unique and is_neural_embeddings_enabled():
+        t4_ref_paths = [str(it.get("front_path") or "") for it in top_unique if it.get("front_path")]
+        if t4_ref_paths:
+            precompute_batch_image_descriptors(t4_ref_paths, require_multiregion=False)
+
     stage2_scored: list[tuple[float, dict]] = []
     for item in top_unique:
         try:
@@ -2652,7 +2685,7 @@ def _search_set_visually(
                 continue
             f_sim_cls = _compute_single_side_whole_image_similarity(scan_front_crop, tf_arr)
             f_sim, q_t4_neural_emb = _compute_hybrid_neural_sim(
-                scan_front_crop, f_sim_cls, ref_path=item.get("front_path"), ref_crop_rgb=tf_arr, scan_emb=q_t4_neural_emb, neural_weight=0.58
+                scan_front_crop, f_sim_cls, ref_path=item.get("front_path"), ref_crop_rgb=tf_arr, scan_emb=q_t4_neural_emb, neural_weight=0.58, scan_desc=q_t4_neural_desc, match_mode="identity"
             )
             b_sim = None
             tb_arr = item.get("back_rgb")
@@ -2745,6 +2778,7 @@ def verify_and_correct_parallel_match(
     detected_serial_denom: Optional[str] = None,
     card_attributes: str = "",
     cmp_hint_subset: str = "",
+    scan_front_desc: Optional[dict] = None,
 ) -> dict:
     """
     Mandatory Visual Validation & Self-Correction Tournament for Parallels, Golden Mirrors,
@@ -2761,6 +2795,21 @@ def verify_and_correct_parallel_match(
     fx1, fy1, fx2, fy2 = front_box
     scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
     q_border_sig = _compute_border_foil_signature(scan_front_crop)
+    q_par_desc = scan_front_desc
+    if q_par_desc is None and is_neural_embeddings_enabled():
+        try:
+            eng_par = get_neural_embedding_engine(load_now=True)
+            if eng_par is not None and eng_par.is_ready:
+                q_par_desc = eng_par.extract_descriptor(scan_front_crop, include_color_foil=True)
+        except Exception:
+            q_par_desc = None
+    elif isinstance(q_par_desc, dict) and q_par_desc.get("color_foil_vec") is None and is_neural_embeddings_enabled():
+        try:
+            from Core.neural_vision import extract_color_foil_descriptor
+            q_par_desc = dict(q_par_desc)
+            q_par_desc["color_foil_vec"] = extract_color_foil_descriptor(scan_front_crop)
+        except Exception:
+            pass
 
     scan_back_crop = None
     gold_back_score = 0.0
@@ -2906,6 +2955,14 @@ def verify_and_correct_parallel_match(
         if not exact_pairs and not exemplar_front_paths:
             continue
 
+        if q_par_desc is not None and is_neural_embeddings_enabled():
+            par_batch_paths = [fp_s for fp_s, _ in exact_pairs[:2] if fp_s] + [
+                ex_fp for ex_fp in exemplar_front_paths[:sample_limit] if ex_fp
+            ]
+            if par_batch_paths:
+                precompute_batch_image_descriptors(par_batch_paths, require_multiregion=True)
+
+        par_match_mode = "variation" if is_var else ("back_diff" if is_back_diff else "parallel")
         best_exact_whole = None
         best_exact_front = None
         best_exact_back = None
@@ -2918,10 +2975,16 @@ def verify_and_correct_parallel_match(
                 with Image.open(fp_s) as tf_im:
                     tf_arr = np.array(tf_im.convert("RGB"))
                 f_sim_raw = _compute_single_side_whole_image_similarity(scan_front_crop, tf_arr)
-                # Blend DINOv2 semantic similarity strongly for Image/Photo Variations (60%) & lightly for standard cards (35%)
-                n_wt_par = 0.60 if is_var else (0.25 if not is_back_diff else 0.20)
+                # Blend DINOv2 multi-region similarity strongly for Image/Photo Variations (60%) & parallel checks (38%)
+                n_wt_par = 0.60 if is_var else (0.38 if not is_back_diff else 0.22)
                 f_sim, _ = _compute_hybrid_neural_sim(
-                    scan_front_crop, f_sim_raw, ref_path=fp_s, ref_crop_rgb=tf_arr, neural_weight=n_wt_par
+                    scan_front_crop,
+                    f_sim_raw,
+                    ref_path=fp_s,
+                    ref_crop_rgb=tf_arr,
+                    neural_weight=n_wt_par,
+                    scan_desc=q_par_desc,
+                    match_mode=par_match_mode,
                 )
                 b_sim = None
                 if scan_back_crop is not None and bp_s and Path(bp_s).exists():
@@ -2941,13 +3004,20 @@ def verify_and_correct_parallel_match(
                 continue
 
         ex_scores = []
-        for ex_fp in exemplar_front_paths[:sample_limit]:
-            ex_sig = _get_lazy_border_foil_signature(ex_fp)
-            if ex_sig is not None:
-                ex_scores.append(float(np.dot(q_border_sig, ex_sig)))
-        ex_scores.sort(reverse=True)
-        top_k_grp = ex_scores[: min(5, len(ex_scores))]
-        parallel_consistency = float(np.mean(top_k_grp)) if top_k_grp else None
+        parallel_consistency = None
+        if q_par_desc is not None and exemplar_front_paths and is_neural_embeddings_enabled():
+            parallel_consistency = score_parallel_group_vectorized(
+                q_par_desc, exemplar_front_paths[:sample_limit], top_k=5
+            )
+        if parallel_consistency is None:
+            for ex_fp in exemplar_front_paths[:sample_limit]:
+                ex_sig = _get_lazy_border_foil_signature(ex_fp)
+                if ex_sig is not None:
+                    ex_scores.append(float(np.dot(q_border_sig, ex_sig)))
+            ex_scores.sort(reverse=True)
+            top_k_grp = ex_scores[: min(5, len(ex_scores))]
+            parallel_consistency = float(np.mean(top_k_grp)) if top_k_grp else None
+        ex_count_n = len(ex_scores) if ex_scores else len(exemplar_front_paths[:sample_limit])
 
         # Compute group back similarity across ALL back-differentiated AND competing Mini/Base subsets!
         group_back_sim = best_exact_back
@@ -2963,14 +3033,14 @@ def verify_and_correct_parallel_match(
         if best_exact_whole is not None:
             if parallel_consistency is not None:
                 front_combined = 0.54 * best_exact_whole + 0.28 * float(best_exact_border or best_exact_whole) + 0.18 * parallel_consistency
-                detail = f"1v1:{best_exact_whole:.2f}|Foil:{best_exact_border:.2f}|Grp:{parallel_consistency:.2f}(n={len(ex_scores)})"
+                detail = f"1v1:{best_exact_whole:.2f}|Foil:{best_exact_border:.2f}|Grp:{parallel_consistency:.2f}(n={ex_count_n})"
             else:
                 front_combined = 0.64 * best_exact_whole + 0.36 * float(best_exact_border or best_exact_whole)
                 detail = f"1v1:{best_exact_whole:.2f}|Foil:{best_exact_border:.2f}"
             src_kind = "Exact1v1"
         elif parallel_consistency is not None:
             front_combined = parallel_consistency
-            detail = f"ParGrp:{parallel_consistency:.2f}(n={len(ex_scores)})"
+            detail = f"ParGrp:{parallel_consistency:.2f}(n={ex_count_n})"
             src_kind = "ParallelGroup"
         elif group_back_sim is not None:
             front_combined = group_back_sim
@@ -3227,6 +3297,8 @@ def identify_and_verify_card_pipeline(
     batch_visual_memory: Optional[dict] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     print_run_map: Optional[dict] = None,
+    precomputed_front_desc: Optional[dict] = None,
+    precomputed_back_desc: Optional[dict] = None,
 ) -> dict:
     """
     Unified 5-Tier Card Identification & 3-Step Parallel Verification Pipeline:
@@ -3248,6 +3320,16 @@ def identify_and_verify_card_pipeline(
     scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
     bx1, by1, bx2, by2 = back_box
     scan_back_crop = np.array(back_oriented.crop((bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2))))
+
+    scan_front_desc = precomputed_front_desc
+    scan_back_desc = precomputed_back_desc
+    if scan_front_desc is None and is_neural_embeddings_enabled():
+        try:
+            eng_id = get_neural_embedding_engine(load_now=True)
+            if eng_id is not None and eng_id.is_ready:
+                scan_front_desc = eng_id.extract_descriptor(scan_front_crop, include_color_foil=True)
+        except Exception:
+            scan_front_desc = None
 
     card_geom = _detect_card_format_geometry(front_img, back_oriented, front_box, back_box)
     ag_back_ocr = _analyze_ag_back_ocr_signals(ocr_bundle.get("full_lines", []))
@@ -3321,6 +3403,7 @@ def identify_and_verify_card_pipeline(
             t1_ver = _verify_candidate_whole_image(
                 scan_front_crop, scan_back_crop, set_name, t1_sub_check, cnum_str,
                 template_catalog, reviewed_by_card, batch_visual_memory=batch_visual_memory,
+                scan_front_desc=scan_front_desc, scan_back_desc=scan_back_desc,
             )
             if t1_ver.get("has_ref"):
                 confirmed_vis_sim = t1_ver["sim"]
@@ -3339,6 +3422,7 @@ def identify_and_verify_card_pipeline(
             _verify_candidate_whole_image(
                 scan_front_crop, scan_back_crop, set_name, target_sub_check, cnum_str,
                 template_catalog, reviewed_by_card, batch_visual_memory=batch_visual_memory,
+                scan_front_desc=scan_front_desc, scan_back_desc=scan_back_desc,
             )
             if (matched_row is not None and cnum_str != "0")
             else {"has_ref": False, "sim": 0.0}
@@ -3373,6 +3457,7 @@ def identify_and_verify_card_pipeline(
                 t3_ver = _verify_candidate_whole_image(
                     scan_front_crop, scan_back_crop, t3_set, t3_sub_check, t3_cn,
                     template_catalog, reviewed_by_card, batch_visual_memory=batch_visual_memory,
+                    scan_front_desc=scan_front_desc, scan_back_desc=scan_back_desc,
                 )
                 if (t3_ver.get("has_ref") and t3_ver.get("sim", 0.0) >= vis_confirm_thresh) or (
                     t3_score >= top_tier_thresh and (not t3_ver.get("has_ref") or t3_ver.get("sim", 0.0) >= vis_confirm_thresh)
@@ -3420,6 +3505,7 @@ def identify_and_verify_card_pipeline(
                     reviewed_by_card=reviewed_by_card,
                     batch_visual_memory=batch_visual_memory,
                     log_cb=log_cb,
+                    scan_front_desc=scan_front_desc,
                 )
                 if t4_res is not None:
                     set_name = t4_res["Set"]
@@ -3457,6 +3543,7 @@ def identify_and_verify_card_pipeline(
                         t5_ver = _verify_candidate_whole_image(
                             scan_front_crop, scan_back_crop, set_name, clean_locked_subset or (valid_subsets[0] if valid_subsets else "Base"),
                             cnum_str, template_catalog, reviewed_by_card, batch_visual_memory=batch_visual_memory,
+                            scan_front_desc=scan_front_desc, scan_back_desc=scan_back_desc,
                         )
                         if t5_ver.get("has_ref"):
                             confirmed_vis_sim = float(t5_ver.get("sim", 0.0))
@@ -3576,6 +3663,7 @@ def identify_and_verify_card_pipeline(
                 detected_serial_denom=effective_stamped_pr,
                 card_attributes=attr_str,
                 cmp_hint_subset=cmp_hint_sub,
+                scan_front_desc=scan_front_desc,
             )
             chosen_sub = par_res["subset"]
             if par_res["score"] > 0:
@@ -5018,6 +5106,16 @@ def reidentify_batch_cards(
             f"🔎 Selected {len(rows_to_check):,} card(s) to re-identify (seeded {len(batch_visual_memory):,} high-confidence visual templates from this batch)."
         )
 
+    pre_front_descs: dict[str, dict] = {}
+    if rows_to_check and is_neural_embeddings_enabled():
+        reid_front_paths = [
+            batch_dir / str(df.loc[ri].get("Front_File", "")).strip()
+            for ri in rows_to_check
+            if str(df.loc[ri].get("Front_File", "")).strip()
+        ]
+        if reid_front_paths:
+            pre_front_descs = precompute_batch_image_descriptors(reid_front_paths, require_multiregion=True, auto_persist=False)
+
     for pos_i, r_idx in enumerate(rows_to_check, 1):
         row = df.loc[r_idx]
         f_path = batch_dir / str(row.get("Front_File", "")).strip()
@@ -5062,6 +5160,7 @@ def reidentify_batch_cards(
             f_box = detect_physical_card_box(f_img)
             b_box = detect_physical_card_box(b_oriented)
 
+            f_desc_pre = pre_front_descs.get(str(f_path.resolve()).lower()) if pre_front_descs and front_rot_ang == 0 else None
             id_res = identify_and_verify_card_pipeline(
                 front_img=f_img,
                 back_oriented=b_oriented,
@@ -5080,6 +5179,7 @@ def reidentify_batch_cards(
                 batch_visual_memory=batch_visual_memory,
                 log_cb=log_cb,
                 print_run_map=print_run_map,
+                precomputed_front_desc=f_desc_pre,
             )
 
             new_set = id_res["Set"]
@@ -5152,6 +5252,7 @@ def reidentify_batch_cards(
         if progress_callback is not None:
             progress_callback(pos_i, total_targets, df.loc[r_idx].to_dict())
 
+    flush_neural_embeddings_if_dirty()
     df, _, renamed_cnt = apply_manifest_overrides_and_rename(batch_dir, df_override=df)
     return df, changed_count, renamed_cnt
 
@@ -5576,6 +5677,16 @@ def reprocess_inventory_skus(
     total_targets = len(target_indices)
     processed_indices: list[int] = []
 
+    pre_inv_descs: dict[str, dict] = {}
+    if target_indices and is_neural_embeddings_enabled():
+        inv_front_paths = []
+        for sku_s_p, r_idx_p in target_indices:
+            fp_p, _, _ = _locate_inventory_card_images(inv_df.loc[r_idx_p].to_dict(), sku_s_p)
+            if fp_p is not None and fp_p.exists():
+                inv_front_paths.append(fp_p)
+        if inv_front_paths:
+            pre_inv_descs = precompute_batch_image_descriptors(inv_front_paths, require_multiregion=True, auto_persist=False)
+
     for pos_i, (sku_s, r_idx) in enumerate(target_indices, 1):
         row_d = inv_df.loc[r_idx].to_dict()
         f_p, b_p, c_p = _locate_inventory_card_images(row_d, sku_s)
@@ -5640,6 +5751,7 @@ def reprocess_inventory_skus(
             f_box = detect_physical_card_box(f_img)
             b_box = detect_physical_card_box(b_oriented)
 
+            f_desc_inv = pre_inv_descs.get(str(f_p.resolve()).lower()) if pre_inv_descs and front_rot_ang == 0 else None
             id_res = identify_and_verify_card_pipeline(
                 front_img=f_img,
                 back_oriented=b_oriented,
@@ -5657,6 +5769,7 @@ def reprocess_inventory_skus(
                 stamped_pr=None,
                 log_cb=log_cb,
                 print_run_map=print_run_map,
+                precomputed_front_desc=f_desc_inv,
             )
 
             new_set = id_res["Set"]
@@ -5752,6 +5865,7 @@ def reprocess_inventory_skus(
         inv_df = save_inventory_df(synced_df)
 
     _flush_border_sig_cache(force=True)
+    flush_neural_embeddings_if_dirty()
     if log_cb:
         log_cb(f"✅ Reprocessed {len(processed_indices)}/{total_targets} Inventory SKU(s) ({renamed_cnt} _My_Collection file set(s) renamed).")
     return {

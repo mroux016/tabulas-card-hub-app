@@ -20,10 +20,15 @@ import cv2
 import numpy as np
 from PIL import Image
 
-__version__ = "0.25.0-beta.1"
-__last_updated__ = "2026-11-21 18:45:00"
+__version__ = "0.25.0-beta.2"
+__last_updated__ = "2026-11-21 22:40:00"
 
-from Core.compute_backend import create_onnx_session, load_compute_settings
+from Core.compute_backend import (
+    create_onnx_session,
+    get_recommended_neural_batch_size,
+    load_compute_settings,
+    release_gpu_worker_slot,
+)
 from Core.config import (
     NEURAL_EMBEDDINGS_CACHE_FILE,
     NEURAL_MODELS_DIR,
@@ -74,8 +79,24 @@ RECOMMENDED_ONNX_MODELS = [
     },
 ]
 
+NEURAL_CACHE_SCHEMA_V24 = "v24_dinov2_fp16"
+NEURAL_CACHE_SCHEMA_V25 = "v25_dinov2_multiregion_fp16"
+
+_LAZY_FLUSH_DIRTY_THRESHOLD = 1500
+_LAZY_FLUSH_INTERVAL_SEC = 60.0
+_INDEX_CHECKPOINT_INTERVAL_ITEMS = 1500
+_INDEX_CHECKPOINT_INTERVAL_SEC = 60.0
+
+_DML_BATCH_BUCKETS = (1, 4, 8, 16, 32, 64)
+
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+
+# Precomputed 16x16 spatial patch masks for DINOv2-small (256 patch tokens)
+_GRID_R, _GRID_C = np.meshgrid(np.arange(16), np.arange(16), indexing="ij")
+_PATCH_BORDER_MASK = ((_GRID_R <= 1) | (_GRID_R >= 14) | (_GRID_C <= 1) | (_GRID_C >= 14)).reshape(-1)
+_PATCH_CORNER_MASK = (((_GRID_R <= 3) | (_GRID_R >= 12)) & ((_GRID_C <= 3) | (_GRID_C >= 12))).reshape(-1)
+_PATCH_CENTER_MASK = ((_GRID_R >= 3) & (_GRID_R <= 12) & (_GRID_C >= 3) & (_GRID_C <= 12)).reshape(-1)
 
 _ENGINE_LOCK = threading.Lock()
 _INDEX_LOCK = threading.RLock()
@@ -83,7 +104,17 @@ _SINGLETON_ENGINE: Optional["NeuralEmbeddingEngine"] = None
 _MEM_EMBED_CACHE: Optional[dict] = None
 _MEM_EMBED_MTIME: float = -1.0
 _MEM_EMBED_DIRTY_COUNT: int = 0
+_MEM_EMBED_LAST_FLUSH_TS: float = 0.0
 _SET_MATRIX_CACHE: dict[tuple[str, str], tuple[int, list[dict], np.ndarray]] = {}
+_PAR_GROUP_MATRIX_CACHE: dict[tuple[str, ...], tuple[int, dict[str, np.ndarray]]] = {}
+
+
+def _choose_dml_bucket(n: int, max_bs: int) -> int:
+    """Rounds chunk size `n` up to a power-of-2 DirectML bucket <= `max_bs` to avoid shader recompilation."""
+    for b in _DML_BATCH_BUCKETS:
+        if b >= n and b <= max_bs:
+            return b
+    return min(max(1, n), max_bs)
 
 
 def preprocess_card_tensor(crop_rgb: np.ndarray, input_size: tuple[int, int] = (224, 224)) -> np.ndarray:
@@ -124,19 +155,241 @@ def _pool_and_normalize_model_output(raw_out: np.ndarray) -> np.ndarray:
     return arr / np.maximum(1e-6, np.linalg.norm(arr, axis=1, keepdims=True))
 
 
+def _l2_normalize_rows(mat: np.ndarray) -> np.ndarray:
+    arr = np.asarray(mat, dtype=np.float32)
+    if arr.ndim == 1:
+        n = float(np.linalg.norm(arr))
+        return (arr / n) if n > 1e-6 else arr
+    norms = np.maximum(1e-6, np.linalg.norm(arr, axis=1, keepdims=True))
+    return arr / norms
+
+
+def _extract_multiregion_patch_vectors(raw_out: np.ndarray) -> dict[str, Optional[np.ndarray]]:
+    """
+    Extracts global + spatial multi-region embeddings from DINOv2 `[B, 257, D]` token output
+    in zero extra forward passes:
+      - `vec`:        `norm(0.60 * norm(CLS) + 0.40 * norm(patch_mean))`
+      - `border_vec`: L2-normalized outer 2-ring border patches (112 tokens on 16x16)
+      - `corner_vec`: L2-normalized four 4x4 corner/logo/stamp zones (64 tokens on 16x16)
+      - `center_vec`: L2-normalized inner 10x10 subject core (100 tokens on 16x16)
+    Gracefully returns `None` for spatial regions if the ONNX backbone only outputs 2D `[B, D]`.
+    """
+    arr = np.asarray(raw_out, dtype=np.float32)
+    global_vecs = _pool_and_normalize_model_output(arr)
+    if arr.ndim != 3 or arr.shape[1] < 6:
+        return {"vec": global_vecs, "border_vec": None, "corner_vec": None, "center_vec": None}
+
+    patches = arr[:, 1:, :]
+    n_patches = patches.shape[1]
+    if n_patches == 256:
+        b_mask, c_mask, m_mask = _PATCH_BORDER_MASK, _PATCH_CORNER_MASK, _PATCH_CENTER_MASK
+    else:
+        side = int(round(np.sqrt(n_patches)))
+        if side * side != n_patches or side < 4:
+            return {"vec": global_vecs, "border_vec": None, "corner_vec": None, "center_vec": None}
+        gr, gc = np.meshgrid(np.arange(side), np.arange(side), indexing="ij")
+        bw = max(1, side // 8)
+        cw = max(1, side // 4)
+        b_mask = ((gr < bw) | (gr >= side - bw) | (gc < bw) | (gc >= side - bw)).reshape(-1)
+        c_mask = (((gr < cw) | (gr >= side - cw)) & ((gc < cw) | (gc >= side - cw))).reshape(-1)
+        m_mask = ((gr >= bw + 1) & (gr < side - bw - 1) & (gc >= bw + 1) & (gc < side - bw - 1)).reshape(-1)
+        if not np.any(m_mask):
+            m_mask = ~b_mask
+
+    border_vec = _l2_normalize_rows(patches[:, b_mask, :].mean(axis=1))
+    corner_vec = _l2_normalize_rows(patches[:, c_mask, :].mean(axis=1))
+    center_vec = _l2_normalize_rows(patches[:, m_mask, :].mean(axis=1))
+    return {
+        "vec": global_vecs,
+        "border_vec": border_vec,
+        "corner_vec": corner_vec,
+        "center_vec": center_vec,
+    }
+
+
+def extract_color_foil_descriptor(crop_rgb: np.ndarray) -> np.ndarray:
+    """
+    Extracts an L2-normalized 168-d color, border, corner-chroma, and refractor/foil-specular
+    descriptor with per-block L2 normalization before weighted concatenation so high-magnitude
+    Laplacian sparkle values never drown out border color.
+    """
+    small_rgb = cv2.resize(crop_rgb, (160, 224), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2LAB)
+    gray = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2GRAY)
+
+    # Outer 12% perimeter border band
+    mask_border = np.ones((224, 160), dtype=np.uint8)
+    mask_border[26:198, 20:140] = 0
+    border_bool = mask_border.astype(bool)
+
+    # Sub-block 1: Border Color Histograms (36 + 20 + 16 + 20 + 20 = 112-d)
+    h_hist = _l2_normalize_rows(cv2.calcHist([hsv], [0], mask_border, [36], [0, 180]).flatten())
+    s_hist = _l2_normalize_rows(cv2.calcHist([hsv], [1], mask_border, [20], [0, 256]).flatten())
+    v_hist = _l2_normalize_rows(cv2.calcHist([hsv], [2], mask_border, [16], [0, 256]).flatten())
+    a_hist = _l2_normalize_rows(cv2.calcHist([lab], [1], mask_border, [20], [0, 256]).flatten())
+    b_hist = _l2_normalize_rows(cv2.calcHist([lab], [2], mask_border, [20], [0, 256]).flatten())
+    border_color_blk = _l2_normalize_rows(np.concatenate([
+        h_hist * 1.45,
+        s_hist * 1.25,
+        v_hist * 0.85,
+        a_hist * 1.35,
+        b_hist * 1.35,
+    ]))
+
+    # Sub-block 2: Refractor / Holo Specular & Sparkle Energy (16 + 12 + 16 = 44-d)
+    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(sx, sy)
+    lap_abs = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+
+    grad_vals = np.clip(grad_mag[border_bool], 0.0, 255.0)
+    lap_vals = np.clip(lap_abs[border_bool], 0.0, 255.0)
+    g_hist_raw, _ = np.histogram(grad_vals, bins=16, range=(0.0, 255.0))
+    l_hist_raw, _ = np.histogram(lap_vals, bins=12, range=(0.0, 255.0))
+    g_hist = _l2_normalize_rows(g_hist_raw.astype(np.float32))
+    l_hist = _l2_normalize_rows(l_hist_raw.astype(np.float32))
+
+    # Hue Shannon entropy (distinguishes rainbow/prismatic refractors from single-hue/matte borders)
+    def _norm_hue_entropy(h_vals: np.ndarray) -> float:
+        hist_e, _ = np.histogram(h_vals, bins=18, range=(0, 180))
+        tot = float(np.sum(hist_e))
+        if tot <= 0.0:
+            return 0.0
+        p = hist_e.astype(np.float32) / tot
+        p = p[p > 0.0]
+        return float(-np.sum(p * np.log2(p)) / np.log2(18.0))
+
+    h_ent_border = _norm_hue_entropy(hsv[:, :, 0][border_bool])
+    h_ent_full = _norm_hue_entropy(hsv[:, :, 0].reshape(-1))
+
+    # 4x4 spatial grid variance of S, a*, b* across the card (captures prismatic rainbow gradients)
+    s_grid = hsv[:, :, 1].reshape(4, 56, 4, 40).mean(axis=(1, 3)).astype(np.float32) / 255.0
+    a_grid = lab[:, :, 1].reshape(4, 56, 4, 40).mean(axis=(1, 3)).astype(np.float32) / 255.0
+    b_grid = lab[:, :, 2].reshape(4, 56, 4, 40).mean(axis=(1, 3)).astype(np.float32) / 255.0
+
+    s_b = hsv[:, :, 1][border_bool].astype(np.float32) / 255.0
+    v_b = hsv[:, :, 2][border_bool].astype(np.float32) / 255.0
+    spec_stats = _l2_normalize_rows(np.array([
+        float(np.mean(s_b)),
+        float(np.std(s_b)),
+        float(np.percentile(s_b, 90)),
+        float(np.mean(v_b)),
+        float(np.std(v_b)),
+        float(np.percentile(v_b, 90)),
+        h_ent_border,
+        h_ent_full,
+        float(np.std(s_grid)),
+        float(np.std(a_grid)),
+        float(np.std(b_grid)),
+        float(np.mean(grad_vals) / 255.0),
+        float(np.std(grad_vals) / 255.0),
+        float(np.percentile(grad_vals, 90) / 255.0),
+        float(np.mean(lap_vals) / 255.0),
+        float(np.percentile(lap_vals, 90) / 255.0),
+    ], dtype=np.float32))
+    foil_spec_blk = _l2_normalize_rows(np.concatenate([
+        g_hist * 1.00,
+        l_hist * 0.90,
+        spec_stats * 1.15,
+    ]))
+
+    # Sub-block 3: 4 Corner/Logo Chroma Summary (4 x 3 = 12-d)
+    corner_slices = (
+        (slice(0, 56), slice(0, 40)),
+        (slice(0, 56), slice(120, 160)),
+        (slice(168, 224), slice(0, 40)),
+        (slice(168, 224), slice(120, 160)),
+    )
+    c_feats: list[float] = []
+    for ys, xs in corner_slices:
+        c_feats.append(float(np.mean(lab[ys, xs, 1])) / 255.0)
+        c_feats.append(float(np.mean(lab[ys, xs, 2])) / 255.0)
+        c_feats.append(float(np.mean(hsv[ys, xs, 1])) / 255.0)
+    corner_chroma_blk = _l2_normalize_rows(np.array(c_feats, dtype=np.float32))
+
+    # Final concatenation & L2-normalization (112 + 44 + 12 = 168-d)
+    return _l2_normalize_rows(np.concatenate([
+        border_color_blk * 1.30,
+        foil_spec_blk * 1.10,
+        corner_chroma_blk * 0.85,
+    ])).astype(np.float32)
+
+
+def batch_cosine_search_matrix(
+    query_mat: np.ndarray,
+    ref_mat: np.ndarray,
+    top_k: int = 10,
+) -> list[list[tuple[int, float]]]:
+    """
+    Vectorized BLAS SGEMM cosine similarity search for 1D `(D,)` or 2D `(Q, D)` queries
+    against L2-normalized `(N, D)` reference embeddings.
+    """
+    if query_mat is None or ref_mat is None or ref_mat.size == 0:
+        return []
+    q = np.asarray(query_mat, dtype=np.float32)
+    single_q = (q.ndim == 1)
+    if single_q:
+        q = q.reshape(1, -1)
+    q = _l2_normalize_rows(q)
+    r = np.asarray(ref_mat, dtype=np.float32)
+    scores_mat = q @ r.T
+    k = min(max(1, int(top_k)), r.shape[0])
+    out: list[list[tuple[int, float]]] = []
+    for row_s in scores_mat:
+        top_idx = np.argpartition(row_s, -k)[-k:]
+        top_sorted = top_idx[np.argsort(row_s[top_idx])[::-1]]
+        out.append([(int(i), round(float(row_s[i]), 5)) for i in top_sorted])
+    return out
+
+
 def batch_cosine_search(query_vec: np.ndarray, matrix_vecs: np.ndarray, top_k: int = 10) -> list[tuple[int, float]]:
     """Vectorized cosine similarity search across `N` L2-normalized reference embeddings (< 2 ms)."""
     if query_vec is None or matrix_vecs is None or matrix_vecs.size == 0:
         return []
-    q = query_vec.astype(np.float32).reshape(-1)
-    q_norm = float(np.linalg.norm(q))
-    if q_norm > 1e-6:
-        q = q / q_norm
-    scores = matrix_vecs @ q
-    k = min(max(1, int(top_k)), len(scores))
-    top_idx = np.argpartition(scores, -k)[-k:]
-    top_sorted = top_idx[np.argsort(scores[top_idx])[::-1]]
-    return [(int(i), round(float(scores[i]), 5)) for i in top_sorted]
+    res = batch_cosine_search_matrix(query_vec, matrix_vecs, top_k=top_k)
+    return res[0] if res else []
+
+
+_MULTIREGION_MODE_WEIGHTS = {
+    "variation": (("center_vec", 0.50), ("vec", 0.30), ("corner_vec", 0.12), ("color_foil_vec", 0.08)),
+    "parallel": (("border_vec", 0.34), ("corner_vec", 0.16), ("color_foil_vec", 0.36), ("vec", 0.14)),
+    "back_diff": (("vec", 0.45), ("border_vec", 0.25), ("color_foil_vec", 0.20), ("corner_vec", 0.10)),
+    "identity": (("vec", 0.75), ("center_vec", 0.25)),
+}
+
+
+def score_multiregion_parallel_pair(q_desc: dict, r_desc: dict, mode: str = "parallel") -> dict:
+    """
+    Task-aware multi-region similarity between query & reference descriptors.
+    Re-normalizes weights automatically over whichever sub-vectors are present so
+    legacy v24 entries (only `vec`) or 2D ONNX backbones still score cleanly.
+    """
+    weights = _MULTIREGION_MODE_WEIGHTS.get(mode, _MULTIREGION_MODE_WEIGHTS["parallel"])
+    sims: dict[str, Optional[float]] = {}
+    num = 0.0
+    den = 0.0
+    for key, wt in weights:
+        qv = q_desc.get(key) if isinstance(q_desc, dict) else None
+        rv = r_desc.get(key) if isinstance(r_desc, dict) else None
+        if qv is not None and rv is not None:
+            qf = np.asarray(qv, dtype=np.float32).reshape(-1)
+            rf = np.asarray(rv, dtype=np.float32).reshape(-1)
+            if qf.shape == rf.shape and qf.size > 0:
+                cos_raw = float(np.dot(qf, rf))
+                sim_val = float(np.clip(cos_raw, 0.0, 1.0)) if key == "color_foil_vec" else calibrate_neural_cosine_to_card_sim(cos_raw)
+                sims[key] = round(sim_val, 5)
+                num += wt * sim_val
+                den += wt
+    score = round(float(np.clip(num / den, 0.0, 1.0)), 4) if den > 1e-6 else 0.0
+    return {
+        "score": score,
+        "global_sim": sims.get("vec"),
+        "border_sim": sims.get("border_vec"),
+        "corner_sim": sims.get("corner_vec"),
+        "center_sim": sims.get("center_vec"),
+        "color_foil_sim": sims.get("color_foil_vec"),
+    }
 
 
 def calibrate_neural_cosine_to_card_sim(cos_val: float) -> float:
@@ -172,6 +425,9 @@ class NeuralEmbeddingEngine:
         self.output_name = ""
         self.input_size = (224, 224)
         self.model_key = "dinov2_small"
+        self._effective_max_batch: int = get_recommended_neural_batch_size()
+        self._static_batch_one: bool = False
+        self._dml_bucket_padding: bool = True
 
     def _discover_best_model(self) -> Optional[Path]:
         if not NEURAL_MODELS_DIR.exists():
@@ -203,6 +459,13 @@ class NeuralEmbeddingEngine:
             )
             inp0 = self.session.get_inputs()[0]
             self.input_name = inp0.name
+            inp_shape = getattr(inp0, "shape", None) or []
+            if len(inp_shape) >= 1 and isinstance(inp_shape[0], int):
+                if inp_shape[0] == 1:
+                    self._static_batch_one = True
+                    self._effective_max_batch = 1
+                elif inp_shape[0] > 1:
+                    self._effective_max_batch = min(self._effective_max_batch, int(inp_shape[0]))
             outs = self.session.get_outputs()
             # Prefer last_hidden_state (3D token output) when present; otherwise first output
             pref_out = next((o for o in outs if "last_hidden_state" in str(o.name).lower()), outs[0])
@@ -212,39 +475,93 @@ class NeuralEmbeddingEngine:
             self.session = None
             return False
 
-    def extract_embeddings_batch(self, crops_rgb: list[np.ndarray], batch_size: int = 32) -> list[Optional[np.ndarray]]:
-        """Extracts L2-normalized float32 embeddings for a list of RGB crops using GPU batching."""
+    def extract_descriptors_batch(
+        self,
+        crops_rgb: list[np.ndarray],
+        batch_size: Optional[int] = None,
+        include_color_foil: bool = True,
+    ) -> list[Optional[dict]]:
+        """
+        Extracts multi-region descriptors (`vec`, `border_vec`, `corner_vec`, `center_vec`,
+        `color_foil_vec`) for a list of RGB crops using micro-batched DirectML/CUDA inference
+        with power-of-2 bucket padding, automatic VRAM backoff, and clean CPU fallback.
+        """
         if not crops_rgb or not self.ensure_loaded():
             return [None] * len(crops_rgb)
 
         n_total = len(crops_rgb)
-        results: list[Optional[np.ndarray]] = [None] * n_total
-        cur_bs = max(1, int(batch_size))
+        results: list[Optional[dict]] = [None] * n_total
+        req_bs = int(batch_size or self._effective_max_batch)
+        cur_bs = 1 if self._static_batch_one else max(1, min(req_bs, self._effective_max_batch))
         pos = 0
 
         while pos < n_total:
             chunk = crops_rgb[pos : pos + cur_bs]
+            chunk_n = len(chunk)
             try:
                 tensor = preprocess_card_batch(chunk, input_size=self.input_size)
+                is_dml = "DmlExecutionProvider" in str(self.active_provider)
+                if is_dml and self._dml_bucket_padding and not self._static_batch_one and chunk_n < cur_bs:
+                    bucket_bs = _choose_dml_bucket(chunk_n, cur_bs)
+                    if bucket_bs > chunk_n:
+                        pad_cnt = bucket_bs - chunk_n
+                        pad_frames = np.repeat(tensor[-1:], pad_cnt, axis=0)
+                        tensor = np.ascontiguousarray(np.concatenate([tensor, pad_frames], axis=0), dtype=np.float32)
+
                 raw_out = self.session.run([self.output_name], {self.input_name: tensor})[0]
-                vecs = _pool_and_normalize_model_output(raw_out)
-                for j in range(len(chunk)):
-                    results[pos + j] = vecs[j]
-                pos += len(chunk)
+                if raw_out.shape[0] > chunk_n:
+                    raw_out = raw_out[:chunk_n]
+                mr = _extract_multiregion_patch_vectors(raw_out)
+                vecs = mr["vec"]
+                b_vecs = mr["border_vec"]
+                c_vecs = mr["corner_vec"]
+                m_vecs = mr["center_vec"]
+
+                for j in range(chunk_n):
+                    cf_vec = extract_color_foil_descriptor(chunk[j]) if include_color_foil else None
+                    results[pos + j] = {
+                        "vec": vecs[j],
+                        "border_vec": b_vecs[j] if b_vecs is not None else None,
+                        "corner_vec": c_vecs[j] if c_vecs is not None else None,
+                        "center_vec": m_vecs[j] if m_vecs is not None else None,
+                        "color_foil_vec": cf_vec,
+                        "schema_v": 2,
+                    }
+                pos += chunk_n
             except Exception:
                 if cur_bs > 1:
                     cur_bs = max(1, cur_bs // 2)
+                    self._effective_max_batch = min(self._effective_max_batch, cur_bs)
                 elif self.active_provider != "CPUExecutionProvider":
                     # Auto-fallback to CPU session on GPU/DirectML runtime error
                     try:
                         self.prefer_gpu = False
-                        self.session, self.active_provider = create_onnx_session(self.model_path, prefer_gpu=False)
-                        self.input_name = self.session.get_inputs()[0].name
+                        self.session, self.active_provider = create_onnx_session(
+                            self.model_path, prefer_gpu=False, purpose="neural", claim_slot=False
+                        )
+                        inp0 = self.session.get_inputs()[0]
+                        self.input_name = inp0.name
+                        outs = self.session.get_outputs()
+                        pref_out = next((o for o in outs if "last_hidden_state" in str(o.name).lower()), outs[0])
+                        self.output_name = pref_out.name
+                        if self.claim_slot:
+                            release_gpu_worker_slot()
                     except Exception:
                         pos += 1
                 else:
                     pos += 1
         return results
+
+    def extract_descriptor(self, crop_rgb: np.ndarray, include_color_foil: bool = True) -> Optional[dict]:
+        if crop_rgb is None or crop_rgb.size == 0 or not self.ensure_loaded():
+            return None
+        res = self.extract_descriptors_batch([crop_rgb], batch_size=1, include_color_foil=include_color_foil)
+        return res[0] if res else None
+
+    def extract_embeddings_batch(self, crops_rgb: list[np.ndarray], batch_size: Optional[int] = None) -> list[Optional[np.ndarray]]:
+        """Extracts L2-normalized float32 global embeddings for a list of RGB crops using GPU batching."""
+        descs = self.extract_descriptors_batch(crops_rgb, batch_size=batch_size, include_color_foil=False)
+        return [d["vec"] if isinstance(d, dict) else None for d in descs]
 
     def extract_embedding(self, crop_rgb: np.ndarray) -> Optional[np.ndarray]:
         if crop_rgb is None or crop_rgb.size == 0 or not self.ensure_loaded():
@@ -276,13 +593,16 @@ def get_neural_embedding_engine(load_now: bool = True) -> Optional[NeuralEmbeddi
 
 
 def reset_neural_engine_cache():
-    global _SINGLETON_ENGINE, _MEM_EMBED_CACHE, _MEM_EMBED_MTIME
+    global _SINGLETON_ENGINE, _MEM_EMBED_CACHE, _MEM_EMBED_MTIME, _MEM_EMBED_DIRTY_COUNT, _MEM_EMBED_LAST_FLUSH_TS
     with _ENGINE_LOCK:
         _SINGLETON_ENGINE = None
     with _INDEX_LOCK:
         _MEM_EMBED_CACHE = None
         _MEM_EMBED_MTIME = -1.0
+        _MEM_EMBED_DIRTY_COUNT = 0
+        _MEM_EMBED_LAST_FLUSH_TS = 0.0
         _SET_MATRIX_CACHE.clear()
+        _PAR_GROUP_MATRIX_CACHE.clear()
 
 
 # ==============================================================================
@@ -425,7 +745,7 @@ def load_neural_embeddings_cache(force_reload: bool = False) -> dict:
     global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME
     with _INDEX_LOCK:
         if not NEURAL_EMBEDDINGS_CACHE_FILE.exists():
-            _MEM_EMBED_CACHE = {"schema": "v24_dinov2_fp16", "model": DINOV2_MODEL_FILENAME, "embeddings": {}}
+            _MEM_EMBED_CACHE = {"schema": NEURAL_CACHE_SCHEMA_V25, "model": DINOV2_MODEL_FILENAME, "embeddings": {}}
             _MEM_EMBED_MTIME = -1.0
             return _MEM_EMBED_CACHE
         try:
@@ -438,28 +758,209 @@ def load_neural_embeddings_cache(force_reload: bool = False) -> dict:
                 _MEM_EMBED_CACHE = data
                 _MEM_EMBED_MTIME = mt
                 _SET_MATRIX_CACHE.clear()
+                _PAR_GROUP_MATRIX_CACHE.clear()
                 return _MEM_EMBED_CACHE
         except Exception:
             pass
-        _MEM_EMBED_CACHE = {"schema": "v24_dinov2_fp16", "model": DINOV2_MODEL_FILENAME, "embeddings": {}}
+        _MEM_EMBED_CACHE = {"schema": NEURAL_CACHE_SCHEMA_V25, "model": DINOV2_MODEL_FILENAME, "embeddings": {}}
         return _MEM_EMBED_CACHE
 
 
 def save_neural_embeddings_cache(cache_obj: dict):
-    global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME, _MEM_EMBED_DIRTY_COUNT
+    global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME, _MEM_EMBED_DIRTY_COUNT, _MEM_EMBED_LAST_FLUSH_TS
     with _INDEX_LOCK:
         try:
+            cache_obj["schema"] = NEURAL_CACHE_SCHEMA_V25
             cache_obj["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
             def _dump_embs(tmp_p: Path):
                 with open(tmp_p, "wb") as f:
                     pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
             atomic_write_bytes(NEURAL_EMBEDDINGS_CACHE_FILE, _dump_embs)
             _MEM_EMBED_CACHE = cache_obj
             _MEM_EMBED_MTIME = NEURAL_EMBEDDINGS_CACHE_FILE.stat().st_mtime
             _MEM_EMBED_DIRTY_COUNT = 0
+            _MEM_EMBED_LAST_FLUSH_TS = time.monotonic()
             _SET_MATRIX_CACHE.clear()
+            _PAR_GROUP_MATRIX_CACHE.clear()
         except Exception:
             pass
+
+
+def _record_to_descriptor(rec: dict) -> Optional[dict]:
+    if not isinstance(rec, dict) or rec.get("vec") is None:
+        return None
+    out = {
+        "vec": np.asarray(rec["vec"], dtype=np.float32),
+        "border_vec": np.asarray(rec["border_vec"], dtype=np.float32) if rec.get("border_vec") is not None else None,
+        "corner_vec": np.asarray(rec["corner_vec"], dtype=np.float32) if rec.get("corner_vec") is not None else None,
+        "center_vec": np.asarray(rec["center_vec"], dtype=np.float32) if rec.get("center_vec") is not None else None,
+        "color_foil_vec": np.asarray(rec["color_foil_vec"], dtype=np.float32) if rec.get("color_foil_vec") is not None else None,
+        "schema_v": int(rec.get("schema_v", 1)),
+    }
+    return out
+
+
+def _rec_has_multiregion(rec: dict) -> bool:
+    return (
+        isinstance(rec, dict)
+        and rec.get("vec") is not None
+        and rec.get("color_foil_vec") is not None
+        and (rec.get("border_vec") is not None or int(rec.get("schema_v", 1)) >= 2)
+    )
+
+
+def _maybe_flush_lazy_cache(cache: dict):
+    global _MEM_EMBED_DIRTY_COUNT, _MEM_EMBED_LAST_FLUSH_TS
+    now_m = time.monotonic()
+    if _MEM_EMBED_LAST_FLUSH_TS <= 0.0:
+        _MEM_EMBED_LAST_FLUSH_TS = now_m
+    if _MEM_EMBED_DIRTY_COUNT >= _LAZY_FLUSH_DIRTY_THRESHOLD or (
+        _MEM_EMBED_DIRTY_COUNT >= 100 and (now_m - _MEM_EMBED_LAST_FLUSH_TS) >= _LAZY_FLUSH_INTERVAL_SEC
+    ):
+        save_neural_embeddings_cache(cache)
+
+
+def _build_cache_entry(p_obj: Path, k: str, cur_mt: float, desc: dict) -> dict:
+    parsed = parse_unified_card_filename(p_obj.name) or {}
+    s_name = parsed.get("set") or p_obj.parent.name.replace("_", " ")
+    entry = {
+        "path": str(p_obj),
+        "mtime": cur_mt,
+        "set_key": canonical_set_key(s_name),
+        "subset": parsed.get("subset") or "Base",
+        "n_cnum": norm(parsed.get("card_number") or ""),
+        "side": parsed.get("side") or ("B" if p_obj.name.upper().endswith("_B.JPG") else "F"),
+        "source": "My_Collection" if str(REVIEWED_CARDS_DIR).lower() in k else "Reference_Library",
+        "schema_v": 2,
+        "vec": desc["vec"].astype(np.float16),
+    }
+    for sub_k in ("border_vec", "corner_vec", "center_vec", "color_foil_vec"):
+        if desc.get(sub_k) is not None:
+            entry[sub_k] = np.asarray(desc[sub_k], dtype=np.float16)
+    return entry
+
+
+def precompute_batch_image_descriptors(
+    img_paths: list[Path | str],
+    batch_size: Optional[int] = None,
+    require_multiregion: bool = True,
+    auto_persist: bool = True,
+) -> dict[str, dict]:
+    """
+    Micro-batches any uncached or legacy-v24 image paths in `img_paths` through DirectML
+    in a single parallel decode + GPU batch pass, returning `{norm_path_key: descriptor}`.
+    """
+    global _MEM_EMBED_DIRTY_COUNT
+    if not img_paths or not is_neural_embeddings_enabled():
+        return {}
+
+    cfg = load_compute_settings()
+    want_mr = bool(require_multiregion) and bool(cfg.get("enable_multiregion_neural", True))
+    results: dict[str, dict] = {}
+    to_compute: list[tuple[Path, str, float]] = []
+    seen_keys: set[str] = set()
+
+    with _INDEX_LOCK:
+        cache = load_neural_embeddings_cache()
+        embs = cache.setdefault("embeddings", {})
+        for raw_p in img_paths:
+            if not raw_p:
+                continue
+            p_obj = Path(raw_p)
+            k = _norm_path_key(p_obj)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            if not p_obj.exists():
+                continue
+            try:
+                cur_mt = p_obj.stat().st_mtime
+            except Exception:
+                cur_mt = 0.0
+            rec = embs.get(k)
+            if isinstance(rec, dict) and rec.get("vec") is not None and abs(float(rec.get("mtime", 0.0)) - cur_mt) < 2.0:
+                if not want_mr or _rec_has_multiregion(rec):
+                    d_hit = _record_to_descriptor(rec)
+                    if d_hit is not None:
+                        results[k] = d_hit
+                        continue
+            to_compute.append((p_obj, k, cur_mt))
+
+    if not to_compute:
+        return results
+
+    eng = get_neural_embedding_engine(load_now=True)
+    if eng is None or not eng.is_ready:
+        return results
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _load_rgb(item):
+        p_o, k_s, mt_v = item
+        try:
+            with Image.open(p_o) as im:
+                return np.array(im.convert("RGB")), p_o, k_s, mt_v
+        except Exception:
+            return None, p_o, k_s, mt_v
+
+    decoded_crops: list[np.ndarray] = []
+    decoded_metas: list[tuple[Path, str, float]] = []
+    if len(to_compute) >= 4:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for rgb, p_o, k_s, mt_v in pool.map(_load_rgb, to_compute):
+                if rgb is not None:
+                    decoded_crops.append(rgb)
+                    decoded_metas.append((p_o, k_s, mt_v))
+    else:
+        for item in to_compute:
+            rgb, p_o, k_s, mt_v = _load_rgb(item)
+            if rgb is not None:
+                decoded_crops.append(rgb)
+                decoded_metas.append((p_o, k_s, mt_v))
+
+    if not decoded_crops:
+        return results
+
+    eff_bs = int(batch_size or get_recommended_neural_batch_size(cfg))
+    descs = eng.extract_descriptors_batch(decoded_crops, batch_size=eff_bs, include_color_foil=want_mr)
+
+    new_entries: dict[str, dict] = {}
+    for (p_o, k_s, mt_v), desc in zip(decoded_metas, descs):
+        if desc is not None:
+            results[k_s] = desc
+            new_entries[k_s] = _build_cache_entry(p_o, k_s, mt_v, desc)
+
+    if new_entries:
+        with _INDEX_LOCK:
+            cache = load_neural_embeddings_cache()
+            embs = cache.setdefault("embeddings", {})
+            embs.update(new_entries)
+            _MEM_EMBED_DIRTY_COUNT += len(new_entries)
+            if auto_persist:
+                _maybe_flush_lazy_cache(cache)
+
+    return results
+
+
+def get_or_compute_image_descriptor(
+    img_path: Path | str,
+    auto_persist: bool = True,
+    require_multiregion: bool = True,
+) -> Optional[dict]:
+    """
+    Retrieves a card image's multi-region descriptor from the RAM/disk neural index in <0.01ms,
+    or computes it on DirectML GPU if not yet indexed (or upgrades legacy v24 entries).
+    """
+    if not img_path or not is_neural_embeddings_enabled():
+        return None
+    p_obj = Path(img_path)
+    k = _norm_path_key(p_obj)
+    res = precompute_batch_image_descriptors(
+        [p_obj], batch_size=1, require_multiregion=require_multiregion, auto_persist=auto_persist
+    )
+    return res.get(k)
 
 
 def get_or_compute_image_embedding(img_path: Path | str, auto_persist: bool = True) -> Optional[np.ndarray]:
@@ -467,56 +968,8 @@ def get_or_compute_image_embedding(img_path: Path | str, auto_persist: bool = Tr
     Retrieves a card image's 384-d DINOv2 embedding from the RAM/disk neural index in <0.01ms,
     or computes it lazily on DirectML GPU if not yet indexed.
     """
-    global _MEM_EMBED_DIRTY_COUNT
-    if not img_path or not is_neural_embeddings_enabled():
-        return None
-    p_obj = Path(img_path)
-    if not p_obj.exists():
-        return None
-    k = _norm_path_key(p_obj)
-    try:
-        cur_mt = p_obj.stat().st_mtime
-    except Exception:
-        cur_mt = 0.0
-
-    with _INDEX_LOCK:
-        cache = load_neural_embeddings_cache()
-        embs = cache.setdefault("embeddings", {})
-        rec = embs.get(k)
-        if isinstance(rec, dict) and rec.get("vec") is not None and abs(float(rec.get("mtime", 0.0)) - cur_mt) < 2.0:
-            return np.asarray(rec["vec"], dtype=np.float32)
-
-    eng = get_neural_embedding_engine(load_now=True)
-    if eng is None or not eng.is_ready:
-        return None
-    try:
-        with Image.open(p_obj) as im:
-            rgb = np.array(im.convert("RGB"))
-        vec = eng.extract_embedding(rgb)
-        if vec is None:
-            return None
-        parsed = parse_unified_card_filename(p_obj.name) or {}
-        s_name = parsed.get("set") or p_obj.parent.name.replace("_", " ")
-        entry = {
-            "path": str(p_obj),
-            "mtime": cur_mt,
-            "set_key": canonical_set_key(s_name),
-            "subset": parsed.get("subset") or "Base",
-            "n_cnum": norm(parsed.get("card_number") or ""),
-            "side": parsed.get("side") or ("B" if p_obj.name.upper().endswith("_B.JPG") else "F"),
-            "source": "My_Collection" if str(REVIEWED_CARDS_DIR).lower() in k else "Reference_Library",
-            "vec": vec.astype(np.float16),
-        }
-        with _INDEX_LOCK:
-            cache = load_neural_embeddings_cache()
-            embs = cache.setdefault("embeddings", {})
-            embs[k] = entry
-            _MEM_EMBED_DIRTY_COUNT += 1
-            if auto_persist and _MEM_EMBED_DIRTY_COUNT >= 40:
-                save_neural_embeddings_cache(cache)
-        return vec
-    except Exception:
-        return None
+    desc = get_or_compute_image_descriptor(img_path, auto_persist=auto_persist, require_multiregion=False)
+    return desc["vec"] if isinstance(desc, dict) else None
 
 
 def flush_neural_embeddings_if_dirty():
@@ -527,17 +980,20 @@ def flush_neural_embeddings_if_dirty():
 
 def build_or_update_neural_embedding_index(
     set_filter: Optional[str] = None,
-    batch_size: int = 32,
+    batch_size: Optional[int] = None,
     force_rebuild: bool = False,
+    upgrade_legacy: bool = True,
     log_cb: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict:
     """
-    Batched GPU Neural Index Builder (RX 9070 XT DirectML runs at ~250-500 cards/sec!):
+    Batched GPU Neural Index Builder (RX 9070 XT DirectML):
       - Incrementally embeds all new/changed Front (`_F.jpg`) & Back (`_B.jpg`) images across
         `D:\\Tabulas Set Library\\_My_Collection\\` and `D:\\Tabulas Set Library\\Reference_Library\\`.
-      - Saves compact `float16` vectors into `Cache\\Library\\neural_embeddings_v1.pkl` with
-        checkpoints every 1,000 images.
+      - Upgrades legacy v24 entries in-place to v25 multi-region descriptors (`border_vec`,
+        `corner_vec`, `center_vec`, `color_foil_vec`) when `upgrade_legacy=True`.
+      - Uses double-buffered CPU decode + GPU inference and large-cache checkpoint cadence
+        (1,500 items or 60s) into `neural_embeddings_v1.pkl`.
     """
     ensure_directories()
     eng = get_neural_embedding_engine(load_now=True)
@@ -546,24 +1002,34 @@ def build_or_update_neural_embedding_index(
             "DINOv2-small ONNX model is not installed yet. Click 'Download DINOv2-small ONNX' in Settings -> Hardware & GPU first."
         )
 
+    cfg = load_compute_settings()
+    want_mr = bool(cfg.get("enable_multiregion_neural", True))
+    eff_bs = max(4, min(64, int(batch_size or get_recommended_neural_batch_size(cfg))))
+
     clean_set_f = str(set_filter or "").strip()
     if clean_set_f in ("All Sets", "ALL"):
         clean_set_f = ""
     target_sk = canonical_set_key(clean_set_f) if clean_set_f else ""
 
-    cache = {"schema": "v24_dinov2_fp16", "model": eng.model_path.name, "embeddings": {}} if force_rebuild else load_neural_embeddings_cache(force_reload=True)
+    cache = (
+        {"schema": NEURAL_CACHE_SCHEMA_V25, "model": eng.model_path.name, "embeddings": {}}
+        if force_rebuild
+        else load_neural_embeddings_cache(force_reload=True)
+    )
     embs: dict = cache.setdefault("embeddings", {})
     cache["model"] = eng.model_path.name
+    cache["schema"] = NEURAL_CACHE_SCHEMA_V25
 
     if log_cb:
         log_cb(
             f"🧬 Scanning Reference_Library & _My_Collection for neural indexing "
-            f"(provider={eng.active_provider}, batch={batch_size}, set={clean_set_f or 'All Sets'})..."
+            f"(provider={eng.active_provider}, batch={eff_bs}, multiregion={want_mr}, set={clean_set_f or 'All Sets'})..."
         )
 
     # Discover candidate Front & Back .jpg images (skip _C.jpg corner sheets!)
     candidates: list[tuple[Path, str, float, dict]] = []
     skipped_cached = 0
+    upgrading_legacy = 0
     roots = [(REVIEWED_CARDS_DIR, "My_Collection"), (REFERENCE_TEMPLATES_DIR, "Reference_Library")]
 
     for root_dir, src_lbl in roots:
@@ -588,8 +1054,10 @@ def build_or_update_neural_embedding_index(
                     continue
                 existing = embs.get(k)
                 if not force_rebuild and isinstance(existing, dict) and existing.get("vec") is not None and abs(float(existing.get("mtime", 0.0)) - mt) < 2.0:
-                    skipped_cached += 1
-                    continue
+                    if not (upgrade_legacy and want_mr) or _rec_has_multiregion(existing):
+                        skipped_cached += 1
+                        continue
+                    upgrading_legacy += 1
                 parsed = parse_unified_card_filename(img_p.name) or {}
                 s_name = parsed.get("set") or sub_dir.name.replace("_", " ")
                 side_c = parsed.get("side") or ("B" if up_n.endswith("_B.JPG") else "F")
@@ -613,6 +1081,7 @@ def build_or_update_neural_embedding_index(
         return {
             "success": True,
             "newly_embedded": 0,
+            "upgraded_legacy": 0,
             "skipped_cached": skipped_cached,
             "total_cached": len(embs),
             "provider": eng.active_provider,
@@ -620,9 +1089,10 @@ def build_or_update_neural_embedding_index(
         }
 
     if log_cb:
+        upg_note = f", including {upgrading_legacy:,} legacy v24->v25 upgrades" if upgrading_legacy else ""
         log_cb(
-            f"⚡ Embedding {total_new:,} new/changed card image(s) on {eng.active_provider} "
-            f"(skipping {skipped_cached:,} already-indexed images)..."
+            f"⚡ Embedding {total_new:,} card image(s) on {eng.active_provider} "
+            f"(skipping {skipped_cached:,} up-to-date{upg_note})..."
         )
 
     from concurrent.futures import ThreadPoolExecutor
@@ -630,63 +1100,88 @@ def build_or_update_neural_embedding_index(
     t0 = time.perf_counter()
     embedded_ok = 0
     failed_cnt = 0
-    bs = max(4, min(64, int(batch_size or 32)))
+    bs = eff_bs
+    items_since_flush = 0
+    last_flush_ts = time.monotonic()
 
     def _load_rgb_fast(item_tuple):
         img_p, _, _, meta = item_tuple
         try:
             with Image.open(img_p) as im:
-                # Fast pre-resize to 224x224 on decode threads so GPU stays 100% fed!
+                # Resize to 224x224 on decode threads (also valid for 160x224 color_foil_vec)
                 arr = np.array(im.convert("RGB").resize((224, 224), Image.Resampling.BILINEAR))
             return arr, meta
         except Exception:
             return None, meta
 
-    with ThreadPoolExecutor(max_workers=4) as decode_pool:
-      for start_i in range(0, total_new, bs):
-        batch_slice = candidates[start_i : start_i + bs]
-        crops_rgb: list[np.ndarray] = []
-        valid_metas: list[dict] = []
-
-        for arr_c, meta_c in decode_pool.map(_load_rgb_fast, batch_slice):
+    def _decode_slice(pool: ThreadPoolExecutor, batch_slice: list) -> tuple[list[np.ndarray], list[dict], int]:
+        crops: list[np.ndarray] = []
+        metas: list[dict] = []
+        errs = 0
+        for arr_c, meta_c in pool.map(_load_rgb_fast, batch_slice):
             if arr_c is not None:
-                crops_rgb.append(arr_c)
-                valid_metas.append(meta_c)
+                crops.append(arr_c)
+                metas.append(meta_c)
             else:
-                failed_cnt += 1
+                errs += 1
+        return crops, metas, errs
 
-        if crops_rgb:
-            vecs = eng.extract_embeddings_batch(crops_rgb, batch_size=bs)
-            for meta, vec in zip(valid_metas, vecs):
-                if vec is not None:
-                    embs[meta["key"]] = {
-                        "path": meta["path"],
-                        "mtime": meta["mtime"],
-                        "set_key": meta["set_key"],
-                        "subset": meta["subset"],
-                        "n_cnum": meta["n_cnum"],
-                        "side": meta["side"],
-                        "source": meta["source"],
-                        "vec": vec.astype(np.float16),
-                    }
-                    embedded_ok += 1
-                else:
-                    failed_cnt += 1
+    slices = [candidates[i : i + bs] for i in range(0, total_new, bs)]
+    with ThreadPoolExecutor(max_workers=4) as decode_pool:
+        next_future = decode_pool.submit(_decode_slice, decode_pool, slices[0]) if slices else None
+        done_n = 0
+        for s_idx, cur_slice in enumerate(slices):
+            crops_rgb, valid_metas, dec_errs = next_future.result() if next_future else ([], [], 0)
+            failed_cnt += dec_errs
+            if s_idx + 1 < len(slices):
+                next_future = decode_pool.submit(_decode_slice, decode_pool, slices[s_idx + 1])
+            else:
+                next_future = None
 
-        done_n = min(total_new, start_i + len(batch_slice))
-        elapsed = max(0.05, time.perf_counter() - t0)
-        rate_ips = done_n / elapsed
-        if progress_callback:
-            progress_callback(
-                done_n,
-                total_new,
-                f"Embedded {done_n:,}/{total_new:,} images ({rate_ips:.1f} img/s on {eng.active_provider})",
-            )
-        elif log_cb and (done_n % (bs * 8) == 0 or done_n == total_new):
-            log_cb(f"  [{done_n}/{total_new}] Embedded {embedded_ok:,} images @ {rate_ips:.1f} img/s ({eng.active_provider})")
+            if crops_rgb:
+                descs = eng.extract_descriptors_batch(crops_rgb, batch_size=bs, include_color_foil=want_mr)
+                for meta, desc in zip(valid_metas, descs):
+                    if desc is not None:
+                        rec_entry = {
+                            "path": meta["path"],
+                            "mtime": meta["mtime"],
+                            "set_key": meta["set_key"],
+                            "subset": meta["subset"],
+                            "n_cnum": meta["n_cnum"],
+                            "side": meta["side"],
+                            "source": meta["source"],
+                            "schema_v": 2,
+                            "vec": desc["vec"].astype(np.float16),
+                        }
+                        for sub_k in ("border_vec", "corner_vec", "center_vec", "color_foil_vec"):
+                            if desc.get(sub_k) is not None:
+                                rec_entry[sub_k] = np.asarray(desc[sub_k], dtype=np.float16)
+                        embs[meta["key"]] = rec_entry
+                        embedded_ok += 1
+                        items_since_flush += 1
+                    else:
+                        failed_cnt += 1
 
-        if done_n % 1000 < bs and done_n < total_new:
-            save_neural_embeddings_cache(cache)
+            done_n = min(total_new, done_n + len(cur_slice))
+            elapsed = max(0.05, time.perf_counter() - t0)
+            rate_ips = done_n / elapsed
+            if progress_callback:
+                progress_callback(
+                    done_n,
+                    total_new,
+                    f"Embedded {done_n:,}/{total_new:,} images ({rate_ips:.1f} img/s on {eng.active_provider})",
+                )
+            elif log_cb and (done_n % (bs * 8) == 0 or done_n == total_new):
+                log_cb(f"  [{done_n}/{total_new}] Embedded {embedded_ok:,} images @ {rate_ips:.1f} img/s ({eng.active_provider})")
+
+            now_m = time.monotonic()
+            if s_idx + 1 < len(slices) and items_since_flush > 0 and (
+                items_since_flush >= _INDEX_CHECKPOINT_INTERVAL_ITEMS
+                or (now_m - last_flush_ts) >= _INDEX_CHECKPOINT_INTERVAL_SEC
+            ):
+                save_neural_embeddings_cache(cache)
+                items_since_flush = 0
+                last_flush_ts = time.monotonic()
 
     save_neural_embeddings_cache(cache)
     total_sec = round(time.perf_counter() - t0, 1)
@@ -700,6 +1195,7 @@ def build_or_update_neural_embedding_index(
     return {
         "success": True,
         "newly_embedded": embedded_ok,
+        "upgraded_legacy": upgrading_legacy,
         "skipped_cached": skipped_cached,
         "failed": failed_cnt,
         "total_cached": len(embs),
@@ -754,11 +1250,83 @@ def search_set_neural_embeddings(
     return [(score, metas[idx]) for idx, score in hits]
 
 
-def benchmark_dinov2_gpu_vs_cpu(batch_size: int = 16) -> dict:
-    """Benchmarks DINOv2-small Batch-16 embedding extraction on CPU vs. DirectML/CUDA GPU."""
+def score_parallel_group_vectorized(
+    q_desc: dict,
+    ref_paths: list[str],
+    top_k: int = 5,
+) -> Optional[float]:
+    """
+    Vectorized multi-region parallel exemplar group scoring:
+    Stacks `border_vec`, `corner_vec`, and `color_foil_vec` for all cached `ref_paths`
+    and computes `M @ q` in one BLAS pass, returning the mean of the Top-K scores.
+    """
+    if not isinstance(q_desc, dict) or not ref_paths:
+        return None
+    cache = load_neural_embeddings_cache()
+    embs = cache.get("embeddings") or {}
+    if not embs:
+        return None
+
+    norm_keys = tuple(_norm_path_key(p) for p in ref_paths if p)
+    if not norm_keys:
+        return None
+    cache_len = len(embs)
+
+    with _INDEX_LOCK:
+        cached_grp = _PAR_GROUP_MATRIX_CACHE.get(norm_keys)
+        if cached_grp is not None and cached_grp[0] == cache_len:
+            mats = cached_grp[1]
+        else:
+            recs = [embs.get(k) for k in norm_keys]
+            recs = [r for r in recs if isinstance(r, dict) and r.get("vec") is not None]
+            if not recs:
+                return None
+            mats = {}
+            for ch in ("border_vec", "corner_vec", "color_foil_vec"):
+                ch_vecs = [np.asarray(r[ch], dtype=np.float32) for r in recs if r.get(ch) is not None]
+                if len(ch_vecs) == len(recs):
+                    mats[ch] = np.stack(ch_vecs, axis=0)
+            if not mats:
+                return None
+            if len(_PAR_GROUP_MATRIX_CACHE) >= 256:
+                _PAR_GROUP_MATRIX_CACHE.clear()
+            _PAR_GROUP_MATRIX_CACHE[norm_keys] = (cache_len, mats)
+
+    ch_weights = (("border_vec", 0.38), ("corner_vec", 0.17), ("color_foil_vec", 0.45))
+    total_scores = None
+    total_w = 0.0
+    for ch, wt in ch_weights:
+        mat = mats.get(ch)
+        qv = q_desc.get(ch)
+        if mat is None or qv is None:
+            continue
+        q = np.asarray(qv, dtype=np.float32).reshape(-1)
+        if q.shape[0] != mat.shape[1]:
+            continue
+        raw_s = mat @ q
+        if ch == "color_foil_vec":
+            s_vec = np.clip(raw_s, 0.0, 1.0)
+        else:
+            s_vec = np.where(raw_s >= 0.72, 0.72 + (raw_s - 0.72) * 1.08, raw_s * 0.98)
+            s_vec = np.clip(s_vec, 0.0, 1.0)
+        total_scores = (s_vec * wt) if total_scores is None else (total_scores + s_vec * wt)
+        total_w += wt
+
+    if total_scores is None or total_w <= 1e-6:
+        return None
+    blended = total_scores / total_w
+    k = min(max(1, int(top_k)), len(blended))
+    top_vals = np.partition(blended, -k)[-k:]
+    return float(np.mean(top_vals))
+
+
+def benchmark_dinov2_gpu_vs_cpu(batch_size: Optional[int] = None) -> dict:
+    """Benchmarks DINOv2-small micro-batched multi-region extraction on CPU vs. DirectML/CUDA GPU."""
+    eff_bs = max(4, min(64, int(batch_size or get_recommended_neural_batch_size())))
     out = {
         "installed": False,
-        "batch_size": int(batch_size),
+        "batch_size": eff_bs,
+        "multiregion_enabled": True,
         "cpu_ms_per_batch": None,
         "gpu_ms_per_batch": None,
         "cpu_cards_per_sec": None,
@@ -773,30 +1341,30 @@ def benchmark_dinov2_gpu_vs_cpu(batch_size: int = 16) -> dict:
         return out
 
     out["installed"] = True
-    synth_batch = [np.random.randint(20, 235, (256, 200, 3), dtype=np.uint8) for _ in range(int(batch_size))]
+    synth_batch = [np.random.randint(20, 235, (256, 200, 3), dtype=np.uint8) for _ in range(eff_bs)]
 
     try:
         eng_cpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=False, claim_slot=False)
         if eng_cpu.ensure_loaded():
-            eng_cpu.extract_embeddings_batch(synth_batch[:4], batch_size=4)  # warmup
+            eng_cpu.extract_descriptors_batch(synth_batch[:4], batch_size=4)  # warmup
             t0 = time.perf_counter()
-            eng_cpu.extract_embeddings_batch(synth_batch, batch_size=batch_size)
+            eng_cpu.extract_descriptors_batch(synth_batch, batch_size=eff_bs)
             cpu_ms = (time.perf_counter() - t0) * 1000.0
             out["cpu_ms_per_batch"] = round(cpu_ms, 1)
-            out["cpu_cards_per_sec"] = round((batch_size * 1000.0) / max(0.1, cpu_ms), 1)
+            out["cpu_cards_per_sec"] = round((eff_bs * 1000.0) / max(0.1, cpu_ms), 1)
 
         eng_gpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=True, claim_slot=False)
         if eng_gpu.ensure_loaded():
             out["gpu_provider"] = eng_gpu.active_provider
             if eng_gpu.active_provider != "CPUExecutionProvider":
                 # Warmup DirectML shader compilation for fixed shape [B, 3, 224, 224]
-                eng_gpu.extract_embeddings_batch(synth_batch, batch_size=batch_size)
+                eng_gpu.extract_descriptors_batch(synth_batch, batch_size=eff_bs)
                 t1 = time.perf_counter()
                 for _ in range(3):
-                    eng_gpu.extract_embeddings_batch(synth_batch, batch_size=batch_size)
+                    eng_gpu.extract_descriptors_batch(synth_batch, batch_size=eff_bs)
                 gpu_ms = ((time.perf_counter() - t1) / 3.0) * 1000.0
                 out["gpu_ms_per_batch"] = round(gpu_ms, 1)
-                out["gpu_cards_per_sec"] = round((batch_size * 1000.0) / max(0.1, gpu_ms), 1)
+                out["gpu_cards_per_sec"] = round((eff_bs * 1000.0) / max(0.1, gpu_ms), 1)
                 if out["cpu_ms_per_batch"]:
                     out["speedup"] = round(out["cpu_ms_per_batch"] / max(0.1, gpu_ms), 2)
     except Exception as e:
@@ -832,11 +1400,16 @@ def get_neural_foundation_status() -> dict:
             "size_mb": round(p.stat().st_size / (1024.0 * 1024.0), 1) if is_inst else 0.0,
         })
     emb_cache_count = 0
+    mr_cache_count = 0
+    cache_schema = NEURAL_CACHE_SCHEMA_V25
     cache_updated = ""
     if NEURAL_EMBEDDINGS_CACHE_FILE.exists():
         try:
             c_obj = load_neural_embeddings_cache()
-            emb_cache_count = len(c_obj.get("embeddings") or {})
+            embs_d = c_obj.get("embeddings") or {}
+            emb_cache_count = len(embs_d)
+            mr_cache_count = sum(1 for r in embs_d.values() if _rec_has_multiregion(r))
+            cache_schema = str(c_obj.get("schema") or NEURAL_CACHE_SCHEMA_V24)
             cache_updated = str(c_obj.get("updated_at") or "")
         except Exception:
             pass
@@ -845,6 +1418,9 @@ def get_neural_foundation_status() -> dict:
         "embeddings_cache_file": str(NEURAL_EMBEDDINGS_CACHE_FILE),
         "dinov2_installed": dinov2_installed,
         "cached_embeddings_count": emb_cache_count,
+        "multiregion_embeddings_count": mr_cache_count,
+        "cache_schema": cache_schema,
+        "recommended_batch_size": get_recommended_neural_batch_size(),
         "cache_updated_at": cache_updated,
         "installed_models_count": sum(1 for m in installed_models if m["installed"]),
         "models": installed_models,

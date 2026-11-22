@@ -9406,7 +9406,7 @@ export default function App() {
                       />
                       {!settingsLayout.hardware?.collapsed && (() => {
                         const cs = computeStatus || {};
-                        const cSet = cs.settings || { compute_mode: 'auto', enable_ocr_gpu: true, enable_opencl_cv: true, max_concurrent_gpu_workers: 2 };
+                        const cSet = cs.settings || { compute_mode: 'auto', enable_ocr_gpu: true, enable_opencl_cv: true, enable_neural_embeddings: true, enable_multiregion_neural: true, neural_batch_size: 32, max_concurrent_gpu_workers: 2 };
                         const ort = cs.onnxruntime || {};
                         const ocl = cs.opencl || {};
                         const nf = cs.neural_foundation || {};
@@ -9537,7 +9537,19 @@ export default function App() {
                                   <option value={3}>3 GPU Workers</option>
                                 </select>
                               </div>
-                              <div className="md:col-span-3 flex flex-col gap-1 pt-1">
+                              <div className="md:col-span-2">
+                                <label className="block text-[10px] text-slate-400 mb-1">Neural Batch Size</label>
+                                <select
+                                  value={cSet.neural_batch_size || 32}
+                                  onChange={(e) => updateComputeCfg({ neural_batch_size: parseInt(e.target.value, 10) || 32 })}
+                                  className="w-full bg-slate-900 border border-indigo-700/70 rounded-lg px-2 py-1.5 text-xs font-mono text-indigo-200"
+                                >
+                                  <option value={16}>16 (Conservative)</option>
+                                  <option value={32}>32 (RX 9070 XT)</option>
+                                  <option value={64}>64 (Max Throughput)</option>
+                                </select>
+                              </div>
+                              <div className="md:col-span-12 flex flex-wrap items-center gap-4 pt-1">
                                 <label className="flex items-center gap-1.5 text-xs text-slate-200 cursor-pointer">
                                   <input type="checkbox" checked={!!cSet.enable_ocr_gpu} onChange={(e) => updateComputeCfg({ enable_ocr_gpu: e.target.checked })} />
                                   Enable RapidOCR GPU (Win #1)
@@ -9573,7 +9585,7 @@ export default function App() {
                                   </div>
                                 </div>
                                 <div>
-                                  <div className="text-indigo-300 font-bold mb-0.5">🧬 Win #2 — DINOv2-small (Batch-16)</div>
+                                  <div className="text-indigo-300 font-bold mb-0.5">🧬 Win #2 — DINOv2-small (Batch-{computeBench.dinov2?.batch_size || cSet.neural_batch_size || 32})</div>
                                   {computeBench.dinov2?.installed ? (
                                     <div className="text-slate-300">
                                       CPU: <span className="text-white">{computeBench.dinov2.cpu_cards_per_sec ?? '—'}/s</span> • GPU:{' '}
@@ -9600,6 +9612,11 @@ export default function App() {
                                 </div>
                                 <div className="text-slate-300">
                                   Indexed Card Embeddings: <span className="font-mono text-white font-bold">{(nf.cached_embeddings_count || 0).toLocaleString()}</span>
+                                  {nf.multiregion_embeddings_count > 0 ? (
+                                    <span className="text-cyan-300 ml-2 font-mono text-[10px]">
+                                      • {nf.multiregion_embeddings_count.toLocaleString()} Multi-Region (v25)
+                                    </span>
+                                  ) : null}
                                   {nf.cache_updated_at ? <span className="text-slate-500 ml-2">(updated {nf.cache_updated_at})</span> : null}
                                   <span className="text-slate-500 ml-2 font-mono text-[10px]">{nf.models_dir || 'Cache\\Library\\Models'}</span>
                                 </div>
@@ -9617,14 +9634,14 @@ export default function App() {
                                   <>
                                     <button
                                       type="button"
-                                      onClick={() => triggerJob('system', 'Build / Update DINOv2 Neural Index (GPU Batch-32)', 'build_neural_index', { batch_size: 32, force_rebuild: false, estimated_total: 1000 })}
+                                      onClick={() => triggerJob('system', `Build / Update DINOv2 Neural Index (GPU Batch-${cSet.neural_batch_size || 32})`, 'build_neural_index', { batch_size: cSet.neural_batch_size || 32, force_rebuild: false, estimated_total: 1000 })}
                                       className={`px-3.5 py-1.5 rounded-xl font-extrabold text-xs shadow ${skin.accentBtn}`}
                                     >
                                       🧬 Build / Update Neural Index
                                     </button>
                                     <button
                                       type="button"
-                                      onClick={() => triggerJob('system', 'Rebuild Full DINOv2 Neural Index (Force)', 'build_neural_index', { batch_size: 32, force_rebuild: true, estimated_total: 1000 })}
+                                      onClick={() => triggerJob('system', `Rebuild Full DINOv2 Neural Index (GPU Batch-${cSet.neural_batch_size || 32})`, 'build_neural_index', { batch_size: cSet.neural_batch_size || 32, force_rebuild: true, estimated_total: 1000 })}
                                       title="Re-embed all Reference_Library and _My_Collection card images from scratch"
                                       className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-semibold text-xs"
                                     >

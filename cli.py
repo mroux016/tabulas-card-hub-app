@@ -58,7 +58,7 @@ from Core.config import (
     sanitize_filename_part,
 )
 from Core.rate_learner import get_rate_learner
-from Core.compute_backend import init_worker_compute_backend, probe_system_hardware, release_gpu_worker_slot
+from Core.compute_backend import get_recommended_neural_batch_size, init_worker_compute_backend, probe_system_hardware, release_gpu_worker_slot
 from Core.neural_vision import build_or_update_neural_embedding_index, download_dinov2_small_model
 from Core.database import (
     find_unarchived_scan_batches,
@@ -1618,7 +1618,7 @@ def run_background_job_from_file(payload_path: Path):
         elif job_type == "build_neural_index":
             build_or_update_neural_embedding_index(
                 set_filter=str(payload.get("set_filter") or "").strip() or None,
-                batch_size=int(payload.get("batch_size", 32)),
+                batch_size=int(payload.get("batch_size") or get_recommended_neural_batch_size()),
                 force_rebuild=bool(payload.get("force_rebuild", False)),
                 log_cb=_worker_log_cb,
                 progress_callback=lambda cur_i, tot_i, msg: _worker_log_cb(f"[{cur_i}/{tot_i}] {msg}"),
