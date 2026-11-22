@@ -2031,6 +2031,9 @@ function GradingDeepDiveStudio({
   onBack,
   backLabel = 'Back',
   onSwitchIndividual,
+  onSwitchBulk,
+  cardOptions,
+  onSelectCardIndex,
   onCardUpdated,
   skin,
   pushNotification,
@@ -2048,7 +2051,7 @@ function GradingDeepDiveStudio({
   const [naturalSize, setNaturalSize] = useState({ w: 1500, h: 2100 });
   const canvasWrapRef = useRef(null);
   const svgRef = useRef(null);
-  const [fittedBox, setFittedBox] = useState({ w: 380, h: 532 });
+  const [fittedBox, setFittedBox] = useState({ w: 340, h: 476 });
 
   // Main Card Zoom & Pan
   const [mainZoom, setMainZoom] = useState(1.0);
@@ -2062,6 +2065,15 @@ function GradingDeepDiveStudio({
   const [draftCorners, setDraftCorners] = useState(null);
   const [savingGeom, setSavingGeom] = useState(false);
   const geomDragRef = useRef(null);
+
+  // Virtual Clear Centering Card Overlay (Legends-style transparent centering tool)
+  const [showCenteringGauge, setShowCenteringGauge] = useState(false);
+  const [gaugeOpacity, setGaugeOpacity] = useState(80);
+  const [gaugeRotate, setGaugeRotate] = useState(0.0);
+  const [gaugeNudge, setGaugeNudge] = useState({ x: 0, y: 0 });
+  const [gaugeFormatOverride, setGaugeFormatOverride] = useState('auto'); // 'auto' | 'standard' | 'mini'
+  const [gaugeColorMode, setGaugeColorMode] = useState('contrast'); // 'contrast' | 'classic_black' | 'cyan'
+  const [showLegendsChart, setShowLegendsChart] = useState(false);
 
   const sku = String(card?.SKU || '').trim();
   const effectiveBatch = batchName || card?._BatchName || '';
@@ -2093,6 +2105,9 @@ function GradingDeepDiveStudio({
     setEditMode('none');
     setMainZoom(1.0);
     setMainPan({ x: 0, y: 0 });
+    setGaugeRotate(0.0);
+    setGaugeNudge({ x: 0, y: 0 });
+    setGaugeFormatOverride('auto');
     setDiagnostics(null);
     fetchDiagnostics(false);
   }, [sku, targetType, effectiveBatch]);
@@ -2102,6 +2117,8 @@ function GradingDeepDiveStudio({
     setEditMode('none');
     setMainZoom(1.0);
     setMainPan({ x: 0, y: 0 });
+    setGaugeRotate(0.0);
+    setGaugeNudge({ x: 0, y: 0 });
   }, [activeSide]);
 
   useEffect(() => {
@@ -2117,8 +2134,8 @@ function GradingDeepDiveStudio({
     if (!el) return;
     const updateFit = () => {
       const rect = el.getBoundingClientRect();
-      const availW = Math.max(120, rect.width - 16);
-      const availH = Math.max(180, rect.height - 16);
+      const availW = Math.max(80, Math.floor((rect.width - 24) * 0.96));
+      const availH = Math.max(80, Math.floor((rect.height - 48) * 0.95));
       const natW = Math.max(1, naturalSize.w || 1500);
       const natH = Math.max(1, naturalSize.h || 2100);
       const ratio = natW / natH;
@@ -2128,7 +2145,7 @@ function GradingDeepDiveStudio({
         fh = availH;
         fw = fh * ratio;
       }
-      setFittedBox({ w: Math.max(100, Math.floor(fw)), h: Math.max(140, Math.floor(fh)) });
+      setFittedBox({ w: Math.max(70, Math.floor(fw)), h: Math.max(70, Math.floor(fh)) });
     };
     updateFit();
     if (typeof ResizeObserver !== 'undefined') {
@@ -2138,7 +2155,7 @@ function GradingDeepDiveStudio({
     }
     window.addEventListener('resize', updateFit);
     return () => window.removeEventListener('resize', updateFit);
-  }, [naturalSize.w, naturalSize.h]);
+  }, [naturalSize.w, naturalSize.h, showCenteringGauge, editMode]);
 
   const sFold = encodeURIComponent(sanitizeFolderName(card?.Set || ''));
   const frontUrl = card?.Front_File
@@ -2588,35 +2605,92 @@ function GradingDeepDiveStudio({
     { key: 'surface', title: 'Surface', icon: '✨', color: 'purple', text: notesByCat.surface },
   ];
 
+  // Compute physical card format ('standard' 2.5x3.5 vs 'mini' 1.5x2.625), orientation, and skew angle for Virtual Centering Gauge
+  const gaugeGeometry = (() => {
+    const baseRect = Array.isArray(activeOuterRect) && activeOuterRect.length === 4
+      ? activeOuterRect
+      : [0.04, 0.03, 0.92, 0.94];
+    const [ox, oy, ow, oh] = baseRect;
+    const rawCardPxW = Math.max(10, ow * (naturalSize.w || 1500));
+    const rawCardPxH = Math.max(10, oh * (naturalSize.h || 2100));
+    const isLandscape = sideCent?.orientation === 'landscape' || rawCardPxW > rawCardPxH * 1.05 || (naturalSize.w || 1500) > (naturalSize.h || 2100) * 1.05;
+    const shortLongAspect = Math.min(rawCardPxW, rawCardPxH) / Math.max(1, Math.max(rawCardPxW, rawCardPxH));
+    const metaStr = `${card?.Set || ''} ${card?.Subset || ''} ${card?.Subset_Parallel || ''}`;
+    const isFramedMini = /\b(framed|rip card|full[- ]size|boxloader)\b/i.test(metaStr);
+    const isNamedMini = !isFramedMini && /\b(mini|t206|topps 206|tobacco)\b/i.test(metaStr);
+    const autoIsMini = sideCent?.card_format === 'mini' || (!isFramedMini && shortLongAspect <= 0.635) || isNamedMini;
+    const isMini = gaugeFormatOverride === 'mini' ? true : gaugeFormatOverride === 'standard' ? false : autoIsMini;
+
+    // Base skew angle from sideCent.skew_deg or detected TL->TR corner slope
+    let baseSkew = Number(sideCent?.skew_deg || 0);
+    if (!Number.isFinite(baseSkew)) baseSkew = 0;
+    if (baseSkew === 0 && sideCent?.corners?.tl && sideCent?.corners?.tr) {
+      const dx = (sideCent.corners.tr[0] - sideCent.corners.tl[0]) * (naturalSize.w || 1500);
+      const dy = (sideCent.corners.tr[1] - sideCent.corners.tl[1]) * (naturalSize.h || 2100);
+      if (Math.abs(dx) > 20) {
+        const calcDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+        if (Math.abs(calcDeg) <= 4.5) baseSkew = Number(calcDeg.toFixed(2));
+      }
+    }
+    const totalAngle = Number((baseSkew + gaugeRotate).toFixed(2));
+
+    // Physical dimensions in inches
+    const physShortIn = isMini ? 1.5 : 2.5;
+    const physLongIn = isMini ? 2.625 : 3.5;
+    const physWIn = isLandscape ? physLongIn : physShortIn;
+    const physHIn = isLandscape ? physShortIn : physLongIn;
+
+    return {
+      ox: Math.max(0.0, Math.min(0.95, ox + gaugeNudge.x)),
+      oy: Math.max(0.0, Math.min(0.95, oy + gaugeNudge.y)),
+      ow: Math.max(0.05, Math.min(1.0, ow)),
+      oh: Math.max(0.05, Math.min(1.0, oh)),
+      isLandscape,
+      isMini,
+      autoIsMini,
+      baseSkew,
+      totalAngle,
+      physWIn,
+      physHIn,
+      formatLabel: isMini ? 'Mini (1.5"×2.625")' : 'Standard (2.5"×3.5")',
+      orientLabel: isLandscape ? 'Landscape' : 'Portrait',
+    };
+  })();
+
   return (
-    <div className="flex flex-col gap-2.5 h-[calc(100vh-56px)] overflow-hidden">
-      {/* TOP BAR */}
-      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0`}>
+    <div className="flex-1 min-h-0 h-full flex flex-col gap-2 overflow-hidden">
+      {/* SINGLE COMPACT TOP BAR (~44px) */}
+      <div className={`${skin.cardBg} border ${skin.border} rounded-xl px-3 py-1.5 min-h-[42px] flex flex-wrap items-center justify-between gap-2 shrink-0`}>
         <div className="flex flex-wrap items-center gap-2 min-w-0">
           {onBack && (
-            <button type="button" onClick={onBack} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">
+            <button type="button" onClick={onBack} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold shrink-0">
               ⬅ {backLabel}
             </button>
           )}
-          {onSwitchIndividual && (
-            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
-              <button type="button" onClick={onSwitchIndividual} className="px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white">🪟 Individual</button>
-              <button type="button" className={`px-2.5 py-1 rounded-lg font-bold ${skin.accentActive}`}>🔬 Deep-Dive</button>
+          {(onSwitchIndividual || onSwitchBulk) && (
+            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px] shrink-0">
+              {onSwitchIndividual && (
+                <button type="button" onClick={onSwitchIndividual} className="px-2 py-0.5 rounded-md font-bold text-slate-400 hover:text-white">🪟 Individual</button>
+              )}
+              <button type="button" className={`px-2 py-0.5 rounded-md font-bold ${skin.accentActive}`}>🔬 Deep-Dive</button>
+              {onSwitchBulk && (
+                <button type="button" onClick={onSwitchBulk} className="px-2 py-0.5 rounded-md font-bold text-slate-400 hover:text-white">📋 Bulk</button>
+              )}
             </div>
           )}
-          <div className="min-w-0">
-            <span className="text-xs font-mono text-sky-400 font-bold mr-2">SKU {sku}</span>
-            <span className="text-sm font-extrabold text-white truncate">
+          <div className="min-w-0 flex items-center gap-1.5 truncate">
+            <span className="text-xs font-mono text-sky-400 font-bold shrink-0">SKU {sku}</span>
+            <span className="text-xs font-extrabold text-white truncate">
               {card?.Set} #{cnumDisp} {card?.Player} <span className="text-slate-400 font-normal">({subDisp})</span>
             </span>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
           <button
             type="button"
             onClick={() => { setFlagPresetId(isolatedDefectId || ''); setShowFlagModal(true); }}
-            className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow"
+            className="px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow"
           >
             🚩 Flag Error
           </button>
@@ -2624,22 +2698,34 @@ function GradingDeepDiveStudio({
             type="button"
             disabled={loadingDiag}
             onClick={() => fetchDiagnostics(true)}
-            className="px-2.5 py-1.5 rounded-xl bg-cyan-950/90 hover:bg-cyan-800 border border-cyan-600/70 text-cyan-200 font-bold text-xs disabled:opacity-45"
+            className="px-2.5 py-1 rounded-lg bg-cyan-950/90 hover:bg-cyan-800 border border-cyan-600/70 text-cyan-200 font-bold text-xs disabled:opacity-45"
           >
             {loadingDiag ? '⏳ Scanning...' : '🔄 Re-Scan'}
           </button>
-          <div className="flex items-center gap-1.5 text-xs">
-            <button type="button" onClick={onPrev} disabled={cardIndex <= 0} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 font-bold">◀ Prev</button>
-            <span className="font-mono text-slate-300 px-1">{cardIndex + 1} / {Math.max(1, totalCards)}</span>
-            <button type="button" onClick={onNext} disabled={cardIndex >= totalCards - 1} className={`px-2.5 py-1.5 rounded-xl disabled:opacity-35 font-bold ${skin.accentBtn}`}>Next ▶</button>
+          <div className="flex items-center gap-1 text-xs">
+            <button type="button" onClick={onPrev} disabled={cardIndex <= 0} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-35 font-bold">◀ Prev</button>
+            {Array.isArray(cardOptions) && cardOptions.length > 1 && onSelectCardIndex ? (
+              <select
+                value={cardIndex}
+                onChange={(e) => onSelectCardIndex(parseInt(e.target.value, 10) || 0)}
+                className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] font-mono max-w-[210px] text-slate-200"
+              >
+                {cardOptions.map((opt) => (
+                  <option key={opt.index} value={opt.index}>{opt.label}</option>
+                ))}
+              </select>
+            ) : (
+              <span className="font-mono text-slate-300 px-1">{cardIndex + 1} / {Math.max(1, totalCards)}</span>
+            )}
+            <button type="button" onClick={onNext} disabled={cardIndex >= totalCards - 1} className={`px-2 py-1 rounded-lg disabled:opacity-35 font-bold ${skin.accentBtn}`}>Next ▶</button>
           </div>
         </div>
       </div>
 
       {/* MAIN SPLIT PANE */}
-      <div className="flex-1 min-h-0 overflow-hidden grid grid-cols-1 lg:grid-cols-12 gap-3">
-        {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + ZOOM/PAN + EDIT CENTERING/CORNERS */}
-        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0`}>
+      <div className="flex-1 min-h-0 overflow-hidden grid grid-cols-1 lg:grid-cols-12 gap-2.5">
+        {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + ZOOM/PAN + CENTERING GAUGE + EDIT CENTERING/CORNERS */}
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-2.5 flex flex-col gap-1.5 min-h-0 h-full overflow-hidden`}>
           {/* LEFT TOOLBAR */}
           <div className="flex flex-wrap items-center justify-between gap-1.5 shrink-0">
             <div className="flex items-center gap-1.5">
@@ -2647,20 +2733,20 @@ function GradingDeepDiveStudio({
                 <button
                   type="button"
                   onClick={() => setActiveSide('Front')}
-                  className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Front' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                  className={`px-2.5 py-0.5 rounded-lg font-bold transition ${activeSide === 'Front' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
                 >
                   Front
                 </button>
                 <button
                   type="button"
                   onClick={() => setActiveSide('Back')}
-                  className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Back' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                  className={`px-2.5 py-0.5 rounded-lg font-bold transition ${activeSide === 'Back' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
                 >
                   Back
                 </button>
               </div>
               {sideCent?.sleeve_detected && (
-                <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 text-[10.5px] font-semibold">
+                <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 text-[10px] font-semibold">
                   🛡️ Sleeve
                 </span>
               )}
@@ -2676,6 +2762,20 @@ function GradingDeepDiveStudio({
                   <button type="button" onClick={() => { setMainZoom(1.0); setMainPan({ x: 0, y: 0 }); }} className="px-1.5 text-[10px] text-amber-300 hover:text-amber-200 font-bold">Reset</button>
                 )}
               </div>
+
+              {/* VIRTUAL CLEAR CENTERING CARD TOGGLE BUTTON */}
+              <button
+                type="button"
+                onClick={() => setShowCenteringGauge((v) => !v)}
+                title="Toggle Legends-style Virtual Clear Centering Card Overlay"
+                className={`px-2 py-1 rounded-lg border font-bold transition ${
+                  showCenteringGauge
+                    ? 'bg-cyan-500/25 border-cyan-400 text-cyan-100 ring-1 ring-cyan-400/40'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-cyan-200'
+                }`}
+              >
+                📏 Centering Gauge
+              </button>
 
               {editMode === 'none' ? (
                 <>
@@ -2698,7 +2798,7 @@ function GradingDeepDiveStudio({
               )}
 
               {anyFilteredOrIsolated && (
-                <button type="button" onClick={showAllMarkers} className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold shadow">
+                <button type="button" onClick={showAllMarkers} className="px-2 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold shadow">
                   👁️ Show All
                 </button>
               )}
@@ -2714,6 +2814,110 @@ function GradingDeepDiveStudio({
             </div>
           </div>
 
+          {/* COMPACT CENTERING GAUGE CONTROLS BAR (OPACITY 20%-90%, ROTATE -3° TO +3°, NUDGE, FORMAT & LEGENDS % CHART) */}
+          {showCenteringGauge && (
+            <div className="px-2.5 py-1 rounded-xl bg-slate-950/95 border border-cyan-500/45 flex flex-wrap items-center justify-between gap-2 text-[10.5px] shrink-0">
+              <div className="flex items-center gap-1.5">
+                <span className="font-bold text-cyan-300">📏 {gaugeGeometry.formatLabel} • {gaugeGeometry.orientLabel}</span>
+                <select
+                  value={gaugeFormatOverride}
+                  onChange={(e) => setGaugeFormatOverride(e.target.value)}
+                  title="Card Physical Format (Auto-detects Standard 2.5x3.5 vs Mini 1.5x2.625)"
+                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-200 font-semibold"
+                >
+                  <option value="auto">Auto ({gaugeGeometry.autoIsMini ? 'Mini' : 'Std'})</option>
+                  <option value="standard">Std 2.5×3.5</option>
+                  <option value="mini">Mini 1.5×2.625</option>
+                </select>
+                <select
+                  value={gaugeColorMode}
+                  onChange={(e) => setGaugeColorMode(e.target.value)}
+                  title="Gauge Line Contrast Theme"
+                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[10px] text-slate-200 font-semibold"
+                >
+                  <option value="contrast">Hi-Contrast</option>
+                  <option value="classic_black">Legends Ink</option>
+                  <option value="cyan">Cyan Glow</option>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setShowLegendsChart((v) => !v)}
+                  title="Toggle Legends 1-10 Line Pair Centering Percentages Chart (Red = 60/40 or Better)"
+                  className={`px-1.5 py-0.5 rounded border text-[10px] font-bold transition ${
+                    showLegendsChart ? 'bg-rose-950/90 border-rose-500 text-rose-200' : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300'
+                  }`}
+                >
+                  📊 % Chart
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* OPACITY SLIDER (20% - 90%) */}
+                <label className="flex items-center gap-1 text-slate-300" title="Virtual Centering Card Overlay Opacity (20%–90%)">
+                  <span className="text-slate-400">Opacity</span>
+                  <input
+                    type="range"
+                    min={20}
+                    max={90}
+                    step={5}
+                    value={gaugeOpacity}
+                    onChange={(e) => setGaugeOpacity(Number(e.target.value))}
+                    className="w-16 accent-cyan-400 cursor-pointer"
+                  />
+                  <span className="font-mono text-cyan-300 w-7 text-right">{gaugeOpacity}%</span>
+                </label>
+
+                {/* ROTATE (-3° TO +3°) */}
+                <div className="flex items-center gap-1 text-slate-300" title="Align Virtual Centering Card to skewed scans (-3° to +3°)">
+                  <span className="text-slate-400">Rotate</span>
+                  <button
+                    type="button"
+                    onClick={() => setGaugeRotate((r) => Math.max(-3.0, Number((r - 0.25).toFixed(2))))}
+                    className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
+                  >
+                    −
+                  </button>
+                  <input
+                    type="range"
+                    min={-3}
+                    max={3}
+                    step={0.1}
+                    value={gaugeRotate}
+                    onChange={(e) => setGaugeRotate(Number(e.target.value))}
+                    className="w-16 accent-amber-400 cursor-pointer"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setGaugeRotate((r) => Math.min(3.0, Number((r + 0.25).toFixed(2))))}
+                    className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
+                  >
+                    +
+                  </button>
+                  <span className="font-mono text-amber-300 w-11 text-right">
+                    {gaugeGeometry.totalAngle >= 0 ? `+${gaugeGeometry.totalAngle.toFixed(1)}°` : `${gaugeGeometry.totalAngle.toFixed(1)}°`}
+                  </span>
+                </div>
+
+                {/* NUDGE X/Y & RESET */}
+                <div className="flex items-center gap-0.5" title="Fine-nudge Virtual Centering Gauge position">
+                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.max(-0.08, p.x - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">◀</button>
+                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.max(-0.08, p.y - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▲</button>
+                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.min(0.08, p.y + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▼</button>
+                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.min(0.08, p.x + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▶</button>
+                  {(gaugeRotate !== 0 || gaugeNudge.x !== 0 || gaugeNudge.y !== 0 || gaugeFormatOverride !== 'auto') && (
+                    <button
+                      type="button"
+                      onClick={() => { setGaugeRotate(0.0); setGaugeNudge({ x: 0, y: 0 }); setGaugeFormatOverride('auto'); }}
+                      className="ml-1 px-1.5 py-0.5 rounded bg-amber-950/90 hover:bg-amber-800 border border-amber-600/60 text-amber-200 font-bold"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* CARD CANVAS */}
           <div
             ref={canvasWrapRef}
@@ -2721,7 +2925,7 @@ function GradingDeepDiveStudio({
             onPointerMove={handleCanvasPointerMove}
             onPointerUp={handleSvgPointerUp}
             onPointerLeave={handleSvgPointerUp}
-            className={`flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative ${mainZoom > 1.0 ? 'cursor-grab active:cursor-grabbing' : ''}`}
+            className={`flex-1 min-h-0 flex items-center justify-center pt-7 pb-2 px-2 bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative ${mainZoom > 1.0 ? 'cursor-grab active:cursor-grabbing' : ''}`}
           >
             {!activeImgUrl ? (
               <div className="text-xs text-slate-500">No {activeSide} scan image available.</div>
@@ -2838,29 +3042,242 @@ function GradingDeepDiveStudio({
                     );
                   })}
                 </svg>
+
+                {/* AUTHENTIC LEGENDS 10-LINE VIRTUAL CLEAR CENTERING CARD SVG OVERLAY (SOLID=ODD 1,3,5,7,9 • DASHED=EVEN 2,4,6,8,10) */}
+                {showCenteringGauge && (() => {
+                  const W = Math.max(100, fittedBox.w);
+                  const H = Math.max(100, fittedBox.h);
+                  const cardX = gaugeGeometry.ox * W;
+                  const cardY = gaugeGeometry.oy * H;
+                  const cardW = Math.max(40, gaugeGeometry.ow * W);
+                  const cardH = Math.max(40, gaugeGeometry.oh * H);
+                  const cx = cardX + cardW * 0.5;
+                  const cy = cardY + cardH * 0.5;
+                  const pxPerInX = cardW / gaugeGeometry.physWIn;
+                  const pxPerInY = cardH / gaugeGeometry.physHIn;
+
+                  // 10 Concentric graduated lines (1..10) spaced uniformly in physical inches:
+                  // Standard (2.5"x3.5"): 0.024" per line (Line 1 = 0.024" .. Line 10 = 0.240")
+                  // Mini (1.5"x2.625")   : 0.0155" per line (Line 1 = 0.0155" .. Line 10 = 0.155")
+                  const unitStepIn = gaugeGeometry.isMini ? 0.0155 : 0.024;
+                  const steps10 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => ({
+                    n,
+                    isOdd: n % 2 === 1, // SOLID = ODD, DASHED = EVEN
+                    inVal: n * unitStepIn,
+                    dx: n * unitStepIn * pxPerInX,
+                    dy: n * unitStepIn * pxPerInY,
+                  }));
+
+                  const maxDx = steps10[9].dx;
+                  const maxDy = steps10[9].dy;
+                  const cornerArmX = Math.max(16, Math.min(cardW * 0.15, maxDx + 10));
+                  const cornerArmY = Math.max(16, Math.min(cardH * 0.15, maxDy + 10));
+                  const cornerGap = Math.max(4, Math.min(cardW, cardH) * 0.018);
+                  const bullseyeR = Math.max(11, Math.min(cardW, cardH) * 0.042);
+                  const dotR = Math.max(2.4, bullseyeR * 0.22);
+
+                  // Theme palette for crisp readability on any card stock
+                  const isClassic = gaugeColorMode === 'classic_black';
+                  const isCyan = gaugeColorMode === 'cyan';
+                  const outerCol = isClassic ? '#0f172a' : isCyan ? '#22d3ee' : '#f8fafc';
+                  const oddCol = isClassic ? '#0f172a' : isCyan ? '#22d3ee' : '#38bdf8';
+                  const evenCol = isClassic ? '#1e293b' : isCyan ? '#a5f3fc' : '#f8fafc';
+                  const haloCol = isClassic ? 'rgba(255,255,255,0.92)' : '#020617';
+                  const numFillOdd = isClassic ? '#020617' : '#38bdf8';
+                  const numFillEven = isClassic ? '#0f172a' : '#fef08a';
+
+                  const txtStyle = {
+                    paintOrder: 'stroke',
+                    stroke: haloCol,
+                    strokeWidth: isClassic ? '2.6px' : '2.8px',
+                    strokeLinecap: 'round',
+                    strokeLinejoin: 'round',
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+                    fontWeight: 900,
+                  };
+
+                  // Staggered diagonal label coordinates (matching the physical Legends gauge)
+                  const topLeftBaseX = cardX + maxDx + 6;
+                  const topRightBaseX = cardX + cardW - maxDx - 6;
+                  const horizStepX = Math.max(5.5, Math.min(13, (cardW - 2 * maxDx - 24) / 11));
+                  const leftTopBaseY = cardY + maxDy + 8;
+                  const leftBotBaseY = cardY + cardH - maxDy - 6;
+                  const vertStepY = Math.max(5.2, Math.min(11.5, (cardH - 2 * maxDy - 32) / 22));
+                  const fontSizeNum = Math.max(7.2, Math.min(9.5, Math.min(cardW, cardH) * 0.025));
+
+                  return (
+                    <svg
+                      viewBox={`0 0 ${W} ${H}`}
+                      className="absolute inset-0 w-full h-full pointer-events-none select-none"
+                      style={{ opacity: Math.max(0.2, Math.min(0.9, gaugeOpacity / 100)) }}
+                    >
+                      <g transform={`rotate(${gaugeGeometry.totalAngle}, ${cx}, ${cy})`}>
+                        {/* Clear Acrylic Card Tint */}
+                        <rect
+                          x={cardX}
+                          y={cardY}
+                          width={cardW}
+                          height={cardH}
+                          rx={4}
+                          fill={isClassic ? 'rgba(255, 255, 255, 0.05)' : 'rgba(14, 165, 233, 0.03)'}
+                        />
+
+                        {/* Heavy Outer Frame with Legends Corner Brackets & Subtle Corner Breaks */}
+                        <path
+                          d={`M ${cardX} ${cardY + cornerArmY} L ${cardX} ${cardY} L ${cardX + cornerArmX} ${cardY}
+                              M ${cardX + cornerArmX + cornerGap} ${cardY} L ${cardX + cardW - cornerArmX - cornerGap} ${cardY}
+                              M ${cardX + cardW - cornerArmX} ${cardY} L ${cardX + cardW} ${cardY} L ${cardX + cardW} ${cardY + cornerArmY}
+                              M ${cardX + cardW} ${cardY + cornerArmY + cornerGap} L ${cardX + cardW} ${cardY + cardH - cornerArmY - cornerGap}
+                              M ${cardX + cardW} ${cardY + cardH - cornerArmY} L ${cardX + cardW} ${cardY + cardH} L ${cardX + cardW - cornerArmX} ${cardY + cardH}
+                              M ${cardX + cardW - cornerArmX - cornerGap} ${cardY + cardH} L ${cardX + cornerArmX + cornerGap} ${cardY + cardH}
+                              M ${cardX + cornerArmX} ${cardY + cardH} L ${cardX} ${cardY + cardH} L ${cardX} ${cardY + cardH - cornerArmY}
+                              M ${cardX} ${cardY + cardH - cornerArmY - cornerGap} L ${cardX} ${cardY + cornerArmY + cornerGap}`}
+                          fill="none"
+                          stroke={outerCol}
+                          strokeWidth="3.2"
+                          strokeLinecap="square"
+                        />
+
+                        {/* 10 Concentric Inner Graduated Frames: SOLID = ODD (1,3,5,7,9), DASHED = EVEN (2,4,6,8,10) */}
+                        {steps10.map((st) => {
+                          const rx = cardX + st.dx;
+                          const ry = cardY + st.dy;
+                          const rw = Math.max(8, cardW - 2 * st.dx);
+                          const rh = Math.max(8, cardH - 2 * st.dy);
+                          const strokeCol = st.isOdd ? oddCol : evenCol;
+                          return (
+                            <rect
+                              key={`ring-${st.n}`}
+                              x={rx}
+                              y={ry}
+                              width={rw}
+                              height={rh}
+                              fill="none"
+                              stroke={strokeCol}
+                              strokeWidth={st.isOdd ? '1.25' : '1.05'}
+                              strokeDasharray={st.isOdd ? undefined : '4.5 3.2'}
+                            />
+                          );
+                        })}
+
+                        {/* Full Horizontal & Vertical Center Crosshairs (Interrupted by Center Bullseye Circle) */}
+                        <line x1={cardX} y1={cy} x2={cx - bullseyeR} y2={cy} stroke={outerCol} strokeWidth="1.45" />
+                        <line x1={cx + bullseyeR} y1={cy} x2={cardX + cardW} y2={cy} stroke={outerCol} strokeWidth="1.45" />
+                        <line x1={cx} y1={cardY} x2={cx} y2={cy - bullseyeR} stroke={outerCol} strokeWidth="1.45" />
+                        <line x1={cx} y1={cy + bullseyeR} x2={cx} y2={cardY + cardH} stroke={outerCol} strokeWidth="1.45" />
+
+                        {/* Center Bullseye Circle & Target Dot */}
+                        <circle cx={cx} cy={cy} r={bullseyeR} fill="rgba(2, 6, 23, 0.22)" stroke={outerCol} strokeWidth="1.65" />
+                        <circle cx={cx} cy={cy} r={dotR} fill={outerCol} />
+
+                        {/* Staggered Diagonal Line Numbers (1..10) on Top, Bottom, Left & Right */}
+                        {steps10.map((st) => {
+                          const nCol = st.isOdd ? numFillOdd : numFillEven;
+                          const kIdx = Math.floor((st.n - 1) / 2); // 0..4 for odd/even diagonal staircases
+                          const topY = cardY + st.dy + fontSizeNum * 0.35;
+                          const botY = cardY + cardH - st.dy + fontSizeNum * 0.35;
+                          const leftX = cardX + st.dx;
+                          const rightX = cardX + cardW - st.dx;
+
+                          // Top: Odd (1,3,5,7,9) on Top-Left diagonal; Even (2,4,6,8,10) on Top-Right diagonal
+                          const topX = st.isOdd
+                            ? topLeftBaseX + kIdx * horizStepX * 1.45
+                            : topRightBaseX - kIdx * horizStepX * 1.45;
+                          // Bottom: Even (2,4,6,8,10) on Bottom-Left diagonal; Odd (1,3,5,7,9) on Bottom-Right diagonal
+                          const botX = !st.isOdd
+                            ? topLeftBaseX + kIdx * horizStepX * 1.45
+                            : topRightBaseX - kIdx * horizStepX * 1.45;
+
+                          // Left & Right Vertical Lines: Upper & Lower 1..10 diagonal staircases
+                          const upperSideY = leftTopBaseY + (st.n - 1) * vertStepY;
+                          const lowerSideY = leftBotBaseY - (st.n - 1) * vertStepY;
+
+                          return (
+                            <g key={`nums-${st.n}`}>
+                              <text x={topX} y={topY} textAnchor="middle" fontSize={fontSizeNum} fill={nCol} style={txtStyle}>{st.n}</text>
+                              <text x={botX} y={botY} textAnchor="middle" fontSize={fontSizeNum} fill={nCol} style={txtStyle}>{st.n}</text>
+                              <text x={leftX} y={upperSideY} textAnchor="middle" fontSize={fontSizeNum * 0.92} fill={nCol} style={txtStyle}>{st.n}</text>
+                              <text x={leftX} y={lowerSideY} textAnchor="middle" fontSize={fontSizeNum * 0.92} fill={nCol} style={txtStyle}>{st.n}</text>
+                              <text x={rightX} y={upperSideY} textAnchor="middle" fontSize={fontSizeNum * 0.92} fill={nCol} style={txtStyle}>{st.n}</text>
+                              <text x={rightX} y={lowerSideY} textAnchor="middle" fontSize={fontSizeNum * 0.92} fill={nCol} style={txtStyle}>{st.n}</text>
+                            </g>
+                          );
+                        })}
+
+                        {/* Legends Header & Footer Callouts (50/50 through 65/35 + Dashed/Solid Legend) */}
+                        <text x={cx} y={cardY - 4} textAnchor="middle" fontSize={Math.max(8, fontSizeNum)} fill="#38bdf8" style={txtStyle}>
+                          LEGENDS CENTERING GAUGE • {gaugeGeometry.isMini ? 'MINI 1.5×2.625' : 'STD 2.5×3.5'} • L/R {liveCentStats.lr} | T/B {liveCentStats.tb}
+                        </text>
+                        <text x={cx} y={cy + bullseyeR + 13} textAnchor="middle" fontSize={Math.max(7.2, fontSizeNum * 0.88)} fill="#e2e8f0" style={txtStyle}>
+                          SOLID = ODD (1,3,5,7,9) • DASHED = EVEN (2,4,6,8,10)
+                        </text>
+                        <text x={cx} y={cy + bullseyeR + 24} textAnchor="middle" fontSize={Math.max(7.2, fontSizeNum * 0.88)} fill="#67e8f9" style={txtStyle}>
+                          50/50 (N-N) • 53/47 (9-8) • 55/45 (6-5) • 58/42 (7-5) • 60/40 (3-2 / 6-4) • 65/35 (9-5)
+                        </text>
+                      </g>
+                    </svg>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* LEGENDS CENTERING PERCENTAGES REFERENCE CARD POPOVER (MATCHING PHYSICAL CHART: RED = 60/40 OR BETTER) */}
+            {showCenteringGauge && showLegendsChart && (
+              <div className="absolute top-9 right-2.5 z-20 w-72 bg-slate-950/95 backdrop-blur-md border border-cyan-500/60 rounded-xl p-2.5 shadow-2xl text-[10px] select-none">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-1 mb-1.5">
+                  <div>
+                    <div className="font-black text-white uppercase tracking-wide text-[10.5px]">📏 Centering Percentages</div>
+                    <div className="text-[9px] text-slate-400 font-semibold">RIGHT/LEFT + TOP/BOTTOM LINE PAIRS</div>
+                  </div>
+                  <button type="button" onClick={() => setShowLegendsChart(false)} className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold">✕</button>
+                </div>
+                <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 font-mono text-[9.5px]">
+                  {[
+                    ['2-1: 66/34', false], ['6-4: 60/40', true],  ['8-8: 50/50', true],
+                    ['2-2: 50/50', true],  ['6-5: 55/45', true],  ['9-4: 69/31', false],
+                    ['3-1: 75/25', false], ['6-6: 50/50', true],  ['9-5: 64/36', false],
+                    ['3-2: 60/40', true],  ['7-3: 70/30', false], ['9-6: 60/40', true],
+                    ['3-3: 50/50', true],  ['7-4: 64/36', false], ['9-7: 56/44', true],
+                    ['4-2: 67/33', false], ['7-5: 58/42', true],  ['9-8: 53/47', true],
+                    ['4-3: 57/43', true],  ['7-6: 54/46', true],  ['9-9: 50/50', true],
+                    ['4-4: 50/50', true],  ['7-7: 50/50', true],  ['10-5: 67/33', false],
+                    ['5-3: 63/37', false], ['8-5: 62/38', false], ['10-6: 63/37', false],
+                    ['5-4: 56/44', true],  ['8-6: 57/43', true],  ['10-7: 59/41', true],
+                    ['5-5: 50/50', true],  ['8-7: 53/47', true],  ['10-8: 56/44', true],
+                    ['6-3: 67/33', false], ['10-9: 53/47', true], ['10-10: 50/50', true],
+                  ].map(([pairTxt, isBetter6040], idx) => (
+                    <div key={idx} className={`font-bold ${isBetter6040 ? 'text-rose-400' : 'text-slate-300'}`}>
+                      {pairTxt}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-1.5 pt-1 border-t border-slate-800 text-center font-extrabold text-[9.5px] text-rose-400 uppercase tracking-wider">
+                  RED INDICATES 60/40 OR BETTER
+                </div>
               </div>
             )}
 
             {/* CRISP HTML CENTERING RATIO BADGE (NEVER CLIPPED IN PORTRAIT OR LANDSCAPE) */}
-            {(activeLayers.centering || editMode === 'centering') && sideCent && (
-              <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-xl bg-slate-950/90 border border-cyan-500/70 text-cyan-200 font-mono text-[11px] font-bold shadow pointer-events-none whitespace-nowrap">
+            {(activeLayers.centering || editMode === 'centering' || showCenteringGauge) && sideCent && (
+              <div className="absolute top-1.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-xl bg-slate-950/90 border border-cyan-500/70 text-cyan-200 font-mono text-[10.5px] font-bold shadow pointer-events-none whitespace-nowrap">
                 {activeSide} Centering: L/R {liveCentStats.lr} • T/B {liveCentStats.tb}
+                {showCenteringGauge ? ` • Gauge ${gaugeGeometry.isMini ? 'Mini' : 'Std'} (${gaugeGeometry.totalAngle >= 0 ? `+${gaugeGeometry.totalAngle.toFixed(1)}°` : `${gaugeGeometry.totalAngle.toFixed(1)}°`})` : ''}
               </div>
             )}
 
             {editMode !== 'none' && (
-              <div className="absolute bottom-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-xl bg-slate-950/90 border border-amber-500/70 text-amber-200 text-[11px] font-semibold pointer-events-none whitespace-nowrap">
+              <div className="absolute bottom-1.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-xl bg-slate-950/90 border border-amber-500/70 text-amber-200 text-[10.5px] font-semibold pointer-events-none whitespace-nowrap">
                 {editMode === 'centering' ? 'Drag cyan (outer) & yellow (inner) edge handles, then Save & Recalculate' : 'Drag TL / TR / BL / BR corner brackets onto card tips, then Save & Recalculate'}
               </div>
             )}
 
             {loadingDiag && (
-              <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl bg-slate-950/90 border border-sky-700 text-sky-300 text-xs font-bold">
+              <div className="absolute bottom-2 left-2 px-2.5 py-1 rounded-xl bg-slate-950/90 border border-sky-700 text-sky-300 text-xs font-bold">
                 ⏳ Analyzing surface &amp; centering geometry...
               </div>
             )}
             {diagError && (
-              <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl bg-rose-950/90 border border-rose-600 text-rose-200 text-xs font-bold">
+              <div className="absolute bottom-2 left-2 px-2.5 py-1 rounded-xl bg-rose-950/90 border border-rose-600 text-rose-200 text-xs font-bold">
                 ❌ {diagError}
               </div>
             )}
@@ -2868,7 +3285,7 @@ function GradingDeepDiveStudio({
         </div>
 
         {/* RIGHT PANE: PSA/BGS CARDS + CLICKABLE NOTES TOGGLES + COMPACT DEFECT GRID + ENLARGED LOUPE OVERLAY */}
-        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0 overflow-hidden relative`}>
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-2.5 flex flex-col gap-2 min-h-0 h-full overflow-hidden relative`}>
           {/* TOP: AUTHENTIC PSA & BECKETT SUMMARY CARDS (NON-TOGGLE) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 shrink-0">
             {renderPsaCard()}
@@ -5148,7 +5565,16 @@ export default function App() {
         )}
 
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
-          <main ref={mainScrollRef} className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 gap-4">
+          <main
+            ref={mainScrollRef}
+            className={`flex-1 flex flex-col min-w-0 min-h-0 ${
+              (activePage === 'inventory_editor' && invEditorMode === 'deep_dive') ||
+              activePage === 'batch_deep_dive' ||
+              (activePage === 'grading_inspector' && inspectorMode === 'deep_dive')
+                ? 'overflow-hidden p-2.5 gap-2'
+                : 'overflow-y-auto p-4 gap-4'
+            }`}
+          >
             <TabulasErrorBoundary resetKey={`${activePage}-${activeBatchName}-${deepDiveIdx}`} onReset={() => setActivePage('dashboard')}>
             {/* 0. HOME DASHBOARD (DEFAULT STARTUP SCREEN — ALWAYS REACHABLE VIA TOP-LEFT LOGO) */}
             {activePage === 'dashboard' && (() => {
@@ -6786,51 +7212,20 @@ export default function App() {
               };
 
               return (
-                <div className="space-y-4">
-                  <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button onClick={() => setActivePage('guided_batch_review')} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">⬅ Guided Review</button>
-                        <button onClick={() => setActivePage('scan_ingestion')} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">📂 Batches</button>
-                        <h2 className="text-sm font-extrabold text-white">
-                          🔬 Deep-Dive Single-Card Review — {ddIsAll ? `All Batches (${batches.length})` : currentBatchObj.batchName} ({ddSearched.length > 0 ? `${safeDdIdx + 1} / ${ddSearched.length}` : '0 Cards'})
-                        </h2>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button onClick={() => setDeepDiveIdx((i) => Math.max(0, i - 1))} disabled={safeDdIdx <= 0} className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-xs font-bold">◀ Prev Card</button>
-                        <select
-                          value={safeDdIdx}
-                          onChange={(e) => setDeepDiveIdx(parseInt(e.target.value, 10) || 0)}
-                          className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs font-mono max-w-[260px]"
-                        >
-                          {ddSearched.map((sc, si) => (
-                            <option key={`${sc._BatchName}-${sc.SKU}`} value={si}>
-                              {si + 1}. SKU {sc.SKU} — #{String(sc.Card_Number || '').replace(/^#/, '')} {sc.Player} [{sc.Subset_Parallel}]
-                            </option>
-                          ))}
-                        </select>
-                        <button onClick={() => setDeepDiveIdx((i) => Math.min(Math.max(0, ddSearched.length - 1), i + 1))} disabled={safeDdIdx >= ddSearched.length - 1} className={`px-3.5 py-1.5 rounded-xl text-xs font-bold disabled:opacity-35 ${skin.accentBtn}`}>Next Card ▶</button>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                      <select value={guidedScopeMode} onChange={(e) => { setGuidedScopeMode(e.target.value); setDeepDiveIdx(0); }} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
-                        <option value="selected_or_flagged">Selected / Flagged Cards ({ddFlaggedDefault.length})</option>
-                        <option value="non_base_only">✨ Non-Base / Parallels Only ({ddNonBaseCount})</option>
-                        <option value="below_190">All Cards Below OCR 185 ({ddPool.filter((c) => safeNum(c.OCR_Confidence, 0) < 185).length})</option>
-                        <option value="all_batch">All Cards in View ({ddPool.length})</option>
-                      </select>
-                      <input
-                        value={guidedSearchQ}
-                        onChange={(e) => { setGuidedSearchQ(e.target.value); setDeepDiveIdx(0); }}
-                        placeholder="Filter Deep-Dive cards (SKU, Batch, #, Player, Parallel)..."
-                        className="md:col-span-2 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs"
-                      />
-                    </div>
-                  </div>
-
+                <div className="flex-1 min-h-0 h-full flex flex-col overflow-hidden">
                   {!ddCard ? (
-                    <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-8 text-center text-xs text-slate-400`}>
-                      No cards match the selected Deep-Dive filter. Switch scope above to inspect other cards in this batch.
+                    <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center space-y-3`}>
+                      <div className="text-xs text-slate-400">
+                        No cards match the selected Deep-Dive filter.
+                      </div>
+                      <div className="flex items-center justify-center gap-2">
+                        <button type="button" onClick={() => { setGuidedScopeMode('all_batch'); setGuidedSearchQ(''); setDeepDiveIdx(0); }} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-sky-300">
+                          Show All Cards in Batch ({ddPool.length})
+                        </button>
+                        <button type="button" onClick={() => setActivePage('guided_batch_review')} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200">
+                          ⬅ Guided Review
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <GradingDeepDiveStudio
@@ -6845,6 +7240,11 @@ export default function App() {
                       onBack={() => setActivePage('guided_batch_review')}
                       backLabel="Guided Review"
                       onSwitchIndividual={() => setActivePage('guided_batch_review')}
+                      cardOptions={ddSearched.map((sc, si) => ({
+                        index: si,
+                        label: `${si + 1}/${ddSearched.length} • SKU ${sc.SKU} — #${String(sc.Card_Number || '').replace(/^#/, '')} ${sc.Player}`,
+                      }))}
+                      onSelectCardIndex={(idx) => setDeepDiveIdx(idx)}
                       onCardUpdated={(res) => {
                         if (Array.isArray(res?.cards)) {
                           setBatches((prev) => prev.map((b) => (b.batchName === ddCardBatch ? { ...b, cards: res.cards.map((x) => ({ ...x, _BatchName: ddCardBatch })) } : b)));
@@ -7420,112 +7820,90 @@ export default function App() {
               };
 
               return (
-                <div className="space-y-4">
-                  {/* TOP CONTROL HEADER WITH MODE SWITCHER + PARALLEL REPROCESS */}
-                  <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button onClick={() => setActivePage('inventory')} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">⬅ Back to Inventory</button>
-                        <h2 className="text-sm font-bold text-white">
-                          ✏️ Inventory Editor — {editorCards.length.toLocaleString()} Selected SKU(s)
-                        </h2>
-                        <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
-                          <button
-                            type="button"
-                            onClick={() => setInvEditorMode('individual')}
-                            className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'individual' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
-                          >
-                            🪟 Individual
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setInvEditorMode('deep_dive')}
-                            className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'deep_dive' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
-                          >
-                            🔬 Deep-Dive
-                          </button>
-                          {editorCards.length > 1 && (
+                <div className={invEditorMode === 'deep_dive' ? 'flex-1 min-h-0 h-full flex flex-col overflow-hidden' : 'space-y-4'}>
+                  {/* TOP CONTROL HEADER WITH MODE SWITCHER + PARALLEL REPROCESS (HIDDEN IN DEEP-DIVE SO ONLY ONE ~44PX BAR IS SHOWN) */}
+                  {invEditorMode !== 'deep_dive' && (
+                    <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button onClick={() => setActivePage('inventory')} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">⬅ Back to Inventory</button>
+                          <h2 className="text-sm font-bold text-white">
+                            ✏️ Inventory Editor — {editorCards.length.toLocaleString()} Selected SKU(s)
+                          </h2>
+                          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
                             <button
                               type="button"
-                              onClick={() => setInvEditorMode('bulk')}
-                              className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'bulk' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                              onClick={() => setInvEditorMode('individual')}
+                              className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'individual' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
                             >
-                              📋 Bulk Edit
+                              🪟 Individual
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setInvEditorMode('deep_dive')}
+                              className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'deep_dive' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                            >
+                              🔬 Deep-Dive
+                            </button>
+                            {editorCards.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => setInvEditorMode('bulk')}
+                                className={`px-2.5 py-1 rounded-lg font-bold transition ${invEditorMode === 'bulk' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                              >
+                                📋 Bulk Edit
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={editorCards.length === 0 || anyEditorSkuBusy}
+                            onClick={() => triggerInventoryReprocess((invEditorMode === 'individual' ? edSlice : editorCards).map((ec) => ec.SKU))}
+                            title="Rescan physical images in an available parallel worker and instantly update this page"
+                            className="px-3 py-1.5 rounded-xl bg-cyan-950/90 hover:bg-cyan-800 border border-cyan-600/70 text-cyan-200 font-bold text-xs disabled:opacity-45"
+                          >
+                            {anyEditorSkuBusy
+                              ? '⏳ Reprocessing in Worker...'
+                              : invEditorMode === 'individual'
+                              ? `🔄 Reprocess Page (${edSlice.length})`
+                              : `🔄 Reprocess All (${editorCards.length})`}
+                          </button>
+                          {invEditorMode === 'individual' && dirtyEdSkus.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={saveAllDirtyInvCards}
+                              className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow animate-pulse"
+                            >
+                              💾 Save All Edited ({dirtyEdSkus.length}) &amp; Rename
                             </button>
                           )}
                         </div>
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          disabled={editorCards.length === 0 || anyEditorSkuBusy}
-                          onClick={() => triggerInventoryReprocess((invEditorMode === 'individual' ? edSlice : editorCards).map((ec) => ec.SKU))}
-                          title="Rescan physical images in an available parallel worker and instantly update this page"
-                          className="px-3 py-1.5 rounded-xl bg-cyan-950/90 hover:bg-cyan-800 border border-cyan-600/70 text-cyan-200 font-bold text-xs disabled:opacity-45"
-                        >
-                          {anyEditorSkuBusy
-                            ? '⏳ Reprocessing in Worker...'
-                            : invEditorMode === 'individual'
-                            ? `🔄 Reprocess Page (${edSlice.length})`
-                            : `🔄 Reprocess All (${editorCards.length})`}
-                        </button>
-                        {invEditorMode === 'individual' && dirtyEdSkus.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={saveAllDirtyInvCards}
-                            className="px-4 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow animate-pulse"
-                          >
-                            💾 Save All Edited ({dirtyEdSkus.length}) &amp; Rename
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* FILTER / PAGINATION BAR FOR INDIVIDUAL & DEEP-DIVE MODES */}
-                    {invEditorMode === 'individual' && editorCards.length > 0 && (
-                      <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
-                        <input
-                          value={invEditorSearchQ}
-                          onChange={(e) => { setInvEditorSearchQ(e.target.value); setInvEditorPage(1); }}
-                          placeholder="Filter selected cards (SKU, #, Player, Subset, Status)..."
-                          className="md:col-span-3 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs"
-                        />
-                        <select value={invEditorPageSize} onChange={(e) => { setInvEditorPageSize(parseInt(e.target.value, 10) || 15); setInvEditorPage(1); }} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
-                          <option value={10}>10 cards / page</option><option value={15}>15 cards / page</option><option value={25}>25 cards / page</option><option value={50}>50 cards / page</option>
-                        </select>
-                        <div className="md:col-span-2 flex items-center justify-end gap-1.5 text-xs">
-                          <button onClick={() => goInvEditorPage(edSafePage - 1)} disabled={edSafePage <= 1} className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
-                          <span className="font-mono text-white">Page {edSafePage} / {edTotalPages}</span>
-                          <button onClick={() => goInvEditorPage(edSafePage + 1)} disabled={edSafePage >= edTotalPages} className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
-                        </div>
-                      </div>
-                    )}
-
-                    {invEditorMode === 'deep_dive' && searchedEdCards.length > 0 && (
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <input
-                          value={invEditorSearchQ}
-                          onChange={(e) => { setInvEditorSearchQ(e.target.value); setInvEditorIdx(0); }}
-                          placeholder="Filter selected SKUs..."
-                          className="flex-1 min-w-[200px] bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs"
-                        />
-                        <div className="flex items-center gap-1.5">
-                          <button onClick={() => setInvEditorIdx((i) => Math.max(0, i - 1))} disabled={safeDdEdIdx <= 0} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-xs font-bold">◀ Prev Card</button>
-                          <select
-                            value={safeDdEdIdx}
-                            onChange={(e) => setInvEditorIdx(parseInt(e.target.value, 10) || 0)}
-                            className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs font-mono max-w-[260px]"
-                          >
-                            {searchedEdCards.map((ec, ei) => (
-                              <option key={ec.SKU} value={ei}>{ei + 1}. SKU {ec.SKU} — #{ec['Card Number']} {ec.Player} [{ec.Subset}]</option>
-                            ))}
+                      {/* FILTER / PAGINATION BAR FOR INDIVIDUAL MODE */}
+                      {invEditorMode === 'individual' && editorCards.length > 0 && (
+                        <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                          <input
+                            value={invEditorSearchQ}
+                            onChange={(e) => { setInvEditorSearchQ(e.target.value); setInvEditorPage(1); }}
+                            placeholder="Filter selected cards (SKU, #, Player, Subset, Status)..."
+                            className="md:col-span-3 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs"
+                          />
+                          <select value={invEditorPageSize} onChange={(e) => { setInvEditorPageSize(parseInt(e.target.value, 10) || 15); setInvEditorPage(1); }} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
+                            <option value={10}>10 cards / page</option><option value={15}>15 cards / page</option><option value={25}>25 cards / page</option><option value={50}>50 cards / page</option>
                           </select>
-                          <button onClick={() => setInvEditorIdx((i) => Math.min(Math.max(0, searchedEdCards.length - 1), i + 1))} disabled={safeDdEdIdx >= searchedEdCards.length - 1} className={`px-3 py-1.5 rounded-xl text-xs font-bold disabled:opacity-35 ${skin.accentBtn}`}>Next Card ▶</button>
+                          <div className="md:col-span-2 flex items-center justify-end gap-1.5 text-xs">
+                            <button onClick={() => goInvEditorPage(edSafePage - 1)} disabled={edSafePage <= 1} className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
+                            <span className="font-mono text-white">Page {edSafePage} / {edTotalPages}</span>
+                            <button onClick={() => goInvEditorPage(edSafePage + 1)} disabled={edSafePage >= edTotalPages} className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
+                          </div>
                         </div>
-                      </div>
-                    )}
-                  </div>
+                      )}
+                    </div>
+                  )}
 
                   {editorCards.length === 0 ? (
                     <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center text-xs text-slate-400`}>
@@ -7578,7 +7956,13 @@ export default function App() {
                     </>
                   ) : invEditorMode === 'deep_dive' ? (
                     !ddEdCard ? (
-                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center text-xs text-slate-400`}>No cards match the filter.</div>
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center space-y-3 text-xs text-slate-400`}>
+                        <div>No cards match the filter.</div>
+                        <div className="flex items-center justify-center gap-2">
+                          <button type="button" onClick={() => { setInvEditorSearchQ(''); setInvEditorIdx(0); }} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sky-300 font-bold">Clear Search Filter</button>
+                          <button type="button" onClick={() => setInvEditorMode('individual')} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold">🪟 Switch to Individual</button>
+                        </div>
+                      </div>
                     ) : (
                       <GradingDeepDiveStudio
                         key={`inv-gdd-${ddEdCard.SKU}`}
@@ -7591,6 +7975,12 @@ export default function App() {
                         onBack={() => setActivePage('inventory')}
                         backLabel="Inventory"
                         onSwitchIndividual={() => setInvEditorMode('individual')}
+                        onSwitchBulk={editorCards.length > 1 ? () => setInvEditorMode('bulk') : undefined}
+                        cardOptions={searchedEdCards.map((ec, ei) => ({
+                          index: ei,
+                          label: `${ei + 1}/${searchedEdCards.length} • SKU ${ec.SKU} — #${ec['Card Number']} ${ec.Player}`,
+                        }))}
+                        onSelectCardIndex={(idx) => setInvEditorIdx(idx)}
                         onCardUpdated={(res) => {
                           if (Array.isArray(res?.rows)) {
                             setInventory(res.rows);
@@ -9359,7 +9749,7 @@ export default function App() {
 
             {/* 10. GRADING CANDIDATE INSPECTOR */}
             {activePage === 'grading_inspector' && (
-              <div className="space-y-4">
+              <div className={inspectorMode === 'deep_dive' ? 'flex-1 min-h-0 h-full flex flex-col overflow-hidden' : 'space-y-4'}>
                 {gradingCandidates.length === 0 ? (
                   <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center text-xs text-slate-400`}>No grading candidates match the current filter.</div>
                 ) : (() => {
@@ -9379,6 +9769,11 @@ export default function App() {
                         onBack={() => setActivePage('grading_engine')}
                         backLabel="Grading Hub"
                         onSwitchIndividual={() => setInspectorMode('individual')}
+                        cardOptions={gradingCandidates.map((gc, gi) => ({
+                          index: gi,
+                          label: `${gi + 1}/${gradingCandidates.length} • SKU ${gc.SKU} — #${gc['Card Number']} ${gc.Player}`,
+                        }))}
+                        onSelectCardIndex={(idx) => setInspectorIdx(idx)}
                         onCardUpdated={(res) => {
                           if (Array.isArray(res?.rows)) {
                             setInventory(res.rows);
