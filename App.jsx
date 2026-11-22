@@ -1163,6 +1163,16 @@ function InventoryGuidedCardItem({
               ↻ Back
             </button>
           )}
+          {onReplaceImages && (
+            <button
+              type="button"
+              onClick={() => onReplaceImages(card)}
+              title="Replace Front and/or Back scan images from files on your computer (JPG, PNG, or 2-Page PDF)"
+              className="px-2 py-0.5 rounded-lg bg-emerald-950/90 hover:bg-emerald-800 border border-emerald-600/70 text-emerald-200 text-[10.5px] font-bold"
+            >
+              🖼️ Replace Scans
+            </button>
+          )}
           <span className={`px-2 py-0.5 rounded-lg border font-mono font-bold ${tier.badgeCls}`}>
             {tier.label} • OCR {tier.ocr}
           </span>
@@ -1363,7 +1373,8 @@ function InventoryGuidedCardItem({
             disabled={savingOne}
             onClick={() => {
               setSavingOne(true);
-              Promise.resolve(onSaveOne({ ...card, ...draft, 'Card Number': String(draft['Card Number'] || '').replace(/^#/, ''), Needs_Review: 'False' }))
+              const preservedNeedsRev = String(draft.Needs_Review ?? card.Needs_Review ?? 'False').toLowerCase() === 'true' ? 'True' : 'False';
+              Promise.resolve(onSaveOne({ ...card, ...draft, 'Card Number': String(draft['Card Number'] || '').replace(/^#/, ''), Needs_Review: preservedNeedsRev }))
                 .finally(() => setSavingOne(false));
             }}
             className={`w-full py-1.5 px-3 rounded-xl font-bold text-xs ${hasFieldChanges ? skin.accentBtn : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow'}`}
@@ -2191,7 +2202,7 @@ export default function App() {
     }).catch(() => {});
   };
 
-  const refreshAllHubData = (preferredBatch = null) => {
+  const refreshAllHubData = (preferredBatch = null, opts = {}) => {
     fetch(`${NODE_API_BASE}/status`).then((r) => r.json()).then((d) => {
       if (d && d.ok) {
         setBackendConnected(true);
@@ -2204,12 +2215,14 @@ export default function App() {
       if (Array.isArray(rows)) {
         setInventory(rows);
         setInventoryDirty(false);
-        if (rows.length > 0 && !writerSku) setWriterSku(rows[0].SKU);
+        const firstUnsold = rows.find((r) => String(r.Status || '').trim().toLowerCase() !== 'sold');
+        const defaultSku = firstUnsold ? firstUnsold.SKU : (rows[0]?.SKU || '');
+        if (defaultSku) setWriterSku((prev) => prev || defaultSku);
       }
     }).catch(() => {});
     fetch(`${NODE_API_BASE}/incoming-scans`).then((r) => r.json()).then((d) => Array.isArray(d) && setIncomingScans(d)).catch(() => {});
     loadBatchesFromDisk(preferredBatch);
-    fetchFilteredChecklists();
+    if (!opts.preserveChecklist) fetchFilteredChecklists();
     fetch(`${NODE_API_BASE}/config/tracked-sets`).then((r) => r.json()).then((d) => Array.isArray(d) && setTrackedSets(d)).catch(() => {});
     fetch(`${NODE_API_BASE}/directory`).then((r) => r.json()).then((d) => Array.isArray(d) && setDirectoryRows(d)).catch(() => {});
     fetch(`${NODE_API_BASE}/config/set-cart`).then((r) => r.json()).then((c) => { if (Array.isArray(c)) { setSetCart(c); if (c.length > 0) setShowCartSidebar(true); } }).catch(() => {});
@@ -2240,6 +2253,9 @@ export default function App() {
       }
     }).catch(() => {});
   };
+
+  const refreshAllHubDataRef = useRef(refreshAllHubData);
+  refreshAllHubDataRef.current = refreshAllHubData;
 
   useEffect(() => { refreshAllHubData(); }, []);
 
@@ -2350,8 +2366,8 @@ export default function App() {
               setBatchImgBust((v) => v + 1);
             }
 
-            // Auto-refresh all Hub data (selecting the newest batch if scan_ingest just finished!)
-            refreshAllHubData(hasNewIngest ? '' : activeBatchNameRef.current);
+            // Auto-refresh all Hub data (selecting the newest batch if scan_ingest just finished, preserving active checklist filters!)
+            refreshAllHubDataRef.current(hasNewIngest ? '' : activeBatchNameRef.current, { preserveChecklist: true });
             finishedJobs.forEach((fj) => {
               if (fj.jobType === 'system_startup') return;
               const ok = fj.status === 'COMPLETED';
@@ -2662,16 +2678,22 @@ export default function App() {
   };
 
   const persistInventoryToDisk = (rowsToSave = inventory, msgTitle = 'Inventory Saved') => {
-    fetch(`${NODE_API_BASE}/inventory`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rowsToSave) })
+    return fetch(`${NODE_API_BASE}/inventory`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rowsToSave) })
       .then((r) => r.json())
       .then((res) => {
         if (res && res.success) {
           setInventory(res.rows || rowsToSave);
           setInventoryDirty(false);
           pushNotification(msgTitle, `Saved ${(res.rows || rowsToSave).length.toLocaleString()} SKU(s) (${res.renamedFiles || 0} _Cards renamed).`, 'Inventory', 'success');
+          return true;
         }
+        pushNotification('Save Error', res?.error || 'Failed to persist inventory to disk.', 'Inventory', 'error');
+        return false;
       })
-      .catch((e) => pushNotification('Save Error', e.message, 'Inventory', 'error'));
+      .catch((e) => {
+        pushNotification('Save Error', e.message, 'Inventory', 'error');
+        return false;
+      });
   };
 
   const syncEditFormFromInventoryCard = (card) => {
@@ -4697,7 +4719,8 @@ export default function App() {
                             ? dirtyGuidedSkus.map((sku) => {
                                 const baseC = gPool.find((x) => x.SKU === sku) || {};
                                 const dC = batchDraftEdits[sku] || {};
-                                return { ...baseC, ...dC, SKU: sku, Needs_Review: 'False', Manual_Override: dC.Subset_Parallel || baseC.Subset_Parallel || 'Base' };
+                                const explicitFlagTrue = Object.prototype.hasOwnProperty.call(dC, 'Needs_Review') && String(dC.Needs_Review || '').toLowerCase() === 'true';
+                                return { ...baseC, ...dC, SKU: sku, Needs_Review: explicitFlagTrue ? 'True' : 'False', Manual_Override: dC.Subset_Parallel || baseC.Subset_Parallel || 'Base' };
                               })
                             : gSlice.map((c) => ({ ...c, SKU: c.SKU, Needs_Review: 'False' }));
                           targetCards.forEach((tc) => {
@@ -5120,11 +5143,15 @@ export default function App() {
 
               const saveSingleInvCard = (updatedRow, advanceDeepDive = false) => {
                 const nextInv = inventory.map((row) => (row.SKU === updatedRow.SKU ? { ...row, ...updatedRow } : row));
-                setInvEditorDrafts((prev) => { const cp = { ...prev }; delete cp[updatedRow.SKU]; return cp; });
-                persistInventoryToDisk(nextInv, `Saved SKU ${updatedRow.SKU}`);
-                if (advanceDeepDive) {
-                  setInvEditorIdx((i) => Math.min(Math.max(0, searchedEdCards.length - 1), i + 1));
-                }
+                return persistInventoryToDisk(nextInv, `Saved SKU ${updatedRow.SKU}`).then((ok) => {
+                  if (ok) {
+                    setInvEditorDrafts((prev) => { const cp = { ...prev }; delete cp[updatedRow.SKU]; return cp; });
+                    if (advanceDeepDive) {
+                      setInvEditorIdx((i) => Math.min(Math.max(0, searchedEdCards.length - 1), i + 1));
+                    }
+                  }
+                  return ok;
+                });
               };
 
               const saveAllDirtyInvCards = () => {
@@ -6364,37 +6391,6 @@ export default function App() {
 
                   {/* Tracked Sets Queue Table */}
                   <div className={`flex-1 min-h-0 flex flex-col gap-2.5 ${skin.cardBg} border ${skin.border} rounded-2xl p-4`}>
-                  {showCompsExplorer && (
-                    <div className="p-3 bg-slate-950/90 border border-sky-700/40 rounded-xl space-y-2 shrink-0">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold text-sky-300">📊 SportsCardsPro Market Comps Cache ({marketData.comps?.length || 0} Designs)</span>
-                        <input value={compsSearch} onChange={(e) => setCompsSearch(e.target.value)} placeholder="Search cached comps..." className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs" />
-                      </div>
-                      <div className="max-h-48 overflow-auto border border-slate-800 rounded-lg">
-                        <table className="w-full text-left text-[11px] whitespace-nowrap">
-                          <thead className="bg-slate-900 text-slate-400 sticky top-0"><tr><th className="p-1.5">Set</th><th className="p-1.5">Card #</th><th className="p-1.5">Player</th><th className="p-1.5">Subset</th><th className="p-1.5">Raw</th><th className="p-1.5">PSA 9</th><th className="p-1.5">BGS 9.5</th><th className="p-1.5">PSA 10</th><th className="p-1.5">Links</th></tr></thead>
-                          <tbody className="divide-y divide-slate-800">
-                            {(marketData.comps || []).filter((cm) => !compsSearch.trim() || `${cm.Set} ${cm['Card Number']} ${cm.Player} ${cm.Subset}`.toLowerCase().includes(compsSearch.toLowerCase())).slice(0, 150).map((cm, ci) => (
-                              <tr key={ci} className="hover:bg-slate-800/40">
-                                <td className="p-1.5">{cm.Set}</td>
-                                <td className="p-1.5 font-mono">#{cm['Card Number']}</td>
-                                <td className="p-1.5 font-bold text-white">{cm.Player}</td>
-                                <td className="p-1.5">{cm.Subset}</td>
-                                <td className="p-1.5 font-mono">{fmtCurrency(cm.Ungraded)}</td>
-                                <td className="p-1.5 font-mono">{fmtCurrency(cm.Grade_9)}</td>
-                                <td className="p-1.5 font-mono">{fmtCurrency(cm.BGS_9_5)}</td>
-                                <td className="p-1.5 font-mono text-emerald-400 font-bold">{fmtCurrency(cm.PSA_10)}</td>
-                                <td className="p-1.5 flex gap-2">
-                                  {(cm.Card_URL || cm.Source_URL) && <a href={cm.Card_URL || cm.Source_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Card ↗</a>}
-                                  {cm.Comp_URL && <a href={cm.Comp_URL} target="_blank" rel="noreferrer" className="text-amber-300 hover:underline">Comp ↗</a>}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
                     <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <h3 className="text-xs font-bold text-white uppercase">📋 Tracked Sets Queue ({filteredTracked.length} / {trackedSets.length})</h3>
@@ -6849,6 +6845,38 @@ export default function App() {
                   </div>
                 </div>
 
+                {showCompsExplorer && (
+                  <div className="p-3 bg-slate-950/90 border border-sky-700/40 rounded-xl space-y-2 shrink-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-sky-300">📊 SportsCardsPro Market Comps Cache ({marketData.comps?.length || 0} Designs)</span>
+                      <input value={compsSearch} onChange={(e) => setCompsSearch(e.target.value)} placeholder="Search cached comps..." className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1 text-xs" />
+                    </div>
+                    <div className="max-h-48 overflow-auto border border-slate-800 rounded-lg">
+                      <table className="w-full text-left text-[11px] whitespace-nowrap">
+                        <thead className="bg-slate-900 text-slate-400 sticky top-0"><tr><th className="p-1.5">Set</th><th className="p-1.5">Card #</th><th className="p-1.5">Player</th><th className="p-1.5">Subset</th><th className="p-1.5">Raw</th><th className="p-1.5">PSA 9</th><th className="p-1.5">BGS 9.5</th><th className="p-1.5">PSA 10</th><th className="p-1.5">Links</th></tr></thead>
+                        <tbody className="divide-y divide-slate-800">
+                          {(marketData.comps || []).filter((cm) => !compsSearch.trim() || `${cm.Set} ${cm['Card Number']} ${cm.Player} ${cm.Subset}`.toLowerCase().includes(compsSearch.toLowerCase())).slice(0, 150).map((cm, ci) => (
+                            <tr key={ci} className="hover:bg-slate-800/40">
+                              <td className="p-1.5">{cm.Set}</td>
+                              <td className="p-1.5 font-mono">#{cm['Card Number']}</td>
+                              <td className="p-1.5 font-bold text-white">{cm.Player}</td>
+                              <td className="p-1.5">{cm.Subset}</td>
+                              <td className="p-1.5 font-mono">{fmtCurrency(cm.Ungraded)}</td>
+                              <td className="p-1.5 font-mono">{fmtCurrency(cm.Grade_9)}</td>
+                              <td className="p-1.5 font-mono">{fmtCurrency(cm.BGS_9_5)}</td>
+                              <td className="p-1.5 font-mono text-emerald-400 font-bold">{fmtCurrency(cm.PSA_10)}</td>
+                              <td className="p-1.5 flex gap-2">
+                                {(cm.Card_URL || cm.Source_URL) && <a href={cm.Card_URL || cm.Source_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Card ↗</a>}
+                                {cm.Comp_URL && <a href={cm.Comp_URL} target="_blank" rel="noreferrer" className="text-amber-300 hover:underline">Comp ↗</a>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
                 <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-3.5 shrink-0 space-y-3`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-3 text-xs">
@@ -7133,6 +7161,9 @@ export default function App() {
                               includePregrade: !!listingContentOpts.include_pregrade_notes,
                               contentOptions: listingContentOpts,
                               customSetBlurb: setBlurbText,
+                              customTitle: writerCopy.SEO_Title_80Char,
+                              customPrice: writerCopy.Recommended_Price,
+                              customDescription: writerCopy.Description_Body,
                               saveDraft: true,
                             }),
                           }).then((r) => r.json()).then((res) => { if (res.success) { setWriterCopy(res); refreshAllHubData(); pushNotification('Listing Draft Saved', `Saved draft for SKU ${writerSku}.`, 'Sales', 'success'); } })}
@@ -7182,7 +7213,7 @@ export default function App() {
                               </button>
                             )}
                             <button
-                              onClick={() => fetch(`${NODE_API_BASE}/sales/set-blurb?set=${encodeURIComponent(setBlurbSet)}&forceRefresh=true`).then((r) => r.json()).then((res) => { if (res) { setSetBlurbText(res.blurb || ''); setSetBlurbDirty(false); } })}
+                              onClick={() => fetch(`${NODE_API_BASE}/sales/set-blurb?set=${encodeURIComponent(setBlurbSet)}&forceRefresh=true&resetToDefault=true`).then((r) => r.json()).then((res) => { if (res) { setSetBlurbText(res.blurb || ''); setSetBlurbDirty(false); } })}
                               className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
                             >
                               🔄 Default
@@ -7281,7 +7312,7 @@ export default function App() {
                                   platform: batchWriterOpts.platform,
                                   force_refresh_bio: !!batchWriterOpts.forceRefreshBio,
                                   content_options: listingContentOpts,
-                                  custom_set_blurb: setBlurbDirty ? setBlurbText : '',
+                                  custom_set_blurb: (batchWriterOpts.scope === 'set' && batchWriterOpts.setName === setBlurbSet && setBlurbDirty) ? setBlurbText : '',
                                   estimated_total: Math.max(1, batchWriterMatchCount),
                                 }
                               );
@@ -7828,8 +7859,12 @@ export default function App() {
               });
 
               const startAddExpense = () => {
+                const maxExpNum = expensesLedger.reduce((mx, row) => {
+                  const m = String(row?.ID || '').match(/(\d+)$/);
+                  return m ? Math.max(mx, parseInt(m[1], 10)) : mx;
+                }, 0);
                 const newRow = {
-                  ID: `EXP-${String(expensesLedger.length + 1).padStart(3, '0')}`,
+                  ID: `EXP-${String(maxExpNum + 1).padStart(3, '0')}`,
                   Date: new Date().toISOString().slice(0, 10),
                   Category: EXPENSE_CATEGORIES[0],
                   Vendor: '',
@@ -8197,16 +8232,26 @@ export default function App() {
                           !settingsLayout.scheduler?.collapsed && (
                             <div className="flex items-center gap-1.5">
                               <button
-                                onClick={() => setSchedules([...schedules, {
-                                  Schedule_ID: `SCHED-${String(schedules.length + 1).padStart(3, '0')}`,
-                                  Enabled: true,
-                                  Pipeline_Mode: 'auto_checklists',
-                                  Activity_Label: '🏛️ TCDB Master Checklist Builder (With TCDB_CIDs)',
-                                  Frequency: 'DAILY',
-                                  Time_24h: '03:00',
-                                  Task_Name: `Tabulas_Custom_Job_${schedules.length + 1}`,
-                                  OS_Status: 'Pending Sync',
-                                }])}
+                                onClick={() => {
+                                  const maxSchedNum = schedules.reduce((mx, row) => {
+                                    const m = String(row?.Schedule_ID || '').match(/(\d+)$/);
+                                    return m ? Math.max(mx, parseInt(m[1], 10)) : mx;
+                                  }, 0);
+                                  const maxTaskNum = schedules.reduce((mx, row) => {
+                                    const m = String(row?.Task_Name || '').match(/Tabulas_Custom_Job_(\d+)$/);
+                                    return m ? Math.max(mx, parseInt(m[1], 10)) : mx;
+                                  }, 0);
+                                  setSchedules([...schedules, {
+                                    Schedule_ID: `SCHED-${String(maxSchedNum + 1).padStart(3, '0')}`,
+                                    Enabled: true,
+                                    Pipeline_Mode: 'auto_checklists',
+                                    Activity_Label: '🏛️ TCDB Master Checklist Builder (With TCDB_CIDs)',
+                                    Frequency: 'DAILY',
+                                    Time_24h: '03:00',
+                                    Task_Name: `Tabulas_Custom_Job_${maxTaskNum + 1}`,
+                                    OS_Status: 'Pending Sync',
+                                  }]);
+                                }}
                                 className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-semibold"
                               >
                                 ➕ Add

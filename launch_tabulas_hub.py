@@ -2618,6 +2618,15 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     custom_set_blurb=str(payload.get("customSetBlurb") or "").strip() or None,
                 )
                 if bool(payload.get("saveDraft", False)):
+                    custom_title = str(payload.get("customTitle") or "").strip()
+                    custom_price = str(payload.get("customPrice") or "").strip()
+                    custom_desc = str(payload.get("customDescription") or "").strip()
+                    if custom_title:
+                        copy_res["SEO_Title_80Char"] = custom_title
+                    if custom_price:
+                        copy_res["Recommended_Price"] = custom_price
+                    if custom_desc:
+                        copy_res["Description_Body"] = custom_desc
                     curr_d = load_listing_drafts_df()
                     new_d = pd.DataFrame([{
                         "Draft_ID": f"DRF-{sku_v}",
