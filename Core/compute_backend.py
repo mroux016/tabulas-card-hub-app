@@ -827,7 +827,7 @@ def get_active_ocr_provider_name() -> str:
 # ==============================================================================
 # SHARED ONNX SESSION FACTORY (FOUNDATION FOR WINS #2 & #4)
 # ==============================================================================
-def create_onnx_session(model_path: Path, prefer_gpu: bool = True, purpose: str = "neural"):
+def create_onnx_session(model_path: Path, prefer_gpu: bool = True, purpose: str = "neural", claim_slot: bool = True):
     """
     Unified ONNX Runtime session factory used by `Core/neural_vision.py` (Wins #2 & #4).
     Automatically steers DirectML / CUDA onto the discrete GPU (`dGPU`) via exact DXGI
@@ -842,7 +842,7 @@ def create_onnx_session(model_path: Path, prefer_gpu: bool = True, purpose: str 
     cfg = load_compute_settings()
     target = resolve_target_onnx_provider(cfg, purpose=purpose) if prefer_gpu else "CPUExecutionProvider"
 
-    if target in ("DmlExecutionProvider", "CUDAExecutionProvider") and not _PROCESS_CLAIMED_GPU:
+    if claim_slot and target in ("DmlExecutionProvider", "CUDAExecutionProvider") and not _PROCESS_CLAIMED_GPU:
         granted, _, _ = claim_gpu_worker_slot(job_type=f"onnx_{purpose}")
         if not granted:
             target = "CPUExecutionProvider"

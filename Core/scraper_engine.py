@@ -66,6 +66,7 @@ from Core.config import (
     TABULAS_VENV_PYTHON,
     TCDB_STANDARD_GLOSSARY,
     TRACKING_FILE,
+    atomic_write_bytes,
     atomic_write_text,
     build_template_image_filename,
     build_template_image_filenames,
@@ -3012,9 +3013,10 @@ def _merge_set_checklist_into_master(set_df: pd.DataFrame, checklist_set_name: s
             set_df[col] = ""
     set_csv_path = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(checklist_set_name)}.csv"
     set_df = set_df[CHECKLIST_COLUMNS]
-    tmp_set_csv = set_csv_path.with_name(f"{set_csv_path.name}.{os.getpid()}.tmp")
-    set_df.to_csv(tmp_set_csv, index=False, encoding="utf-8-sig")
-    os.replace(str(tmp_set_csv), str(set_csv_path))
+    atomic_write_bytes(
+        set_csv_path,
+        lambda tmp_p: set_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+    )
 
     merged_master = None
     if CHECKLIST_PATH.exists() and CHECKLIST_PATH.stat().st_size > 0:
@@ -3072,13 +3074,15 @@ def _merge_set_checklist_into_master(set_df: pd.DataFrame, checklist_set_name: s
     else:
         merged_master = set_df
 
-    tmp_master_csv = CHECKLIST_PATH.with_name(f"{CHECKLIST_PATH.name}.{os.getpid()}.tmp")
-    merged_master[CHECKLIST_COLUMNS].to_csv(tmp_master_csv, index=False, encoding="utf-8-sig")
-    os.replace(str(tmp_master_csv), str(CHECKLIST_PATH))
+    atomic_write_bytes(
+        CHECKLIST_PATH,
+        lambda tmp_p: merged_master[CHECKLIST_COLUMNS].to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+    )
     try:
-        tmp_backup_csv = CHECKLIST_BACKUP_PATH.with_name(f"{CHECKLIST_BACKUP_PATH.name}.{os.getpid()}.tmp")
-        shutil.copy2(CHECKLIST_PATH, tmp_backup_csv)
-        os.replace(str(tmp_backup_csv), str(CHECKLIST_BACKUP_PATH))
+        atomic_write_bytes(
+            CHECKLIST_BACKUP_PATH,
+            lambda tmp_p: shutil.copy2(CHECKLIST_PATH, tmp_p),
+        )
     except Exception:
         pass
 

@@ -161,9 +161,10 @@ class NeuralEmbeddingEngine:
     with automatic batch-size backoff and 100% seamless CPU fallback.
     """
 
-    def __init__(self, model_path: Optional[Path] = None, prefer_gpu: bool = True):
+    def __init__(self, model_path: Optional[Path] = None, prefer_gpu: bool = True, claim_slot: bool = True):
         ensure_directories()
         self.prefer_gpu = bool(prefer_gpu)
+        self.claim_slot = bool(claim_slot)
         self.model_path: Optional[Path] = Path(model_path) if model_path else self._discover_best_model()
         self.session = None
         self.active_provider = "None"
@@ -198,7 +199,7 @@ class NeuralEmbeddingEngine:
                 return False
         try:
             self.session, self.active_provider = create_onnx_session(
-                self.model_path, prefer_gpu=self.prefer_gpu, purpose="neural"
+                self.model_path, prefer_gpu=self.prefer_gpu, purpose="neural", claim_slot=self.claim_slot
             )
             inp0 = self.session.get_inputs()[0]
             self.input_name = inp0.name
@@ -775,7 +776,7 @@ def benchmark_dinov2_gpu_vs_cpu(batch_size: int = 16) -> dict:
     synth_batch = [np.random.randint(20, 235, (256, 200, 3), dtype=np.uint8) for _ in range(int(batch_size))]
 
     try:
-        eng_cpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=False)
+        eng_cpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=False, claim_slot=False)
         if eng_cpu.ensure_loaded():
             eng_cpu.extract_embeddings_batch(synth_batch[:4], batch_size=4)  # warmup
             t0 = time.perf_counter()
@@ -784,7 +785,7 @@ def benchmark_dinov2_gpu_vs_cpu(batch_size: int = 16) -> dict:
             out["cpu_ms_per_batch"] = round(cpu_ms, 1)
             out["cpu_cards_per_sec"] = round((batch_size * 1000.0) / max(0.1, cpu_ms), 1)
 
-        eng_gpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=True)
+        eng_gpu = NeuralEmbeddingEngine(model_path=model_p, prefer_gpu=True, claim_slot=False)
         if eng_gpu.ensure_loaded():
             out["gpu_provider"] = eng_gpu.active_provider
             if eng_gpu.active_provider != "CPUExecutionProvider":

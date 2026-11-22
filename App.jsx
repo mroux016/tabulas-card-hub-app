@@ -961,7 +961,7 @@ function GuidedReviewCardItem({
           <label className="block text-[10px] text-slate-400 mb-0.5">Needs Review</label>
           <select
             value={String(draft.Needs_Review).toLowerCase() === 'true' ? 'True' : 'False'}
-            onChange={(e) => { setReviewTouched(true); onDraftChange({ ...draft, Needs_Review: e.target.value }); }}
+            onChange={(e) => { setReviewTouched(true); onDraftChange({ ...draft, Needs_Review: e.target.value, _reviewTouched: true }); }}
             className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs"
           >
             <option value="False">✅ False</option>
@@ -976,14 +976,15 @@ function GuidedReviewCardItem({
               setSavingOne(true);
               const isConfirmOnly = !hasFieldChanges && (!reviewTouched || String(draft.Needs_Review).toLowerCase() !== 'true');
               const finalNeedsRev = reviewTouched ? String(draft.Needs_Review || 'False') : 'False';
+              const { _reviewTouched: _ignoredReviewTouched, ...cleanDraft } = draft || {};
               Promise.resolve(
                 onSaveOne(
                   {
                     ...card,
-                    ...draft,
+                    ...cleanDraft,
                     SKU: card.SKU,
                     Needs_Review: isConfirmOnly ? 'False' : finalNeedsRev,
-                    Manual_Override: isConfirmOnly ? '' : (draft.Subset_Parallel || curSub),
+                    Manual_Override: isConfirmOnly ? '' : (cleanDraft.Subset_Parallel || curSub),
                   },
                   { confirmOnly: isConfirmOnly }
                 )
@@ -4680,9 +4681,9 @@ export default function App() {
                           const targetCards = dirtyGuidedSkus.length > 0
                             ? dirtyGuidedSkus.map((sku) => {
                                 const baseC = gPool.find((x) => x.SKU === sku) || {};
-                                const dC = batchDraftEdits[sku] || {};
-                                const explicitFlagTrue = Object.prototype.hasOwnProperty.call(dC, 'Needs_Review') && String(dC.Needs_Review || '').toLowerCase() === 'true';
-                                return { ...baseC, ...dC, SKU: sku, Needs_Review: explicitFlagTrue ? 'True' : 'False', Manual_Override: dC.Subset_Parallel || baseC.Subset_Parallel || 'Base' };
+                                const { _reviewTouched, ...cleanDraft } = batchDraftEdits[sku] || {};
+                                const explicitFlagTrue = Boolean(_reviewTouched) && String(cleanDraft.Needs_Review || '').toLowerCase() === 'true';
+                                return { ...baseC, ...cleanDraft, SKU: sku, Needs_Review: explicitFlagTrue ? 'True' : 'False', Manual_Override: cleanDraft.Subset_Parallel || baseC.Subset_Parallel || 'Base' };
                               })
                             : gSlice.map((c) => ({ ...c, SKU: c.SKU, Needs_Review: 'False' }));
                           targetCards.forEach((tc) => {
