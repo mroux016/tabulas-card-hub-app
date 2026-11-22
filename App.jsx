@@ -5,7 +5,7 @@ const APP_VERSION = '0.24.0-beta.45';
 const LAST_UPDATED = '2026-11-21 15:05:00';
 const STORAGE_ROOT = 'C:\\Tabulas Card Hub';
 const SET_LIBRARY_ROOT = 'D:\\Tabulas Set Library';
-const API_ORIGIN = window.location.origin;
+const API_ORIGIN = (typeof window !== 'undefined' && window.location && window.location.origin && !window.location.origin.startsWith('file://') && window.location.origin !== 'null') ? window.location.origin : 'http://localhost:5000';
 const NODE_API_BASE = `${API_ORIGIN}/api`;
 
 // ============================================================================
