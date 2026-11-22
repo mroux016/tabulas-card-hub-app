@@ -19,7 +19,7 @@ os.environ["TABULAS_ARCHIVE_DIR"] = str(_TEMP_ROOT / "Archive")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from Core.compute_backend import get_active_gpu_worker_claims, run_compute_benchmark
-from Core.surface_defect_engine import inspect_card_surface_through_sleeve
+from Core.surface_defect_engine import _cluster_and_nms_defects, inspect_card_surface_through_sleeve
 from Core.vision_grader import estimate_card_pregrade
 
 
@@ -225,6 +225,34 @@ def test_scanner_streaks_vs_true_defects():
     assert any(a["type"] == "scanner_streak" for a in res_t["superficial_artifacts"]), res_t["superficial_artifacts"]
 
 
+def test_nms_clustering_and_edge_dent():
+    # 1. Spatial NMS collapses nearby detections within 3.5% normalized distance into 1 union defect
+    clustered = _cluster_and_nms_defects([
+        {"id": "d1", "side": "Front", "type": "surface_scratch", "category": "surface", "severity": 0.5, "confidence": 0.75, "bbox_norm": [0.40, 0.40, 0.02, 0.02]},
+        {"id": "d2", "side": "Front", "type": "surface_scratch", "category": "surface", "severity": 1.0, "confidence": 0.88, "bbox_norm": [0.415, 0.41, 0.02, 0.02]},
+        {"id": "d3", "side": "Front", "type": "dimple_dent", "category": "surface", "severity": 0.5, "confidence": 0.80, "bbox_norm": [0.75, 0.75, 0.02, 0.02]},
+    ])
+    assert len(clustered) == 2, f"Expected 2 clusters, got {len(clustered)}: {clustered}"
+    merged = next(d for d in clustered if d["id"] == "d2")
+    assert merged["bbox_norm"] == [0.4, 0.4, 0.035, 0.03], merged
+    assert merged["severity"] == 1.0 and merged["confidence"] == 0.88
+
+    # 2. Edge-band dent (within 3.5% of card edge, outside corner tips) -> edge_dent under edges
+    f_im, f_box = _make_clean_card_in_sleeve()
+    base = np.array(f_im).astype(np.int16)
+    yy, xx = np.ogrid[:base.shape[0], :base.shape[1]]
+    # Place dipole in outer 3.5% edge band (13px..23px from edge, outside corner tips)
+    ex = f_box[0] + 18
+    ey = 520
+    lobe_p = np.exp(-((xx - ex) ** 2 + (yy - (ey - 6)) ** 2) / 28.0) * 58.0
+    lobe_n = np.exp(-((xx - ex) ** 2 + (yy - (ey + 6)) ** 2) / 28.0) * 58.0
+    dent_arr = np.clip(base + (lobe_p - lobe_n)[..., None], 0, 255).astype(np.uint8)
+    res_ed = inspect_card_surface_through_sleeve(Image.fromarray(dent_arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    edge_dents = [d for d in res_ed["confirmed_defects"] if d["type"] == "edge_dent"]
+    assert len(edge_dents) >= 1, res_ed["confirmed_defects"]
+    assert edge_dents[0]["category"] == "edges" and edge_dents[0]["marker_style"] == "arrow", edge_dents[0]
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")
@@ -242,4 +270,6 @@ if __name__ == "__main__":
     print("[PASS] test_cpu_parity_and_benchmark_no_slot_leak")
     test_scanner_streaks_vs_true_defects()
     print("[PASS] test_scanner_streaks_vs_true_defects")
+    test_nms_clustering_and_edge_dent()
+    print("[PASS] test_nms_clustering_and_edge_dent")
     print("ALL WIN #4 TESTS PASSED")

@@ -2179,6 +2179,33 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": str(e)}, status=500)
             return
 
+        if route == "/api/grading/update-geometry" and isinstance(payload, dict):
+            from Core.vision_grader import update_card_grading_geometry
+            t_type = str(payload.get("targetType") or "inventory").strip().lower()
+            sku_v = str(payload.get("sku") or "").strip()
+            b_name = str(payload.get("batchName") or "").strip()
+            try:
+                res_geom = update_card_grading_geometry(
+                    target_type=t_type,
+                    sku=sku_v,
+                    batch_name=b_name,
+                    payload=payload,
+                )
+                if res_geom.get("success"):
+                    gb = res_geom.get("gradesBefore") or {}
+                    ga = res_geom.get("gradesAfter") or {}
+                    _log_ui_action_to_file(
+                        "Grading",
+                        f"Manual Geometry ({payload.get('side', 'Front')}) — SKU {sku_v}",
+                        f"PSA {gb.get('Est_PSA', '?')}->{ga.get('Est_PSA', '?')} | BGS {gb.get('Est_BGS', '?')}->{ga.get('Est_BGS', '?')}",
+                    )
+                    self._send_json(res_geom, status=200)
+                else:
+                    self._send_json(res_geom, status=400)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, status=500)
+            return
+
         if route == "/api/batches/commit" and isinstance(payload, dict):
             import cli
             try:

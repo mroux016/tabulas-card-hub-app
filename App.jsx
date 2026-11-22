@@ -2040,11 +2040,27 @@ function GradingDeepDiveStudio({
   const [diagError, setDiagError] = useState('');
   const [activeLayers, setActiveLayers] = useState({ centering: true, corners: true, edges: true, surface: true });
   const [showArtifacts, setShowArtifacts] = useState(false);
-  const [selectedItemId, setSelectedItemId] = useState('');
+  const [isolatedDefectId, setIsolatedDefectId] = useState('');
+  const [loupeZoom, setLoupeZoom] = useState(1.0);
   const [showFlagModal, setShowFlagModal] = useState(false);
+  const [flagPresetId, setFlagPresetId] = useState('');
   const [naturalSize, setNaturalSize] = useState({ w: 1500, h: 2100 });
   const canvasWrapRef = useRef(null);
+  const svgRef = useRef(null);
   const [fittedBox, setFittedBox] = useState({ w: 380, h: 532 });
+
+  // Main Card Zoom & Pan
+  const [mainZoom, setMainZoom] = useState(1.0);
+  const [mainPan, setMainPan] = useState({ x: 0, y: 0 });
+  const panDragRef = useRef(null);
+
+  // Interactive Geometry Edit Modes ('none' | 'centering' | 'corners')
+  const [editMode, setEditMode] = useState('none');
+  const [draftOuter, setDraftOuter] = useState(null);
+  const [draftInner, setDraftInner] = useState(null);
+  const [draftCorners, setDraftCorners] = useState(null);
+  const [savingGeom, setSavingGeom] = useState(false);
+  const geomDragRef = useRef(null);
 
   const sku = String(card?.SKU || '').trim();
   const effectiveBatch = batchName || card?._BatchName || '';
@@ -2072,10 +2088,20 @@ function GradingDeepDiveStudio({
   };
 
   useEffect(() => {
-    setSelectedItemId('');
+    setIsolatedDefectId('');
+    setEditMode('none');
+    setMainZoom(1.0);
+    setMainPan({ x: 0, y: 0 });
     setDiagnostics(null);
     fetchDiagnostics(false);
   }, [sku, targetType, effectiveBatch]);
+
+  useEffect(() => {
+    setIsolatedDefectId('');
+    setEditMode('none');
+    setMainZoom(1.0);
+    setMainPan({ x: 0, y: 0 });
+  }, [activeSide]);
 
   useEffect(() => {
     const srcSizes = diagnostics?.source_images || {};
@@ -2090,8 +2116,8 @@ function GradingDeepDiveStudio({
     if (!el) return;
     const updateFit = () => {
       const rect = el.getBoundingClientRect();
-      const availW = Math.max(120, rect.width - 12);
-      const availH = Math.max(180, rect.height - 12);
+      const availW = Math.max(120, rect.width - 16);
+      const availH = Math.max(180, rect.height - 16);
       const natW = Math.max(1, naturalSize.w || 1500);
       const natH = Math.max(1, naturalSize.h || 2100);
       const ratio = natW / natH;
@@ -2128,6 +2154,11 @@ function GradingDeepDiveStudio({
 
   const toggleLayer = (cat) => setActiveLayers((prev) => ({ ...prev, [cat]: !prev[cat] }));
 
+  const showAllMarkers = () => {
+    setIsolatedDefectId('');
+    setActiveLayers({ centering: true, corners: true, edges: true, surface: true });
+  };
+
   const psaInfo = diagnostics?.grades?.psa || {
     overall: card?.Est_PSA || '—',
     tier: '',
@@ -2152,8 +2183,28 @@ function GradingDeepDiveStudio({
   const sideCent = activeSide === 'Back' ? diagnostics?.centering?.back : diagnostics?.centering?.front;
   const confirmedAll = Array.isArray(diagnostics?.confirmed_defects) ? diagnostics.confirmed_defects : [];
   const artifactsAll = Array.isArray(diagnostics?.superficial_artifacts) ? diagnostics.superficial_artifacts : [];
-  const sideDefects = confirmedAll.filter((d) => String(d.side || 'Front') === activeSide && activeLayers[String(d.category || 'surface')]);
-  const sideArtifacts = showArtifacts ? artifactsAll.filter((a) => String(a.side || 'Front') === activeSide && Array.isArray(a.bbox_norm)) : [];
+
+  // Active-side defects only, sorted with matching (active) categories first
+  const activeSideDefectsAll = confirmedAll
+    .filter((d) => String(d.side || 'Front') === activeSide)
+    .slice()
+    .sort((a, b) => {
+      const aOn = activeLayers[String(a.category || 'surface')] ? 0 : 1;
+      const bOn = activeLayers[String(b.category || 'surface')] ? 0 : 1;
+      if (aOn !== bOn) return aOn - bOn;
+      return Number(b.penalty ?? b.severity ?? 0) - Number(a.penalty ?? a.severity ?? 0);
+    });
+
+  // Left card SVG markers: if isolatedDefectId is set, show ONLY that defect; otherwise show active categories
+  const visibleSideDefects = isolatedDefectId
+    ? activeSideDefectsAll.filter((d) => d.id === isolatedDefectId)
+    : activeSideDefectsAll.filter((d) => activeLayers[String(d.category || 'surface')]);
+
+  const sideArtifacts = showArtifacts && !isolatedDefectId
+    ? artifactsAll.filter((a) => String(a.side || 'Front') === activeSide && Array.isArray(a.bbox_norm))
+    : [];
+
+  const isolatedDefect = isolatedDefectId ? activeSideDefectsAll.find((d) => d.id === isolatedDefectId) || null : null;
 
   const notesByCat = diagnostics?.notes_by_category || {
     centering: `${card?.Centering_LR || '—'} L/R | ${card?.Centering_TB || '—'} T/B`,
@@ -2163,16 +2214,7 @@ function GradingDeepDiveStudio({
     advisories: [],
   };
 
-  // Build 4 corner crop boxes around outer_card_rect (or default [0.04, 0.03, 0.92, 0.94])
-  const oc = Array.isArray(sideCent?.outer_card_rect) ? sideCent.outer_card_rect : [0.04, 0.03, 0.92, 0.94];
-  const cornerLoupes = [
-    { key: 'Top-Left', label: 'TL', x: oc[0], y: oc[1], w: 0.14, h: 0.14 },
-    { key: 'Top-Right', label: 'TR', x: Math.max(0, oc[0] + oc[2] - 0.14), y: oc[1], w: 0.14, h: 0.14 },
-    { key: 'Bot-Left', label: 'BL', x: oc[0], y: Math.max(0, oc[1] + oc[3] - 0.14), w: 0.14, h: 0.14 },
-    { key: 'Bot-Right', label: 'BR', x: Math.max(0, oc[0] + oc[2] - 0.14), y: Math.max(0, oc[1] + oc[3] - 0.14), w: 0.14, h: 0.14 },
-  ];
-
-  const buildCropUrl = (sideLbl, bbox, pad = 0.025, size = 180) => {
+  const buildCropUrl = (sideLbl, bbox, pad = 0.03, size = 240) => {
     if (!sku || !Array.isArray(bbox)) return '';
     const qs = new URLSearchParams({
       targetType,
@@ -2189,6 +2231,158 @@ function GradingDeepDiveStudio({
     return `${NODE_API_BASE}/grading/crop?${qs.toString()}`;
   };
 
+  // Interactive Geometry Edit helpers
+  const startEditCentering = () => {
+    const oc = Array.isArray(sideCent?.outer_card_rect) ? [...sideCent.outer_card_rect] : [0.04, 0.03, 0.92, 0.94];
+    const ic = Array.isArray(sideCent?.inner_frame_rect) ? [...sideCent.inner_frame_rect] : [0.09, 0.08, 0.82, 0.84];
+    setDraftOuter(oc);
+    setDraftInner(ic);
+    setEditMode('centering');
+  };
+
+  const startEditCorners = () => {
+    const oc = Array.isArray(sideCent?.outer_card_rect) ? sideCent.outer_card_rect : [0.04, 0.03, 0.92, 0.94];
+    const c = sideCent?.corners || {
+      tl: [oc[0], oc[1]],
+      tr: [oc[0] + oc[2], oc[1]],
+      bl: [oc[0], oc[1] + oc[3]],
+      br: [oc[0] + oc[2], oc[1] + oc[3]],
+    };
+    setDraftCorners({
+      tl: [...(c.tl || [oc[0], oc[1]])],
+      tr: [...(c.tr || [oc[0] + oc[2], oc[1]])],
+      bl: [...(c.bl || [oc[0], oc[1] + oc[3]])],
+      br: [...(c.br || [oc[0] + oc[2], oc[1] + oc[3]])],
+    });
+    setEditMode('corners');
+  };
+
+  const saveGeometryEdit = () => {
+    setSavingGeom(true);
+    const body = {
+      targetType,
+      sku,
+      batchName: effectiveBatch,
+      side: activeSide,
+    };
+    if (editMode === 'centering') {
+      body.outer_card_rect = draftOuter;
+      body.inner_frame_rect = draftInner;
+    } else if (editMode === 'corners') {
+      body.corners = draftCorners;
+    }
+    fetch(`${NODE_API_BASE}/grading/update-geometry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res?.success) {
+          if (res.diagnostics) setDiagnostics(res.diagnostics);
+          if (onCardUpdated) onCardUpdated(res);
+          setEditMode('none');
+          const gb = res.gradesBefore || {};
+          const ga = res.gradesAfter || {};
+          if (pushNotification) {
+            pushNotification(
+              `Geometry Saved (${activeSide}) — SKU ${sku}`,
+              `PSA ${gb.Est_PSA || '?'} → ${ga.Est_PSA || '?'} | BGS ${gb.Est_BGS || '?'} → ${ga.Est_BGS || '?'}`,
+              'Grading',
+              'success'
+            );
+          }
+        } else {
+          setDiagError(res?.error || 'Failed to save manual geometry.');
+        }
+      })
+      .catch((e) => setDiagError(e.message || 'Network error saving geometry.'))
+      .finally(() => setSavingGeom(false));
+  };
+
+  const clientToNorm = (clientX, clientY) => {
+    const el = svgRef.current;
+    if (!el) return [0.5, 0.5];
+    const r = el.getBoundingClientRect();
+    const nx = Math.max(0.0, Math.min(1.0, (clientX - r.left) / Math.max(1, r.width)));
+    const ny = Math.max(0.0, Math.min(1.0, (clientY - r.top) / Math.max(1, r.height)));
+    return [Number(nx.toFixed(4)), Number(ny.toFixed(4))];
+  };
+
+  const handleSvgPointerMove = (e) => {
+    const gd = geomDragRef.current;
+    if (!gd) return;
+    e.stopPropagation();
+    const [nx, ny] = clientToNorm(e.clientX, e.clientY);
+    if (gd.kind === 'corner') {
+      setDraftCorners((prev) => ({ ...(prev || {}), [gd.edge]: [nx, ny] }));
+      return;
+    }
+    const setter = gd.kind === 'outer' ? setDraftOuter : setDraftInner;
+    setter((prev) => {
+      if (!prev) return prev;
+      let [x, y, w, h] = prev;
+      let x2 = x + w;
+      let y2 = y + h;
+      const minGap = 0.06;
+      if (gd.edge === 'left') x = Math.min(x2 - minGap, nx);
+      else if (gd.edge === 'right') x2 = Math.max(x + minGap, nx);
+      else if (gd.edge === 'top') y = Math.min(y2 - minGap, ny);
+      else if (gd.edge === 'bottom') y2 = Math.max(y + minGap, ny);
+      return [Number(x.toFixed(4)), Number(y.toFixed(4)), Number((x2 - x).toFixed(4)), Number((y2 - y).toFixed(4))];
+    });
+  };
+
+  const handleSvgPointerUp = () => {
+    geomDragRef.current = null;
+    panDragRef.current = null;
+  };
+
+  const handleCanvasWheel = (e) => {
+    if (e.ctrlKey || Math.abs(e.deltaY) > 0) {
+      e.preventDefault();
+      const delta = e.deltaY < 0 ? 0.2 : -0.2;
+      setMainZoom((z) => {
+        const nz = Number(Math.max(1.0, Math.min(4.0, z + delta)).toFixed(2));
+        if (nz <= 1.0) setMainPan({ x: 0, y: 0 });
+        return nz;
+      });
+    }
+  };
+
+  const handleCanvasPointerDown = (e) => {
+    if (editMode !== 'none' || mainZoom <= 1.0 || geomDragRef.current) return;
+    panDragRef.current = { startX: e.clientX, startY: e.clientY, origX: mainPan.x, origY: mainPan.y };
+  };
+
+  const handleCanvasPointerMove = (e) => {
+    if (geomDragRef.current) {
+      handleSvgPointerMove(e);
+      return;
+    }
+    const pd = panDragRef.current;
+    if (!pd) return;
+    setMainPan({ x: pd.origX + (e.clientX - pd.startX), y: pd.origY + (e.clientY - pd.startY) });
+  };
+
+  // Live centering calculation during Edit Centering
+  const activeOuterRect = editMode === 'centering' && draftOuter ? draftOuter : sideCent?.outer_card_rect;
+  const activeInnerRect = editMode === 'centering' && draftInner ? draftInner : sideCent?.inner_frame_rect;
+  const liveCentStats = (() => {
+    if (!Array.isArray(activeOuterRect) || !Array.isArray(activeInnerRect)) {
+      return { lr: sideCent?.lr || '50/50', tb: sideCent?.tb || '50/50' };
+    }
+    const [ox, oy, ow, oh] = activeOuterRect;
+    const [ix, iy, iw, ih] = activeInnerRect;
+    const l = Math.max(0.001, ix - ox);
+    const r = Math.max(0.001, ox + ow - (ix + iw));
+    const t = Math.max(0.001, iy - oy);
+    const b = Math.max(0.001, oy + oh - (iy + ih));
+    const lrL = Math.max(32, Math.min(68, Math.round((l / (l + r)) * 100)));
+    const tbT = Math.max(32, Math.min(68, Math.round((t / (t + b)) * 100)));
+    return { lr: `${lrL}/${100 - lrL}`, tb: `${tbT}/${100 - tbT}` };
+  })();
+
   const renderSvgMarker = (d, idx) => {
     if (!Array.isArray(d.bbox_norm)) return null;
     const [bx, by, bw, bh] = d.bbox_norm;
@@ -2198,7 +2392,7 @@ function GradingDeepDiveStudio({
     const h = Math.max(14, bh * 1000);
     const cx = x + w * 0.5;
     const cy = y + h * 0.5;
-    const isSel = selectedItemId === d.id;
+    const isSel = isolatedDefectId === d.id;
     const strokeCol = isSel ? '#facc15' : '#ef4444';
     const sw = isSel ? 5 : 3;
     const style = d.marker_style || 'circle';
@@ -2206,20 +2400,15 @@ function GradingDeepDiveStudio({
     return (
       <g
         key={d.id || idx}
-        onClick={() => setSelectedItemId(isSel ? '' : d.id)}
+        onClick={(e) => {
+          e.stopPropagation();
+          setLoupeZoom(1.0);
+          setIsolatedDefectId(isSel ? '' : d.id);
+        }}
         style={{ cursor: 'pointer' }}
       >
         {style === 'box' ? (
-          <rect
-            x={x}
-            y={y}
-            width={w}
-            height={h}
-            rx={6}
-            fill={isSel ? 'rgba(250,204,21,0.16)' : 'rgba(239,68,68,0.12)'}
-            stroke={strokeCol}
-            strokeWidth={sw}
-          />
+          <rect x={x} y={y} width={w} height={h} rx={6} fill={isSel ? 'rgba(250,204,21,0.18)' : 'rgba(239,68,68,0.12)'} stroke={strokeCol} strokeWidth={sw} />
         ) : style === 'arrow' ? (
           <g>
             <circle cx={cx} cy={cy} r={Math.max(18, Math.max(w, h) * 0.65)} fill="rgba(239,68,68,0.14)" stroke={strokeCol} strokeWidth={sw} />
@@ -2227,14 +2416,7 @@ function GradingDeepDiveStudio({
             <circle cx={cx} cy={cy} r={5} fill={strokeCol} />
           </g>
         ) : (
-          <circle
-            cx={cx}
-            cy={cy}
-            r={Math.max(20, Math.max(w, h) * 0.65)}
-            fill={isSel ? 'rgba(250,204,21,0.16)' : 'rgba(239,68,68,0.14)'}
-            stroke={strokeCol}
-            strokeWidth={sw}
-          />
+          <circle cx={cx} cy={cy} r={Math.max(20, Math.max(w, h) * 0.65)} fill={isSel ? 'rgba(250,204,21,0.18)' : 'rgba(239,68,68,0.14)'} stroke={strokeCol} strokeWidth={sw} />
         )}
         <title>{`${d.label || d.type} (-${Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)})`}</title>
       </g>
@@ -2243,51 +2425,103 @@ function GradingDeepDiveStudio({
 
   const cnumDisp = String(card?.['Card Number'] || card?.Card_Number || '').replace(/^#/, '');
   const subDisp = card?.Subset || card?.Subset_Parallel || 'Base';
+  const anyFilteredOrIsolated = Boolean(isolatedDefectId) || !activeLayers.centering || !activeLayers.corners || !activeLayers.edges || !activeLayers.surface;
 
-  const renderGradeSummaryCard = (title, info, accentCls) => {
-    const subs = info?.subgrades || {};
-    const pills = [
-      { key: 'centering', label: 'Centering', val: subs.centering },
-      { key: 'corners', label: 'Corners', val: subs.corners },
-      { key: 'edges', label: 'Edges', val: subs.edges },
-      { key: 'surface', label: 'Surface', val: subs.surface },
+  // Authentic PSA Card (Red & White, Non-Toggle)
+  const renderPsaCard = () => {
+    const subs = psaInfo?.subgrades || {};
+    const items = [
+      { label: 'Centering', val: subs.centering },
+      { label: 'Corners', val: subs.corners },
+      { label: 'Edges', val: subs.edges },
+      { label: 'Surface', val: subs.surface },
     ];
     return (
-      <div className="bg-slate-950/90 border border-slate-800 rounded-2xl p-3 space-y-2">
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{title}</div>
-            <div className="flex items-baseline gap-2">
-              <span className={`text-2xl font-black font-mono ${accentCls}`}>{info?.overall ?? '—'}</span>
-              {info?.tier && <span className="text-[10.5px] font-semibold text-slate-300">{info.tier}</span>}
-            </div>
+      <div className="rounded-2xl overflow-hidden border-2 border-red-600 bg-white text-slate-900 shadow-lg">
+        <div className="bg-red-600 text-white px-3 py-1.5 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="font-black tracking-widest text-xs uppercase bg-white text-red-600 px-1.5 py-0.5 rounded">PSA</span>
+            <span className="text-[11px] font-bold uppercase tracking-wide">Estimated Grade</span>
           </div>
-          <span className="text-[9.5px] text-slate-500 font-mono">Click pills to toggle overlays</span>
+          <div className="flex items-baseline gap-1.5">
+            {psaInfo?.tier && <span className="text-[10px] font-bold uppercase opacity-90">{psaInfo.tier}</span>}
+            <span className="text-xl font-black font-mono leading-none">{psaInfo?.overall ?? '—'}</span>
+          </div>
         </div>
-        <div className="grid grid-cols-4 gap-1.5">
-          {pills.map((pl) => {
-            const on = Boolean(activeLayers[pl.key]);
-            return (
-              <button
-                key={pl.key}
-                type="button"
-                onClick={() => toggleLayer(pl.key)}
-                title={`Toggle ${pl.label} overlay on card image`}
-                className={`px-1.5 py-1.5 rounded-xl border text-center transition ${
-                  on
-                    ? 'bg-sky-950/90 border-sky-500/80 text-white shadow-sm'
-                    : 'bg-slate-900/70 border-slate-800 text-slate-500 opacity-65 hover:opacity-100'
-                }`}
-              >
-                <div className="text-[9px] uppercase font-bold truncate">{pl.label}</div>
-                <div className="text-xs font-black font-mono">{pl.val ?? '—'}</div>
-              </button>
-            );
-          })}
+        <div className="p-2 grid grid-cols-4 gap-1.5 bg-slate-50">
+          {items.map((it) => (
+            <div key={it.label} className="bg-white border border-red-200 rounded-xl px-1.5 py-1 text-center">
+              <div className="text-[9px] font-bold uppercase text-red-700 truncate">{it.label}</div>
+              <div className="text-xs font-black font-mono text-slate-900">{it.val ?? '—'}</div>
+            </div>
+          ))}
         </div>
       </div>
     );
   };
+
+  // Authentic Beckett (BGS) Card (Dynamic Silver / Gold / Black Label 10, Non-Toggle)
+  const renderBgsCard = () => {
+    const subs = bgsInfo?.subgrades || {};
+    const ovNum = parseFloat(bgsInfo?.overall);
+    const cNum = parseFloat(subs.centering);
+    const coNum = parseFloat(subs.corners);
+    const eNum = parseFloat(subs.edges);
+    const sNum = parseFloat(subs.surface);
+    const isBlackLabel = !isNaN(ovNum) && ovNum >= 10.0 && cNum >= 10.0 && coNum >= 10.0 && eNum >= 10.0 && sNum >= 10.0;
+    const isGoldLabel = !isBlackLabel && !isNaN(ovNum) && ovNum >= 9.5;
+
+    const wrapCls = isBlackLabel
+      ? 'bg-gradient-to-br from-neutral-950 via-black to-neutral-900 border-2 border-amber-400 text-amber-300 shadow-lg'
+      : isGoldLabel
+      ? 'bg-gradient-to-br from-amber-300 via-yellow-400 to-amber-500 border-2 border-amber-200 text-slate-950 shadow-lg'
+      : 'bg-gradient-to-br from-slate-200 via-slate-300 to-slate-400 border-2 border-slate-100 text-slate-950 shadow-lg';
+
+    const hdrCls = isBlackLabel
+      ? 'border-b border-amber-400/40 text-amber-300'
+      : 'border-b border-black/15 text-slate-950';
+
+    const boxCls = isBlackLabel
+      ? 'bg-neutral-900/95 border border-amber-400/60 text-amber-300'
+      : 'bg-white/75 border border-black/15 text-slate-950';
+
+    const labelBadge = isBlackLabel ? 'BLACK LABEL 10' : isGoldLabel ? 'GOLD LABEL' : 'SILVER LABEL';
+    const items = [
+      { label: 'Centering', val: subs.centering },
+      { label: 'Corners', val: subs.corners },
+      { label: 'Edges', val: subs.edges },
+      { label: 'Surface', val: subs.surface },
+    ];
+    return (
+      <div className={`rounded-2xl overflow-hidden ${wrapCls}`}>
+        <div className={`px-3 py-1.5 flex items-center justify-between ${hdrCls}`}>
+          <div className="flex items-center gap-1.5">
+            <span className={`font-black tracking-wider text-[11px] px-1.5 py-0.5 rounded ${isBlackLabel ? 'bg-amber-400 text-black' : 'bg-slate-900 text-white'}`}>BGS</span>
+            <span className="text-[10px] font-extrabold uppercase tracking-wide">{labelBadge}</span>
+          </div>
+          <div className="flex items-baseline gap-1.5">
+            {bgsInfo?.tier && <span className="text-[10px] font-bold uppercase opacity-80">{bgsInfo.tier}</span>}
+            <span className="text-xl font-black font-mono leading-none">{bgsInfo?.overall ?? '—'}</span>
+          </div>
+        </div>
+        <div className="p-2 grid grid-cols-4 gap-1.5">
+          {items.map((it) => (
+            <div key={it.label} className={`rounded-xl px-1.5 py-1 text-center ${boxCls}`}>
+              <div className="text-[9px] font-bold uppercase opacity-80 truncate">{it.label}</div>
+              <div className="text-xs font-black font-mono">{it.val ?? '—'}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const noteBoxes = [
+    { key: 'centering', title: 'Centering', icon: '📐', color: 'cyan', text: notesByCat.centering },
+    { key: 'corners', title: 'Corners', icon: '⌜', color: 'rose', text: notesByCat.corners },
+    { key: 'edges', title: 'Edges', icon: '║', color: 'amber', text: notesByCat.edges },
+    { key: 'surface', title: 'Surface', icon: '✨', color: 'purple', text: notesByCat.surface },
+  ];
 
   return (
     <div className="flex flex-col gap-3 h-[calc(100vh-5.5rem)] min-h-[680px]">
@@ -2316,7 +2550,7 @@ function GradingDeepDiveStudio({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => setShowFlagModal(true)}
+            onClick={() => { setFlagPresetId(isolatedDefectId || ''); setShowFlagModal(true); }}
             className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow"
           >
             🚩 Flag Error
@@ -2339,57 +2573,108 @@ function GradingDeepDiveStudio({
 
       {/* MAIN SPLIT PANE */}
       <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-3">
-        {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + EXACT ASPECT-LOCKED SVG OVERLAY */}
+        {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + ZOOM/PAN + EDIT CENTERING/CORNERS */}
         <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0`}>
-          <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
-            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => setActiveSide('Front')}
-                className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Front' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
-              >
-                Front
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveSide('Back')}
-                className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Back' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
-              >
-                Back
-              </button>
+          {/* LEFT TOOLBAR */}
+          <div className="flex flex-wrap items-center justify-between gap-1.5 shrink-0">
+            <div className="flex items-center gap-1.5">
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setActiveSide('Front')}
+                  className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Front' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                >
+                  Front
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveSide('Back')}
+                  className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Back' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                >
+                  Back
+                </button>
+              </div>
+              {sideCent?.sleeve_detected && (
+                <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 text-[10.5px] font-semibold">
+                  🛡️ Sleeve
+                </span>
+              )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-              {sideCent?.sleeve_detected && (
-                <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 font-semibold">
-                  🛡️ Sleeve Detected
-                </span>
+            <div className="flex flex-wrap items-center gap-1 text-[11px]">
+              {/* ZOOM CONTROLS */}
+              <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg px-1 py-0.5 gap-1">
+                <button type="button" onClick={() => setMainZoom((z) => { const nz = Math.max(1.0, Number((z - 0.25).toFixed(2))); if (nz <= 1.0) setMainPan({ x: 0, y: 0 }); return nz; })} className="px-1.5 font-bold text-slate-300 hover:text-white">−</button>
+                <span className="font-mono text-[10px] text-sky-300 w-10 text-center">{Math.round(mainZoom * 100)}%</span>
+                <button type="button" onClick={() => setMainZoom((z) => Math.min(4.0, Number((z + 0.25).toFixed(2))))} className="px-1.5 font-bold text-slate-300 hover:text-white">+</button>
+                {mainZoom > 1.0 && (
+                  <button type="button" onClick={() => { setMainZoom(1.0); setMainPan({ x: 0, y: 0 }); }} className="px-1.5 text-[10px] text-amber-300 hover:text-amber-200 font-bold">Reset</button>
+                )}
+              </div>
+
+              {editMode === 'none' ? (
+                <>
+                  <button type="button" onClick={startEditCentering} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-200 font-bold">
+                    📐 Edit Centering
+                  </button>
+                  <button type="button" onClick={startEditCorners} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-200 font-bold">
+                    📐 Edit Corners
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button type="button" disabled={savingGeom} onClick={saveGeometryEdit} className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold">
+                    {savingGeom ? '⏳ Saving...' : '💾 Save & Recalculate'}
+                  </button>
+                  <button type="button" disabled={savingGeom} onClick={() => setEditMode('none')} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold">
+                    Cancel
+                  </button>
+                </>
+              )}
+
+              {anyFilteredOrIsolated && (
+                <button type="button" onClick={showAllMarkers} className="px-2.5 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold shadow">
+                  👁️ Show All
+                </button>
               )}
               <button
                 type="button"
                 onClick={() => setShowArtifacts((s) => !s)}
-                className={`px-2 py-0.5 rounded-lg border font-semibold ${
+                className={`px-2 py-1 rounded-lg border font-semibold ${
                   showArtifacts ? 'bg-amber-950/80 border-amber-500 text-amber-200' : 'bg-slate-900 border-slate-700 text-slate-400'
                 }`}
               >
-                {showArtifacts ? '👁️ Holder Artifacts On' : `Holder Artifacts (${artifactsAll.length})`}
+                Artifacts ({artifactsAll.filter((a) => String(a.side || 'Front') === activeSide).length})
               </button>
-              {selectedItemId && (
-                <button type="button" onClick={() => setSelectedItemId('')} className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300">
-                  Clear Focus
-                </button>
-              )}
             </div>
           </div>
 
-          <div ref={canvasWrapRef} className="flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative">
+          {/* CARD CANVAS */}
+          <div
+            ref={canvasWrapRef}
+            onWheel={handleCanvasWheel}
+            onPointerDown={handleCanvasPointerDown}
+            onPointerMove={handleCanvasPointerMove}
+            onPointerUp={handleSvgPointerUp}
+            onPointerLeave={handleSvgPointerUp}
+            className={`flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative ${mainZoom > 1.0 && editMode === 'none' ? 'cursor-grab active:cursor-grabbing' : ''}`}
+          >
             {!activeImgUrl ? (
               <div className="text-xs text-slate-500">No {activeSide} scan image available.</div>
             ) : (
-              <div className="relative shrink-0" style={{ width: `${fittedBox.w}px`, height: `${fittedBox.h}px` }}>
+              <div
+                className="relative shrink-0"
+                style={{
+                  width: `${fittedBox.w}px`,
+                  height: `${fittedBox.h}px`,
+                  transform: `translate(${mainPan.x}px, ${mainPan.y}px) scale(${mainZoom})`,
+                  transformOrigin: 'center center',
+                }}
+              >
                 <img
                   src={activeImgUrl}
                   alt={`${activeSide} card`}
+                  draggable={false}
                   onLoad={(e) => {
                     const nw = e.currentTarget.naturalWidth;
                     const nh = e.currentTarget.naturalHeight;
@@ -2397,32 +2682,79 @@ function GradingDeepDiveStudio({
                   }}
                   className="w-full h-full block select-none rounded-lg"
                 />
-                <svg viewBox="0 0 1000 1000" preserveAspectRatio="none" className="absolute inset-0 w-full h-full">
-                  {/* CENTERING GUIDES */}
-                  {activeLayers.centering && sideCent && Array.isArray(sideCent.outer_card_rect) && Array.isArray(sideCent.inner_frame_rect) && (() => {
-                    const [ox, oy, ow, oh] = sideCent.outer_card_rect.map((v) => v * 1000);
-                    const [ix, iy, iw, ih] = sideCent.inner_frame_rect.map((v) => v * 1000);
+                <svg ref={svgRef} viewBox="0 0 1000 1000" preserveAspectRatio="none" className="absolute inset-0 w-full h-full">
+                  {/* CENTERING GUIDES (VIEW OR EDIT CENTERING MODE) */}
+                  {(activeLayers.centering || editMode === 'centering') && Array.isArray(activeOuterRect) && Array.isArray(activeInnerRect) && (() => {
+                    const [ox, oy, ow, oh] = activeOuterRect.map((v) => v * 1000);
+                    const [ix, iy, iw, ih] = activeInnerRect.map((v) => v * 1000);
+                    const isEditC = editMode === 'centering';
                     return (
                       <g>
-                        <rect x={ox} y={oy} width={ow} height={oh} fill="none" stroke="#22d3ee" strokeWidth="3" strokeDasharray="10 6" />
-                        <rect x={ix} y={iy} width={iw} height={ih} fill="none" stroke="#38bdf8" strokeWidth="2.5" />
-                        <line x1={ox} y1={oy + oh * 0.5} x2={ix} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="3" />
-                        <line x1={ix + iw} y1={oy + oh * 0.5} x2={ox + ow} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="3" />
-                        <line x1={ox + ow * 0.5} y1={oy} x2={ox + ow * 0.5} y2={iy} stroke="#22d3ee" strokeWidth="3" />
-                        <line x1={ox + ow * 0.5} y1={iy + ih} x2={ox + ow * 0.5} y2={oy + oh} stroke="#22d3ee" strokeWidth="3" />
-                        <rect x={ox + ow * 0.5 - 78} y={Math.max(4, oy + 6)} width="156" height="26" rx="6" fill="rgba(2,6,23,0.85)" stroke="#22d3ee" strokeWidth="1.5" />
-                        <text x={ox + ow * 0.5} y={Math.max(22, oy + 24)} textAnchor="middle" fill="#67e8f9" fontSize="15" fontWeight="bold" fontFamily="monospace">
-                          {`L/R ${sideCent.lr} • T/B ${sideCent.tb}`}
-                        </text>
+                        <rect x={ox} y={oy} width={ow} height={oh} fill="none" stroke="#22d3ee" strokeWidth={isEditC ? 3.5 : 2.5} strokeDasharray="10 6" />
+                        <rect x={ix} y={iy} width={iw} height={ih} fill="none" stroke="#38bdf8" strokeWidth={isEditC ? 3.5 : 2.5} />
+                        <line x1={ox} y1={oy + oh * 0.5} x2={ix} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="2.5" />
+                        <line x1={ix + iw} y1={oy + oh * 0.5} x2={ox + ow} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="2.5" />
+                        <line x1={ox + ow * 0.5} y1={oy} x2={ox + ow * 0.5} y2={iy} stroke="#22d3ee" strokeWidth="2.5" />
+                        <line x1={ox + ow * 0.5} y1={iy + ih} x2={ox + ow * 0.5} y2={oy + oh} stroke="#22d3ee" strokeWidth="2.5" />
+
+                        {isEditC && (
+                          <g>
+                            {/* 4 Draggable Outer Edges */}
+                            <line x1={ox} y1={oy} x2={ox} y2={oy + oh} stroke="transparent" strokeWidth="22" style={{ cursor: 'ew-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'outer', edge: 'left' }; }} />
+                            <line x1={ox + ow} y1={oy} x2={ox + ow} y2={oy + oh} stroke="transparent" strokeWidth="22" style={{ cursor: 'ew-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'outer', edge: 'right' }; }} />
+                            <line x1={ox} y1={oy} x2={ox + ow} y2={oy} stroke="transparent" strokeWidth="22" style={{ cursor: 'ns-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'outer', edge: 'top' }; }} />
+                            <line x1={ox} y1={oy + oh} x2={ox + ow} y2={oy + oh} stroke="transparent" strokeWidth="22" style={{ cursor: 'ns-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'outer', edge: 'bottom' }; }} />
+                            {/* 4 Draggable Inner Frame Edges */}
+                            <line x1={ix} y1={iy} x2={ix} y2={iy + ih} stroke="transparent" strokeWidth="22" style={{ cursor: 'ew-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'inner', edge: 'left' }; }} />
+                            <line x1={ix + iw} y1={iy} x2={ix + iw} y2={iy + ih} stroke="transparent" strokeWidth="22" style={{ cursor: 'ew-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'inner', edge: 'right' }; }} />
+                            <line x1={ix} y1={iy} x2={ix + iw} y2={iy} stroke="transparent" strokeWidth="22" style={{ cursor: 'ns-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'inner', edge: 'top' }; }} />
+                            <line x1={ix} y1={iy + ih} x2={ix + iw} y2={iy + ih} stroke="transparent" strokeWidth="22" style={{ cursor: 'ns-resize' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'inner', edge: 'bottom' }; }} />
+                            {/* Visual Drag Handles */}
+                            {[
+                              { cx: ox, cy: oy + oh * 0.5, c: '#22d3ee' },
+                              { cx: ox + ow, cy: oy + oh * 0.5, c: '#22d3ee' },
+                              { cx: ox + ow * 0.5, cy: oy, c: '#22d3ee' },
+                              { cx: ox + ow * 0.5, cy: oy + oh, c: '#22d3ee' },
+                              { cx: ix, cy: iy + ih * 0.5, c: '#facc15' },
+                              { cx: ix + iw, cy: iy + ih * 0.5, c: '#facc15' },
+                              { cx: ix + iw * 0.5, cy: iy, c: '#facc15' },
+                              { cx: ix + iw * 0.5, cy: iy + ih, c: '#facc15' },
+                            ].map((h, hi) => (
+                              <circle key={hi} cx={h.cx} cy={h.cy} r="9" fill={h.c} stroke="#020617" strokeWidth="2.5" style={{ pointerEvents: 'none' }} />
+                            ))}
+                          </g>
+                        )}
                       </g>
                     );
                   })()}
 
-                  {/* CONFIRMED DEFECT INDICATORS */}
-                  {sideDefects.map(renderSvgMarker)}
+                  {/* EDIT CORNERS MODE: 4 DRAGGABLE L-SHAPED CORNER BRACKETS */}
+                  {editMode === 'corners' && draftCorners && (() => {
+                    const arm = 48;
+                    const defs = [
+                      { k: 'tl', dx: arm, dy: arm, lbl: 'TL' },
+                      { k: 'tr', dx: -arm, dy: arm, lbl: 'TR' },
+                      { k: 'bl', dx: arm, dy: -arm, lbl: 'BL' },
+                      { k: 'br', dx: -arm, dy: -arm, lbl: 'BR' },
+                    ];
+                    return defs.map((cd) => {
+                      const pt = draftCorners[cd.k] || [0.5, 0.5];
+                      const px = pt[0] * 1000;
+                      const py = pt[1] * 1000;
+                      return (
+                        <g key={cd.k} style={{ cursor: 'move' }} onPointerDown={(e) => { e.stopPropagation(); geomDragRef.current = { kind: 'corner', edge: cd.k }; }}>
+                          <path d={`M ${px + cd.dx} ${py} L ${px} ${py} L ${px} ${py + cd.dy}`} fill="none" stroke="#facc15" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
+                          <circle cx={px} cy={py} r="14" fill="rgba(250,204,21,0.35)" stroke="#facc15" strokeWidth="2.5" />
+                        </g>
+                      );
+                    });
+                  })()}
 
-                  {/* SUPERFICIAL HOLDER ARTIFACTS (OPTIONAL AMBER DASHED) */}
-                  {sideArtifacts.map((a, ai) => {
+                  {/* CONFIRMED DEFECT INDICATORS (HIDDEN DURING GEOMETRY EDIT) */}
+                  {editMode === 'none' && visibleSideDefects.map(renderSvgMarker)}
+
+                  {/* SUPERFICIAL HOLDER ARTIFACTS */}
+                  {editMode === 'none' && sideArtifacts.map((a, ai) => {
                     const [ax, ay, aw, ah] = a.bbox_norm.map((v) => v * 1000);
                     return (
                       <rect
@@ -2444,6 +2776,20 @@ function GradingDeepDiveStudio({
                 </svg>
               </div>
             )}
+
+            {/* CRISP HTML CENTERING RATIO BADGE (NEVER CLIPPED IN PORTRAIT OR LANDSCAPE) */}
+            {(activeLayers.centering || editMode === 'centering') && sideCent && (
+              <div className="absolute top-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-xl bg-slate-950/90 border border-cyan-500/70 text-cyan-200 font-mono text-[11px] font-bold shadow pointer-events-none whitespace-nowrap">
+                {activeSide} Centering: L/R {liveCentStats.lr} • T/B {liveCentStats.tb}
+              </div>
+            )}
+
+            {editMode !== 'none' && (
+              <div className="absolute bottom-2 left-1/2 -translate-x-1/2 px-3 py-1 rounded-xl bg-slate-950/90 border border-amber-500/70 text-amber-200 text-[11px] font-semibold pointer-events-none whitespace-nowrap">
+                {editMode === 'centering' ? 'Drag cyan (outer) & yellow (inner) edge handles, then Save & Recalculate' : 'Drag TL / TR / BL / BR corner brackets onto card tips, then Save & Recalculate'}
+              </div>
+            )}
+
             {loadingDiag && (
               <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl bg-slate-950/90 border border-sky-700 text-sky-300 text-xs font-bold">
                 ⏳ Analyzing surface &amp; centering geometry...
@@ -2457,36 +2803,46 @@ function GradingDeepDiveStudio({
           </div>
         </div>
 
-        {/* RIGHT PANE: PSA/BGS CARDS + 4-BOX NOTES + 10x LOUPE STRIP */}
-        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2.5 min-h-0 overflow-y-auto`}>
-          {/* TOP: SIDE-BY-SIDE PSA & BECKETT SUMMARY CARDS WITH CLICKABLE SUBGRADE PILLS */}
+        {/* RIGHT PANE: PSA/BGS CARDS + CLICKABLE NOTES TOGGLES + COMPACT DEFECT GRID + ENLARGED LOUPE OVERLAY */}
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2.5 min-h-0 overflow-y-auto relative`}>
+          {/* TOP: AUTHENTIC PSA & BECKETT SUMMARY CARDS (NON-TOGGLE) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 shrink-0">
-            {renderGradeSummaryCard('Estimated PSA Grade', psaInfo, 'text-emerald-400')}
-            {renderGradeSummaryCard('Estimated Beckett (BGS) Grade', bgsInfo, 'text-sky-400')}
+            {renderPsaCard()}
+            {renderBgsCard()}
           </div>
 
-          {/* MIDDLE: STRUCTURED 4-BOX GRADING NOTES + HOLDER ADVISORIES */}
+          {/* MIDDLE: 4 CLICKABLE GRADING NOTES BOXES (CATEGORY TOGGLES) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 shrink-0 text-[11px]">
-            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
-              <div className="font-bold text-cyan-300 uppercase text-[10px] mb-0.5">📐 Centering</div>
-              <div className="text-slate-200">{notesByCat.centering}</div>
-            </div>
-            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
-              <div className="font-bold text-rose-300 uppercase text-[10px] mb-0.5">Corners</div>
-              <div className="text-slate-200">{notesByCat.corners}</div>
-            </div>
-            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
-              <div className="font-bold text-amber-300 uppercase text-[10px] mb-0.5">Edges</div>
-              <div className="text-slate-200">{notesByCat.edges}</div>
-            </div>
-            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
-              <div className="font-bold text-purple-300 uppercase text-[10px] mb-0.5">Surface</div>
-              <div className="text-slate-200">{notesByCat.surface}</div>
-            </div>
+            {noteBoxes.map((nb) => {
+              const isOn = Boolean(activeLayers[nb.key]);
+              return (
+                <button
+                  key={nb.key}
+                  type="button"
+                  onClick={() => {
+                    setIsolatedDefectId('');
+                    toggleLayer(nb.key);
+                  }}
+                  className={`text-left rounded-xl p-2.5 border transition ${
+                    isOn
+                      ? 'bg-slate-950/90 border-sky-500/70 ring-1 ring-sky-500/30'
+                      : 'bg-slate-950/40 border-slate-800/70 opacity-55 hover:opacity-85'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1 mb-0.5">
+                    <span className="font-bold text-slate-200 uppercase text-[10px]">{nb.icon} {nb.title}</span>
+                    <span className={`text-[9.5px] font-bold px-1.5 py-0.2 rounded ${isOn ? 'bg-sky-950 text-sky-300 border border-sky-700/60' : 'bg-slate-900 text-slate-500'}`}>
+                      {isOn ? '✓ Shown' : 'Hidden'}
+                    </span>
+                  </div>
+                  <div className="text-slate-300 leading-snug">{nb.text}</div>
+                </button>
+              );
+            })}
           </div>
 
           {Array.isArray(notesByCat.advisories) && notesByCat.advisories.length > 0 && (
-            <div className="bg-amber-950/40 border border-amber-700/60 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-200 shrink-0">
+            <div className="bg-amber-950/40 border border-amber-700/60 rounded-xl px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-200 shrink-0">
               <span>⚠️ {notesByCat.advisories.join(' • ')}</span>
               <button type="button" onClick={() => setShowArtifacts((s) => !s)} className="px-2 py-0.5 rounded-lg bg-amber-900/70 hover:bg-amber-800 text-[10px] font-bold">
                 {showArtifacts ? 'Hide Artifacts' : 'Show Ignored Artifacts'}
@@ -2494,90 +2850,139 @@ function GradingDeepDiveStudio({
             </div>
           )}
 
-          {/* BOTTOM: 10x ZOOM LOUPE STRIP (2x2 CORNER QUAD + DETECTED DEFECT LOUPES) */}
-          <div className="flex-1 min-h-[190px] bg-slate-950/85 border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2">
-            <div className="flex items-center justify-between text-[11px] shrink-0">
-              <span className="font-bold text-white uppercase tracking-wider">🔍 10x Zoom Loupes ({activeSide} Corners &amp; Detected Defects)</span>
-              <span className="text-slate-400">Click any crop to pinpoint on card</span>
+          {/* BOTTOM: COMPACT ACTIVE-SIDE DEFECT GRID (NO CLEAN CORNERS, ACTIVE-FIRST SORTING + GRAYING) */}
+          <div className="flex-1 min-h-[180px] bg-slate-950/85 border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
+              <span className="font-bold text-white uppercase tracking-wider">
+                🔍 {activeSide} Detected Issues ({activeSideDefectsAll.length})
+              </span>
+              <div className="flex items-center gap-2">
+                {anyFilteredOrIsolated && (
+                  <button type="button" onClick={showAllMarkers} className="px-2 py-0.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-[10px] font-bold">
+                    👁️ Show All
+                  </button>
+                )}
+                <span className="text-slate-400">Click any tile to isolate &amp; inspect</span>
+              </div>
             </div>
 
-            <div className="flex-1 min-h-0 flex flex-col sm:flex-row gap-2.5 overflow-x-auto">
-              {/* 2x2 CORNER LOUPE QUAD */}
-              <div className="grid grid-cols-2 gap-1.5 shrink-0 w-[196px]">
-                {cornerLoupes.map((cl) => {
-                  const cornerDef = confirmedAll.find((d) => d.side === activeSide && d.category === 'corners' && String(d.zone || '').toLowerCase() === cl.key.toLowerCase());
-                  const cropUrl = buildCropUrl(activeSide, [cl.x, cl.y, cl.w, cl.h], 0.015, 160);
+            {activeSideDefectsAll.length === 0 ? (
+              <div className="flex-1 flex items-center justify-center rounded-xl border border-dashed border-slate-800 text-xs text-emerald-300/90 px-4">
+                ✨ Clean {activeSide} — no permanent corner, edge, or surface defects detected.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 overflow-y-auto pr-1">
+                {activeSideDefectsAll.map((d, di) => {
+                  const isCatActive = Boolean(activeLayers[String(d.category || 'surface')]);
+                  const isIso = isolatedDefectId === d.id;
+                  const cropUrl = buildCropUrl(activeSide, d.bbox_norm || [0.35, 0.35, 0.2, 0.2], 0.04, 200);
                   return (
                     <button
-                      key={cl.key}
+                      key={d.id || di}
                       type="button"
                       onClick={() => {
-                        setActiveLayers((p) => ({ ...p, corners: true }));
-                        if (cornerDef) setSelectedItemId(cornerDef.id);
+                        setLoupeZoom(1.0);
+                        setIsolatedDefectId(d.id);
                       }}
-                      className={`relative rounded-xl overflow-hidden border ${cornerDef ? 'border-rose-500' : 'border-slate-700'} bg-slate-900 aspect-square group`}
-                      title={`${activeSide} ${cl.key} Corner`}
+                      className={`rounded-xl border overflow-hidden flex flex-col text-left transition ${
+                        isIso
+                          ? 'border-amber-400 ring-2 ring-amber-400/60 bg-slate-900'
+                          : isCatActive
+                          ? 'border-rose-600/70 bg-slate-900 hover:border-rose-400'
+                          : 'border-slate-800 bg-slate-900/60 opacity-35 grayscale hover:opacity-70'
+                      }`}
                     >
-                      {cropUrl && <img src={cropUrl} alt={cl.key} className="w-full h-full object-cover" />}
-                      {cornerDef && (
+                      <div className="relative w-full aspect-[4/3] bg-slate-950">
+                        {cropUrl && <img src={cropUrl} alt={d.label || d.type} className="w-full h-full object-cover" />}
                         <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
-                          <circle cx="50" cy="50" r="34" fill="none" stroke="#ef4444" strokeWidth="4" />
+                          {d.marker_style === 'box' ? (
+                            <rect x="22" y="22" width="56" height="56" rx="6" fill="none" stroke="#ef4444" strokeWidth="4" />
+                          ) : d.marker_style === 'arrow' ? (
+                            <g>
+                              <circle cx="50" cy="50" r="24" fill="none" stroke="#ef4444" strokeWidth="4" />
+                              <line x1="80" y1="80" x2="52" y2="52" stroke="#ef4444" strokeWidth="4" />
+                            </g>
+                          ) : (
+                            <circle cx="50" cy="50" r="28" fill="none" stroke="#ef4444" strokeWidth="4" />
+                          )}
                         </svg>
-                      )}
-                      <span className="absolute bottom-0.5 left-0.5 px-1 py-0.2 rounded bg-slate-950/85 text-[9px] font-mono font-bold text-slate-200">{cl.label}</span>
+                        <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/85 text-[9px] font-bold uppercase text-slate-200">{d.category || 'surface'}</span>
+                        <span className="absolute top-1 right-1 px-1.5 py-0.5 rounded bg-rose-950/90 text-[9px] font-mono font-bold text-rose-200">-{Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)}</span>
+                      </div>
+                      <div className="p-1.5 text-[10.5px] font-semibold text-slate-200 leading-tight line-clamp-2">
+                        {d.label || d.type}
+                      </div>
                     </button>
                   );
                 })}
               </div>
+            )}
+          </div>
 
-              {/* DETECTED DEFECT 10x LOUPES */}
-              <div className="flex-1 min-w-0 flex items-stretch gap-2 overflow-x-auto pb-1">
-                {confirmedAll.length === 0 ? (
-                  <div className="flex-1 flex items-center justify-center rounded-xl border border-dashed border-slate-800 text-xs text-slate-400 px-4">
-                    ✨ No permanent defects detected on Front or Back.
+          {/* RIGHT-SIDE ENLARGED LOUPE POPUP OVERLAY (LEFT MAIN CARD REMAINS VISIBLE) */}
+          {isolatedDefect && (
+            <div className="absolute inset-2 z-20 bg-slate-950/95 backdrop-blur-md border-2 border-amber-400/80 rounded-2xl p-4 flex flex-col gap-3 shadow-2xl">
+              <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-2 shrink-0">
+                <div className="min-w-0">
+                  <div className="text-[10px] font-mono uppercase text-amber-300">🔍 Enlarged Defect Loupe — {isolatedDefect.side}</div>
+                  <div className="text-sm font-extrabold text-white truncate">{isolatedDefect.label || isolatedDefect.type}</div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-0.5 text-xs gap-1">
+                    <button type="button" onClick={() => setLoupeZoom((z) => Math.max(1.0, Number((z - 0.5).toFixed(1))))} className="px-1 font-bold text-slate-300 hover:text-white">−</button>
+                    <span className="font-mono text-[11px] text-sky-300 w-10 text-center">{Math.round(loupeZoom * 100)}%</span>
+                    <button type="button" onClick={() => setLoupeZoom((z) => Math.min(4.0, Number((z + 0.5).toFixed(1))))} className="px-1 font-bold text-slate-300 hover:text-white">+</button>
                   </div>
-                ) : (
-                  confirmedAll.map((d, di) => {
-                    const cropUrl = buildCropUrl(d.side || 'Front', d.bbox_norm || [0.35, 0.35, 0.2, 0.2], 0.04, 180);
-                    const isSel = selectedItemId === d.id;
-                    return (
-                      <button
-                        key={d.id || di}
-                        type="button"
-                        onClick={() => {
-                          setActiveSide(d.side === 'Back' ? 'Back' : 'Front');
-                          setActiveLayers((p) => ({ ...p, [d.category || 'surface']: true }));
-                          setSelectedItemId(d.id);
-                        }}
-                        className={`w-[132px] shrink-0 rounded-xl border ${isSel ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-rose-600/70'} bg-slate-900 overflow-hidden flex flex-col text-left`}
-                      >
-                        <div className="relative w-full h-[104px] bg-slate-950">
-                          {cropUrl && <img src={cropUrl} alt={d.label || d.type} className="w-full h-full object-cover" />}
-                          <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
-                            {d.marker_style === 'box' ? (
-                              <rect x="22" y="22" width="56" height="56" rx="6" fill="none" stroke="#ef4444" strokeWidth="4" />
-                            ) : d.marker_style === 'arrow' ? (
-                              <g>
-                                <circle cx="50" cy="50" r="24" fill="none" stroke="#ef4444" strokeWidth="4" />
-                                <line x1="80" y1="80" x2="52" y2="52" stroke="#ef4444" strokeWidth="4" />
-                              </g>
-                            ) : (
-                              <circle cx="50" cy="50" r="28" fill="none" stroke="#ef4444" strokeWidth="4" />
-                            )}
-                          </svg>
-                          <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/85 text-[9px] font-bold text-rose-200">{d.side}</span>
-                          <span className="absolute top-1 right-1 px-1.5 py-0.5 rounded bg-rose-950/90 text-[9px] font-mono font-bold text-rose-200">-{Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)}</span>
-                        </div>
-                        <div className="p-1.5 text-[10px] font-semibold text-slate-200 truncate" title={d.label || d.type}>
-                          {d.label || d.type}
-                        </div>
-                      </button>
-                    );
-                  })
-                )}
+                  <button type="button" onClick={() => setIsolatedDefectId('')} className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-200">✕ Close</button>
+                </div>
+              </div>
+
+              <div className="flex-1 min-h-0 flex items-center justify-center bg-black/70 border border-slate-800 rounded-xl overflow-hidden relative">
+                <div className="relative w-64 h-64 overflow-hidden rounded-xl" style={{ transform: `scale(${loupeZoom})`, transformOrigin: 'center center' }}>
+                  <img
+                    src={buildCropUrl(isolatedDefect.side || activeSide, isolatedDefect.bbox_norm || [0.35, 0.35, 0.2, 0.2], 0.04, 384)}
+                    alt={isolatedDefect.label || isolatedDefect.type}
+                    className="w-full h-full object-cover"
+                  />
+                  <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
+                    {isolatedDefect.marker_style === 'box' ? (
+                      <rect x="22" y="22" width="56" height="56" rx="6" fill="none" stroke="#ef4444" strokeWidth="3.5" />
+                    ) : isolatedDefect.marker_style === 'arrow' ? (
+                      <g>
+                        <circle cx="50" cy="50" r="22" fill="none" stroke="#ef4444" strokeWidth="3.5" />
+                        <line x1="80" y1="80" x2="52" y2="52" stroke="#ef4444" strokeWidth="3.5" />
+                      </g>
+                    ) : (
+                      <circle cx="50" cy="50" r="26" fill="none" stroke="#ef4444" strokeWidth="3.5" />
+                    )}
+                  </svg>
+                </div>
+              </div>
+
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs space-y-1.5 shrink-0">
+                <div className="font-bold text-white">{isolatedDefect.label || isolatedDefect.type}</div>
+                <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-300 font-mono">
+                  <span>Category: <strong className="text-sky-300 uppercase">{isolatedDefect.category || 'surface'}</strong></span>
+                  <span>Side: <strong className="text-white">{isolatedDefect.side}</strong></span>
+                  <span>Confidence: <strong className="text-emerald-300">{Math.round(Number(isolatedDefect.confidence || 0.8) * 100)}%</strong></span>
+                  <span>Penalty: <strong className="text-rose-400">-{Number(isolatedDefect.penalty ?? isolatedDefect.severity ?? 0.5).toFixed(1)}</strong></span>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 shrink-0">
+                <button type="button" onClick={showAllMarkers} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-sky-300">
+                  👁️ Show All Markers
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setFlagPresetId(isolatedDefect.id); setShowFlagModal(true); }}
+                  className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow"
+                >
+                  🚩 Flag / Report Error
+                </button>
               </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
 
@@ -2588,12 +2993,13 @@ function GradingDeepDiveStudio({
           batchName={effectiveBatch}
           diagnostics={diagnostics}
           initialSide={activeSide}
-          initialTargetItemId={selectedItemId}
+          initialTargetItemId={flagPresetId || isolatedDefectId}
           skin={skin}
           onClose={() => setShowFlagModal(false)}
           onSubmitted={(res) => {
             if (res.diagnostics) setDiagnostics(res.diagnostics);
             if (onCardUpdated) onCardUpdated(res);
+            setIsolatedDefectId('');
             const gb = res.gradesBefore || {};
             const ga = res.gradesAfter || {};
             if (pushNotification) {

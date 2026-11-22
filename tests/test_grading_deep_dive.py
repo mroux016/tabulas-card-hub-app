@@ -217,6 +217,53 @@ class TestGradingDeepDive(unittest.TestCase):
         self.assertEqual(float(sc_res["card"]["Sub_Surface"]), 9.5)
         self.assertIn(scratch["id"], sc_res["diagnostics"]["overrides"]["dismissed_defect_ids"])
 
+        # 6. Manual Geometry Update (outer_card_rect, inner_frame_rect, and 4 corners)
+        geom_res = self.vg.update_card_grading_geometry(
+            target_type="inventory",
+            sku=self.sku,
+            payload={
+                "side": "Front",
+                "outer_card_rect": [0.05, 0.04, 0.90, 0.92],
+                "inner_frame_rect": [0.12, 0.09, 0.76, 0.82],
+                "corners": {"tl": [0.05, 0.04], "tr": [0.95, 0.04], "bl": [0.05, 0.96], "br": [0.95, 0.96]},
+            },
+        )
+        self.assertTrue(geom_res["success"])
+        f_cent = geom_res["diagnostics"]["centering"]["front"]
+        for a, b in zip(f_cent["outer_card_rect"], [0.05, 0.04, 0.90, 0.92]):
+            self.assertAlmostEqual(a, b, places=2)
+        for a, b in zip(f_cent["inner_frame_rect"], [0.12, 0.09, 0.76, 0.82]):
+            self.assertAlmostEqual(a, b, places=2)
+        self.assertEqual(f_cent["corners"]["tl"], [0.05, 0.04])
+
+    def test_center_out_edge_detection_portrait_landscape_and_mini(self):
+        # Test portrait & landscape cards with a bright outer penny-sleeve rim (20px outside card_box)
+        for w, h, label in [(800, 1120, "portrait"), (1120, 800, "landscape")]:
+            img = Image.new("RGB", (w, h), (18, 22, 28))
+            d = ImageDraw.Draw(img)
+            # Outer bright penny-sleeve rim
+            d.rectangle([16, 16, w - 16, h - 16], outline=(245, 245, 248), width=3)
+            # True physical card stock
+            cx1, cy1, cx2, cy2 = 55, 55, w - 55, h - 55
+            d.rectangle([cx1, cy1, cx2, cy2], fill=(228, 230, 234))
+            d.rectangle([cx1 + 45, cy1 + 45, cx2 - 45, cy2 - 45], fill=(48, 92, 145))
+            box = self.vg.detect_physical_card_box(img)
+            # Must stay near true card stock [55..w-55], NOT snap outward to sleeve rim [16..w-16]
+            self.assertGreaterEqual(box[0], 35, f"{label} left snapped to sleeve: {box}")
+            self.assertLessEqual(box[2], w - 35, f"{label} right snapped to sleeve: {box}")
+            self.assertGreaterEqual(box[1], 35, f"{label} top snapped to sleeve: {box}")
+            self.assertLessEqual(box[3], h - 35, f"{label} bottom snapped to sleeve: {box}")
+
+        # Non-standard mini card (~0.55 aspect) must not be clipped to 2.5:3.5
+        mw, mh = 600, 1080
+        mini = Image.new("RGB", (mw, mh), (18, 22, 28))
+        dm = ImageDraw.Draw(mini)
+        dm.rectangle([60, 40, mw - 60, mh - 40], fill=(230, 230, 232))
+        dm.rectangle([90, 80, mw - 90, mh - 80], fill=(70, 110, 85))
+        mbox = self.vg.detect_physical_card_box(mini)
+        m_ar = (mbox[2] - mbox[0]) / max(1.0, float(mbox[3] - mbox[1]))
+        self.assertLess(m_ar, 0.62, f"Mini card aspect clipped to standard: {mbox} (ar={m_ar:.3f})")
+
 
 if __name__ == "__main__":
     unittest.main()

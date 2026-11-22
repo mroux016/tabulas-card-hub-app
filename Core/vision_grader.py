@@ -421,37 +421,173 @@ def expand_flatbed_pdfs_in_batch_folder(
 # 2. PHYSICAL CARD BOUNDARY DETECTOR & 8-CORNER INSPECTION SHEET BUILDER
 # ==============================================================================
 def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
+    """
+    Orientation-agnostic center-out / aspect-ratio-targeted card outer boundary detector:
+      1. Detects orientation independently per side from scan dimensions & printed ink bounds.
+      2. Locates printed ink/artwork centroid & rough inner bounds (ignoring outer sleeve margins).
+      3. Projects outward using standard 2.5"x3.5" aspect (0.7143 portrait / 1.400 landscape)
+         within a +/-14% search band and picks the innermost strong card-stock edge.
+      4. Enforces +/-3% aspect-ratio consistency to reject penny-sleeve overhangs, while
+         gracefully relaxing for non-standard formats (mini ~0.55, square, tallboy).
+    """
     w, h = img.size
-    arr = np.array(img)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    if w < 60 or h < 60:
+        return (0, 0, w, h)
 
+    arr = np.array(img.convert("RGB"))
     scale = 800.0 / max(w, h)
-    sw, sh = max(80, int(w * scale)), max(80, int(h * scale))
-    s_gray = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    sw, sh = max(80, int(round(w * scale))), max(80, int(round(h * scale)))
+    small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
 
-    blur = cv2.GaussianBlur(s_gray, (5, 5), 0)
+    lab = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    # Outer scanner/sleeve background reference from 3% border strips
+    b_px = max(3, int(min(sw, sh) * 0.03))
+    bg_samples = np.concatenate([
+        lab[:b_px, :, :].reshape(-1, 3),
+        lab[-b_px:, :, :].reshape(-1, 3),
+        lab[:, :b_px, :].reshape(-1, 3),
+        lab[:, -b_px:, :].reshape(-1, 3),
+    ], axis=0)
+    bg_lab = np.median(bg_samples, axis=0)
+    lab_dist = np.linalg.norm(lab - bg_lab[None, None, :], axis=2)
+
+    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+    grad_mag = np.maximum(gx, gy)
+
+    # Printed ink/artwork mask restricted to central 90% so outer sleeve rim is ignored
+    ink_mask = ((hsv[:, :, 1] > 26) | (grad_mag > 22.0) | (lab_dist > 22.0))
+    m_pad_x = max(4, int(sw * 0.05))
+    m_pad_y = max(4, int(sh * 0.05))
+    ink_mask[:m_pad_y, :] = False
+    ink_mask[-m_pad_y:, :] = False
+    ink_mask[:, :m_pad_x] = False
+    ink_mask[:, -m_pad_x:] = False
+
+    ys_ink, xs_ink = np.where(ink_mask)
+    if xs_ink.size >= 120 and ys_ink.size >= 120:
+        ax1 = int(np.percentile(xs_ink, 2))
+        ax2 = int(np.percentile(xs_ink, 98))
+        ay1 = int(np.percentile(ys_ink, 2))
+        ay2 = int(np.percentile(ys_ink, 98))
+        art_w = max(20, ax2 - ax1)
+        art_h = max(20, ay2 - ay1)
+        art_ar = art_w / float(art_h)
+
+        is_landscape = (sw > sh * 1.05) or (art_ar > 1.15)
+        target_ar = 1.400 if is_landscape else (2.5 / 3.5)
+        enforce_std_ar = (1.18 <= art_ar <= 1.62) if is_landscape else (0.60 <= art_ar <= 0.84)
+
+        mid_y1, mid_y2 = max(0, int(ay1 + art_h * 0.2)), min(sh, int(ay2 - art_h * 0.2))
+        mid_x1, mid_x2 = max(0, int(ax1 + art_w * 0.2)), min(sw, int(ax2 - art_w * 0.2))
+        if mid_y2 <= mid_y1 + 8:
+            mid_y1, mid_y2 = int(sh * 0.25), int(sh * 0.75)
+        if mid_x2 <= mid_x1 + 8:
+            mid_x1, mid_x2 = int(sw * 0.25), int(sw * 0.75)
+
+        prof_x = np.mean(gx[mid_y1:mid_y2, :], axis=0)
+        prof_y = np.mean(gy[:, mid_x1:mid_x2], axis=1)
+
+        def _innermost_edge(prof: np.ndarray, start: int, end: int, step: int) -> Optional[int]:
+            """Scans outward from `start` toward `end` and picks the innermost strong card-stock edge."""
+            if step > 0:
+                lo, hi = max(0, start), min(len(prof) - 1, end)
+                if hi <= lo + 2:
+                    return None
+                seg = prof[lo:hi + 1]
+                pk = float(np.max(seg))
+                if pk < 8.0:
+                    return None
+                thr = max(10.0, pk * 0.42)
+                for off in range(len(seg)):
+                    if seg[off] >= thr:
+                        # Step to local peak within +/-3 px
+                        p_hi = min(len(seg), off + 4)
+                        return lo + off + int(np.argmax(seg[off:p_hi]))
+            else:
+                lo, hi = max(0, end), min(len(prof) - 1, start)
+                if hi <= lo + 2:
+                    return None
+                seg = prof[lo:hi + 1]
+                pk = float(np.max(seg))
+                if pk < 8.0:
+                    return None
+                thr = max(10.0, pk * 0.42)
+                for off in range(len(seg) - 1, -1, -1):
+                    if seg[off] >= thr:
+                        p_lo = max(0, off - 3)
+                        return lo + p_lo + int(np.argmax(seg[p_lo:off + 1]))
+            return None
+
+        # Scan outward from rough artwork bounds (innermost card-stock edge before outer sleeve)
+        cand_l = _innermost_edge(prof_x, ax1, max(0, ax1 - int(sw * 0.18)), -1)
+        cand_r = _innermost_edge(prof_x, ax2, min(sw - 1, ax2 + int(sw * 0.18)), 1)
+        cand_t = _innermost_edge(prof_y, ay1, max(0, ay1 - int(sh * 0.18)), -1)
+        cand_b = _innermost_edge(prof_y, ay2, min(sh - 1, ay2 + int(sh * 0.18)), 1)
+
+        # If artwork already sits near outer border (borderless card), scan inward from 0..ax1+6
+        x1 = cand_l if cand_l is not None else max(0, ax1 - int(art_w * 0.05))
+        x2 = cand_r if cand_r is not None else min(sw, ax2 + int(art_w * 0.05))
+        y1 = cand_t if cand_t is not None else max(0, ay1 - int(art_h * 0.05))
+        y2 = cand_b if cand_b is not None else min(sh, ay2 + int(art_h * 0.05))
+
+        cw_c = max(20, x2 - x1)
+        ch_c = max(20, y2 - y1)
+        if enforce_std_ar:
+            cand_ar = cw_c / float(ch_c)
+            if abs(cand_ar - target_ar) / target_ar > 0.03:
+                if cand_ar < target_ar:
+                    # Too tall (e.g. sleeve top/bottom overhang) -> trim overhanging top/bottom
+                    exp_h = int(round(cw_c / target_ar))
+                    excess = ch_c - exp_h
+                    if excess > 2:
+                        top_gap = max(0, ay1 - y1)
+                        bot_gap = max(0, y2 - ay2)
+                        tot_g = max(1, top_gap + bot_gap)
+                        y1 += int(round(excess * (top_gap / float(tot_g))))
+                        y2 = min(sh, y1 + exp_h)
+                else:
+                    # Too wide (e.g. sleeve side overhang) -> trim overhanging left/right
+                    exp_w = int(round(ch_c * target_ar))
+                    excess = cw_c - exp_w
+                    if excess > 2:
+                        l_gap = max(0, ax1 - x1)
+                        r_gap = max(0, x2 - ax2)
+                        tot_g = max(1, l_gap + r_gap)
+                        x1 += int(round(excess * (l_gap / float(tot_g))))
+                        x2 = min(sw, x1 + exp_w)
+
+        if (x2 - x1) * (y2 - y1) >= 0.28 * sw * sh:
+            return (
+                max(0, int(round(x1 / scale))),
+                max(0, int(round(y1 / scale))),
+                min(w, int(round(x2 / scale))),
+                min(h, int(round(y2 / scale))),
+            )
+
+    # Fallback contour detector
+    blur = cv2.GaussianBlur(gray.astype(np.uint8), (5, 5), 0)
     edges = cv2.Canny(blur, 25, 95)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     dil = cv2.dilate(edges, kernel, iterations=2)
-
     cnts, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best_box = (int(w * 0.04), int(h * 0.03), int(w * 0.96), int(h * 0.97))
     best_area = 0.0
     total_s_area = float(sw * sh)
-
     for c in cnts:
         x, y, cw, ch = cv2.boundingRect(c)
         a = float(cw * ch)
-        if 0.35 * total_s_area <= a <= 0.98 * total_s_area:
-            if a > best_area:
-                best_area = a
-                best_box = (
-                    max(0, int(x / scale)),
-                    max(0, int(y / scale)),
-                    min(w, int((x + cw) / scale)),
-                    min(h, int((y + ch) / scale)),
-                )
-
+        if 0.35 * total_s_area <= a <= 0.98 * total_s_area and a > best_area:
+            best_area = a
+            best_box = (
+                max(0, int(x / scale)),
+                max(0, int(y / scale)),
+                min(w, int((x + cw) / scale)),
+                min(h, int((y + ch) / scale)),
+            )
     return best_box
 
 
@@ -4394,49 +4530,89 @@ def _measure_side_centering(
     card_box: tuple[int, int, int, int],
     sleeve_inset_pct: float = 0.0,
     has_holder_margin: bool = False,
+    manual_outer_rect: Optional[list[float]] = None,
+    manual_inner_rect: Optional[list[float]] = None,
+    manual_corners: Optional[dict] = None,
 ) -> dict:
     """
     Measures outer card boundary & inner design frame centering on a single side,
-    returning normalized `[0..1]` geometry and L/R + T/B percentages.
+    returning normalized `[0..1]` geometry, corners, orientation, and L/R + T/B percentages.
     """
     iw, ih = img.size
     iw = max(40, int(iw))
     ih = max(40, int(ih))
-    x1, y1, x2, y2 = [int(v) for v in card_box]
-    x1 = max(0, min(iw - 40, x1))
-    y1 = max(0, min(ih - 40, y1))
-    x2 = max(x1 + 40, min(iw, x2))
-    y2 = max(y1 + 40, min(ih, y2))
 
-    inset_f = max(0.0, min(0.12, float(sleeve_inset_pct or 0.0)))
-    if inset_f > 0.0:
-        cw_raw = x2 - x1
-        ch_raw = y2 - y1
-        dx = int(round(cw_raw * inset_f))
-        dy = int(round(ch_raw * inset_f))
-        if cw_raw - 2 * dx >= 40 and ch_raw - 2 * dy >= 40:
-            x1 += dx
-            x2 -= dx
-            y1 += dy
-            y2 -= dy
+    if isinstance(manual_outer_rect, list) and len(manual_outer_rect) == 4:
+        ox, oy, ow, oh = [float(v) for v in manual_outer_rect]
+        x1 = max(0, min(iw - 40, int(round(ox * iw))))
+        y1 = max(0, min(ih - 40, int(round(oy * ih))))
+        x2 = max(x1 + 40, min(iw, int(round((ox + ow) * iw))))
+        y2 = max(y1 + 40, min(ih, int(round((oy + oh) * ih))))
+    else:
+        x1, y1, x2, y2 = [int(v) for v in card_box]
+        x1 = max(0, min(iw - 40, x1))
+        y1 = max(0, min(ih - 40, y1))
+        x2 = max(x1 + 40, min(iw, x2))
+        y2 = max(y1 + 40, min(ih, y2))
 
-    card_crop = img.crop((x1, y1, x2, y2))
-    cw, ch = card_crop.size
-    arr = np.array(card_crop)
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        inset_f = max(0.0, min(0.12, float(sleeve_inset_pct or 0.0)))
+        if inset_f > 0.0:
+            cw_raw = x2 - x1
+            ch_raw = y2 - y1
+            dx = int(round(cw_raw * inset_f))
+            dy = int(round(ch_raw * inset_f))
+            if cw_raw - 2 * dx >= 40 and ch_raw - 2 * dy >= 40:
+                x1 += dx
+                x2 -= dx
+                y1 += dy
+                y2 -= dy
 
-    mid_y1, mid_y2 = int(ch * 0.25), int(ch * 0.75)
-    mid_x1, mid_x2 = int(cw * 0.25), int(cw * 0.75)
+    cw = max(40, x2 - x1)
+    ch = max(40, y2 - y1)
 
-    grad_x = np.abs(cv2.Sobel(gray[mid_y1:mid_y2, :], cv2.CV_32F, 1, 0, ksize=3)).mean(axis=0)
-    grad_y = np.abs(cv2.Sobel(gray[:, mid_x1:mid_x2], cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
+    if isinstance(manual_inner_rect, list) and len(manual_inner_rect) == 4:
+        ix, iy, inw, inh = [float(v) for v in manual_inner_rect]
+        in_x1 = max(x1 + 2, min(x2 - 12, int(round(ix * iw))))
+        in_y1 = max(y1 + 2, min(y2 - 12, int(round(iy * ih))))
+        in_x2 = max(in_x1 + 10, min(x2 - 2, int(round((ix + inw) * iw))))
+        in_y2 = max(in_y1 + 10, min(y2 - 2, int(round((iy + inh) * ih))))
+        l_idx = max(1, in_x1 - x1)
+        r_idx = max(1, x2 - in_x2)
+        t_idx = max(1, in_y1 - y1)
+        b_idx = max(1, y2 - in_y2)
+    else:
+        card_crop = img.crop((x1, y1, x2, y2))
+        arr = np.array(card_crop)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-    left_span = max(4, int(cw * 0.14))
-    top_span = max(4, int(ch * 0.14))
-    l_idx = int(np.argmax(grad_x[3:left_span])) + 3 if left_span > 4 else int(cw * 0.05)
-    r_idx = int(np.argmax(grad_x[::-1][3:left_span])) + 3 if left_span > 4 else int(cw * 0.05)
-    t_idx = int(np.argmax(grad_y[3:top_span])) + 3 if top_span > 4 else int(ch * 0.05)
-    b_idx = int(np.argmax(grad_y[::-1][3:top_span])) + 3 if top_span > 4 else int(ch * 0.05)
+        mid_y1, mid_y2 = int(ch * 0.25), int(ch * 0.75)
+        mid_x1, mid_x2 = int(cw * 0.25), int(cw * 0.75)
+
+        grad_x = np.abs(cv2.Sobel(gray[mid_y1:mid_y2, :], cv2.CV_32F, 1, 0, ksize=3)).mean(axis=0)
+        grad_y = np.abs(cv2.Sobel(gray[:, mid_x1:mid_x2], cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
+
+        left_span = max(4, int(cw * 0.18))
+        top_span = max(4, int(ch * 0.18))
+
+        def _outermost_frame_edge(prof_seg: np.ndarray, default_val: int) -> int:
+            if prof_seg.size <= 2:
+                return default_val
+            pk = float(np.max(prof_seg))
+            thr = max(10.0, pk * 0.40)
+            for idx_p in range(len(prof_seg)):
+                if prof_seg[idx_p] >= thr:
+                    win_hi = min(len(prof_seg), idx_p + 4)
+                    return 3 + idx_p + int(np.argmax(prof_seg[idx_p:win_hi]))
+            return 3 + int(np.argmax(prof_seg))
+
+        l_idx = _outermost_frame_edge(grad_x[3:left_span], int(cw * 0.05))
+        r_idx = _outermost_frame_edge(grad_x[::-1][3:left_span], int(cw * 0.05))
+        t_idx = _outermost_frame_edge(grad_y[3:top_span], int(ch * 0.05))
+        b_idx = _outermost_frame_edge(grad_y[::-1][3:top_span], int(ch * 0.05))
+        in_x1 = x1 + l_idx
+        in_y1 = y1 + t_idx
+        in_x2 = max(in_x1 + 10, x2 - r_idx)
+        in_y2 = max(in_y1 + 10, y2 - b_idx)
 
     lr_tot = max(1, l_idx + r_idx)
     tb_tot = max(1, t_idx + b_idx)
@@ -4467,21 +4643,32 @@ def _measure_side_centering(
         round((x2 - x1) / float(iw), 4),
         round((y2 - y1) / float(ih), 4),
     ]
-    in_x1 = x1 + l_idx
-    in_y1 = y1 + t_idx
-    in_x2 = max(in_x1 + 10, x2 - r_idx)
-    in_y2 = max(in_y1 + 10, y2 - b_idx)
     inner_rect = [
         round(in_x1 / float(iw), 4),
         round(in_y1 / float(ih), 4),
         round((in_x2 - in_x1) / float(iw), 4),
         round((in_y2 - in_y1) / float(ih), 4),
     ]
+    ox, oy, ow, oh = outer_rect
+    default_corners = {
+        "tl": [ox, oy],
+        "tr": [round(ox + ow, 4), oy],
+        "bl": [ox, round(oy + oh, 4)],
+        "br": [round(ox + ow, 4), round(oy + oh, 4)],
+    }
+    if isinstance(manual_corners, dict):
+        for ck in ("tl", "tr", "bl", "br"):
+            pt = manual_corners.get(ck)
+            if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                default_corners[ck] = [round(float(np.clip(float(pt[0]), 0.0, 1.0)), 4), round(float(np.clip(float(pt[1]), 0.0, 1.0)), 4)]
+
     sleeve_det = bool(has_holder_margin or x1 >= 8 or y1 >= 8 or (iw - x2) >= 8 or (ih - y2) >= 8)
 
     return {
         "outer_card_rect": outer_rect,
         "inner_frame_rect": inner_rect,
+        "corners": default_corners,
+        "orientation": "landscape" if iw > ih else "portrait",
         "lr_left": lr_l,
         "lr_right": lr_r,
         "lr": f"{lr_l}/{lr_r}",
@@ -4541,6 +4728,7 @@ def _default_grading_overrides() -> dict:
         "sleeve_inset_pct": 0.0,
         "light_border_mode": False,
         "subgrade_overrides": {},
+        "manual_geometry": {},
     }
 
 
@@ -4563,6 +4751,7 @@ def recompute_grades_from_diagnostics(
     ov["sleeve_inset_pct"] = round(float(ov.get("sleeve_inset_pct") or 0.0), 4)
     ov["light_border_mode"] = bool(ov.get("light_border_mode", False))
     ov["subgrade_overrides"] = dict(ov.get("subgrade_overrides") or {})
+    ov["manual_geometry"] = dict(ov.get("manual_geometry") or {})
     out_diag["overrides"] = ov
 
     dismissed_set = set(ov["dismissed_defect_ids"])
@@ -4722,15 +4911,29 @@ def estimate_card_pregrade(
     back_file: str = "",
     source_images_meta: Optional[dict] = None,
 ) -> dict | tuple[dict, dict]:
-    if front_box is None:
-        front_box = detect_physical_card_box(front_img)
-    if back_box is None:
-        back_box = detect_physical_card_box(back_img)
-
     ov = _default_grading_overrides()
     if isinstance(overrides, dict):
         ov.update(overrides)
     sleeve_inset = float(ov.get("sleeve_inset_pct") or 0.0)
+    man_geom = ov.get("manual_geometry") if isinstance(ov.get("manual_geometry"), dict) else {}
+    fg = man_geom.get("front") if isinstance(man_geom.get("front"), dict) else {}
+    bg = man_geom.get("back") if isinstance(man_geom.get("back"), dict) else {}
+
+    def _box_from_norm(rect_norm, im: Image.Image) -> Optional[tuple[int, int, int, int]]:
+        if not (isinstance(rect_norm, list) and len(rect_norm) == 4):
+            return None
+        iw, ih = im.size
+        ox, oy, ow, oh = [float(v) for v in rect_norm]
+        x1 = max(0, min(iw - 40, int(round(ox * iw))))
+        y1 = max(0, min(ih - 40, int(round(oy * ih))))
+        x2 = max(x1 + 40, min(iw, int(round((ox + ow) * iw))))
+        y2 = max(y1 + 40, min(ih, int(round((oy + oh) * ih))))
+        return (x1, y1, x2, y2)
+
+    if front_box is None:
+        front_box = _box_from_norm(fg.get("outer_card_rect"), front_img) or detect_physical_card_box(front_img)
+    if back_box is None:
+        back_box = _box_from_norm(bg.get("outer_card_rect"), back_img) or detect_physical_card_box(back_img)
 
     win4_res = None
     try:
@@ -4753,8 +4956,24 @@ def estimate_card_pregrade(
     has_margin_f = bool(win4_res.get("has_holder_margin_front")) if isinstance(win4_res, dict) else False
     has_margin_b = bool(win4_res.get("has_holder_margin_back")) if isinstance(win4_res, dict) else False
 
-    f_cent = _measure_side_centering(front_img, front_box, sleeve_inset_pct=sleeve_inset, has_holder_margin=has_margin_f)
-    b_cent = _measure_side_centering(back_img, back_box, sleeve_inset_pct=sleeve_inset, has_holder_margin=has_margin_b)
+    f_cent = _measure_side_centering(
+        front_img,
+        front_box,
+        sleeve_inset_pct=sleeve_inset,
+        has_holder_margin=has_margin_f,
+        manual_outer_rect=fg.get("outer_card_rect"),
+        manual_inner_rect=fg.get("inner_frame_rect"),
+        manual_corners=fg.get("corners"),
+    )
+    b_cent = _measure_side_centering(
+        back_img,
+        back_box,
+        sleeve_inset_pct=sleeve_inset,
+        has_holder_margin=has_margin_b,
+        manual_outer_rect=bg.get("outer_card_rect"),
+        manual_inner_rect=bg.get("inner_frame_rect"),
+        manual_corners=bg.get("corners"),
+    )
 
     used_fallback = False
     fallback_subs: dict = {}
@@ -5254,6 +5473,162 @@ def flag_grading_error_and_reevaluate(
             "light_border_mode": ov.get("light_border_mode"),
             "notes": notes_txt,
         },
+        "grades_before": grades_before,
+        "grades_after": grades_after,
+    }
+    CACHE_GRADING_FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
+    with interprocess_file_lock(GRADING_FEEDBACK_LOG_FILE.with_suffix(".lock")):
+        with open(GRADING_FEEDBACK_LOG_FILE, "a", encoding="utf-8") as fb_f:
+            fb_f.write(json.dumps(feedback_record, ensure_ascii=False) + "\n")
+
+    return {
+        "success": True,
+        "sku": resolved["sku"],
+        "card": updated_card,
+        "diagnostics": updated_diag,
+        "gradesBefore": grades_before,
+        "gradesAfter": grades_after,
+        "feedbackLogged": True,
+        **extra_rows,
+    }
+
+
+def update_card_grading_geometry(
+    target_type: str,
+    sku: str,
+    batch_name: str = "",
+    payload: Optional[dict] = None,
+) -> dict:
+    """
+    Persists manual per-side `outer_card_rect`, `inner_frame_rect`, and/or 4 `corners`
+    points (`tl`, `tr`, `bl`, `br`) into `overrides.manual_geometry`, logs the correction
+    to `grading_feedback_log.jsonl`, and immediately re-evaluates centering, corners/edges,
+    PSA/BGS estimates, and cache-only ROI.
+    """
+    p = payload if isinstance(payload, dict) else {}
+    side_raw = str(p.get("side") or "Front").strip().lower()
+    side_key = "back" if side_raw == "back" else "front"
+
+    insp = inspect_card_grading_diagnostics(target_type=target_type, sku=sku, batch_name=batch_name)
+    if not insp.get("success"):
+        return insp
+
+    resolved = resolve_card_row_and_images(target_type, sku, batch_name=batch_name)
+    if not resolved.get("success"):
+        return resolved
+
+    df = resolved["df"]
+    r_idx = resolved["r_idx"]
+    row_d = resolved["row"]
+    is_inv = resolved["target_type"] == "inventory"
+    f_p = resolved["front_path"] or resolved["back_path"]
+    b_p = resolved["back_path"] or resolved["front_path"]
+    diag_path = get_grading_diagnostics_path(
+        sku=resolved["sku"],
+        target_type=resolved["target_type"],
+        batch_name=resolved["batch_name"],
+        front_file=str(row_d.get("Front_File") or (f_p.name if f_p else "")),
+    )
+
+    diag = insp["diagnostics"]
+    ov = _default_grading_overrides()
+    if isinstance(diag.get("overrides"), dict):
+        ov.update(diag["overrides"])
+    man_geom = dict(ov.get("manual_geometry") or {})
+    side_geom = dict(man_geom.get(side_key) or {})
+
+    grades_before = {
+        "Est_PSA": str(row_d.get("Est_PSA") or (diag.get("grades") or {}).get("psa", {}).get("overall", "")),
+        "Est_BGS": str(row_d.get("Est_BGS") or (diag.get("grades") or {}).get("bgs", {}).get("overall", "")),
+        "Sub_Centering": str(row_d.get("Sub_Centering") or ""),
+        "Sub_Corners": str(row_d.get("Sub_Corners") or ""),
+        "Sub_Edges": str(row_d.get("Sub_Edges") or ""),
+        "Sub_Surface": str(row_d.get("Sub_Surface") or ""),
+    }
+
+    def _clean_rect(raw_r):
+        if not (isinstance(raw_r, list) and len(raw_r) == 4):
+            return None
+        rx, ry, rw, rh = [float(v) for v in raw_r]
+        rx = float(np.clip(rx, 0.0, 0.95))
+        ry = float(np.clip(ry, 0.0, 0.95))
+        rw = float(np.clip(rw, 0.05, 1.0 - rx))
+        rh = float(np.clip(rh, 0.05, 1.0 - ry))
+        return [round(rx, 4), round(ry, 4), round(rw, 4), round(rh, 4)]
+
+    outer_r = _clean_rect(p.get("outer_card_rect"))
+    inner_r = _clean_rect(p.get("inner_frame_rect"))
+    raw_corners = p.get("corners")
+
+    if isinstance(raw_corners, dict):
+        clean_c = {}
+        for ck in ("tl", "tr", "bl", "br"):
+            pt = raw_corners.get(ck)
+            if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                clean_c[ck] = [
+                    round(float(np.clip(float(pt[0]), 0.0, 1.0)), 4),
+                    round(float(np.clip(float(pt[1]), 0.0, 1.0)), 4),
+                ]
+        if len(clean_c) == 4:
+            side_geom["corners"] = clean_c
+            if outer_r is None:
+                xs = [clean_c[k][0] for k in ("tl", "tr", "bl", "br")]
+                ys = [clean_c[k][1] for k in ("tl", "tr", "bl", "br")]
+                outer_r = _clean_rect([min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)])
+
+    if outer_r is not None:
+        side_geom["outer_card_rect"] = outer_r
+    if inner_r is not None:
+        side_geom["inner_frame_rect"] = inner_r
+
+    man_geom[side_key] = side_geom
+    ov["manual_geometry"] = man_geom
+
+    with Image.open(f_p) as fim:
+        f_img = fim.convert("RGB")
+    with Image.open(b_p) as bim:
+        b_img = bim.convert("RGB")
+
+    csv_grade, updated_diag = estimate_card_pregrade(
+        f_img,
+        b_img,
+        overrides=ov,
+        return_diagnostics=True,
+        diagnostics_path=diag_path,
+        sku=resolved["sku"],
+        front_file=f_p.name,
+        back_file=b_p.name,
+        source_images_meta=diag.get("source_images"),
+    )
+
+    df = _apply_csv_grade_and_cache_roi(df, r_idx, csv_grade, is_inventory=is_inv)
+    if is_inv:
+        saved_df = save_inventory_df(df)
+        updated_card = saved_df[saved_df["SKU"].astype(str).str.strip() == resolved["sku"]].iloc[0].to_dict()
+        extra_rows = {"rows": saved_df.to_dict(orient="records")}
+    else:
+        man_p = resolved["manifest_path"]
+        atomic_write_text(man_p, df.to_csv(index=False), encoding="utf-8-sig")
+        updated_card = df.loc[r_idx].to_dict()
+        extra_rows = {"cards": df.to_dict(orient="records")}
+
+    grades_after = {
+        "Est_PSA": str(updated_card.get("Est_PSA") or ""),
+        "Est_BGS": str(updated_card.get("Est_BGS") or ""),
+        "Sub_Centering": str(updated_card.get("Sub_Centering") or ""),
+        "Sub_Corners": str(updated_card.get("Sub_Corners") or ""),
+        "Sub_Edges": str(updated_card.get("Sub_Edges") or ""),
+        "Sub_Surface": str(updated_card.get("Sub_Surface") or ""),
+    }
+
+    feedback_record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "target_type": resolved["target_type"],
+        "batch_name": resolved["batch_name"],
+        "sku": resolved["sku"],
+        "error_type": "manual_geometry_update",
+        "side": "Back" if side_key == "back" else "Front",
+        "user_correction": side_geom,
         "grades_before": grades_before,
         "grades_after": grades_after,
     }

@@ -44,6 +44,7 @@ _DEFECT_LABEL_MAP = {
     "sleeve_scratch_or_static_streak": "sleeve scratch/streak",
     "sleeve_smudge": "sleeve smudge/haze",
     "scanner_streak": "scanner glass/sensor streak",
+    "edge_dent": "edge dent/ding",
 }
 
 _MARKER_STYLE_MAP = {
@@ -53,7 +54,75 @@ _MARKER_STYLE_MAP = {
     "dimple_dent": "circle",
     "corner_whitening": "circle",
     "edge_chipping": "arrow",
+    "edge_dent": "arrow",
 }
+
+
+def _cluster_and_nms_defects(defects: list[dict], dist_thresh: float = 0.035) -> list[dict]:
+    """
+    Spatial clustering / Non-Maximum Suppression on same-side defects:
+    merges overlapping or nearby detections (normalized center distance <= `dist_thresh`)
+    into a single defect with union `bbox_norm` and highest severity/confidence.
+    """
+    if len(defects) <= 1:
+        return defects
+
+    def _boxes_close(a: dict, b: dict) -> bool:
+        if str(a.get("side") or "") != str(b.get("side") or ""):
+            return False
+        ba = a.get("bbox_norm")
+        bb = b.get("bbox_norm")
+        if not (isinstance(ba, list) and len(ba) == 4 and isinstance(bb, list) and len(bb) == 4):
+            return False
+        ax1, ay1, aw, ah = ba
+        bx1, by1, bw, bh = bb
+        ax2, ay2 = ax1 + aw, ay1 + ah
+        bx2, by2 = bx1 + bw, by1 + bh
+        # Overlap check
+        if ax1 <= bx2 and ax2 >= bx1 and ay1 <= by2 and ay2 >= by1:
+            return True
+        # Center distance check
+        acx, acy = ax1 + aw * 0.5, ay1 + ah * 0.5
+        bcx, bcy = bx1 + bw * 0.5, by1 + bh * 0.5
+        return float(np.hypot(acx - bcx, acy - bcy)) <= dist_thresh
+
+    n = len(defects)
+    visited = [False] * n
+    merged: list[dict] = []
+
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        cluster = [defects[i]]
+        queue = [i]
+        while queue:
+            cur = queue.pop(0)
+            for j in range(n):
+                if not visited[j] and _boxes_close(defects[cur], defects[j]):
+                    visited[j] = True
+                    cluster.append(defects[j])
+                    queue.append(j)
+
+        if len(cluster) == 1:
+            merged.append(cluster[0])
+            continue
+
+        # Pick representative with highest severity, then highest confidence
+        rep = dict(max(cluster, key=lambda d: (float(d.get("severity", 0.5)), float(d.get("confidence", 0.0)))))
+        valid_boxes = [d["bbox_norm"] for d in cluster if isinstance(d.get("bbox_norm"), list) and len(d["bbox_norm"]) == 4]
+        if valid_boxes:
+            ux1 = min(b[0] for b in valid_boxes)
+            uy1 = min(b[1] for b in valid_boxes)
+            ux2 = max(b[0] + b[2] for b in valid_boxes)
+            uy2 = max(b[1] + b[3] for b in valid_boxes)
+            rep["bbox_norm"] = [round(ux1, 4), round(uy1, 4), round(max(0.002, ux2 - ux1), 4), round(max(0.002, uy2 - uy1), 4)]
+        rep["confidence"] = round(max(float(d.get("confidence", 0.0)) for d in cluster), 3)
+        rep["severity"] = max(float(d.get("severity", 0.5)) for d in cluster)
+        rep["penalty"] = round(float(rep["severity"]), 2)
+        merged.append(rep)
+
+    return merged
 
 
 def _round_half_grade(val: float, lo: float = 5.0, hi: float = 10.0) -> float:
@@ -698,17 +767,38 @@ def _inspect_single_side(
                 ab_patch = lab[max(iy1, my - 12):min(iy2, my + 12), max(ix1, mx - 12):min(ix2, mx + 12), 1:3]
                 if ab_patch.size > 0 and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 14.0:
                     used_neg.add(j)
-                    z_lbl = _zone_label(mx - cx1, my - cy1, cw, ch)
-                    conf = min(0.92, 0.68 + _anom_boost(mx - cx1, my - cy1))
-                    confirmed.append(_attach_meta({
-                        "type": "dimple_dent",
-                        "is_true_defect": True,
-                        "confidence": round(conf, 3),
-                        "side": side_label,
-                        "zone": z_lbl,
-                        "severity": 0.5,
-                        "target": "surface",
-                    }, (max(ix1, mx - 12), max(iy1, my - 12), 24, 24)))
+                    # Check if dent lies inside the outer 3.5% edge strip (outside corner tips) -> edge_dent
+                    edge_band_x = max(8, int(cw * 0.035))
+                    edge_band_y = max(8, int(ch * 0.035))
+                    c_tip = max(16, int(min(cw, ch) * 0.08))
+                    near_left = (mx - cx1) <= edge_band_x and (cy1 + c_tip <= my <= cy2 - c_tip)
+                    near_right = (cx2 - mx) <= edge_band_x and (cy1 + c_tip <= my <= cy2 - c_tip)
+                    near_top = (my - cy1) <= edge_band_y and (cx1 + c_tip <= mx <= cx2 - c_tip)
+                    near_bot = (cy2 - my) <= edge_band_y and (cx1 + c_tip <= mx <= cx2 - c_tip)
+                    if near_left or near_right or near_top or near_bot:
+                        e_zone = "Left edge" if near_left else ("Right edge" if near_right else ("Top edge" if near_top else "Bottom edge"))
+                        conf = min(0.92, 0.70 + _anom_boost(mx - cx1, my - cy1))
+                        confirmed.append(_attach_meta({
+                            "type": "edge_dent",
+                            "is_true_defect": True,
+                            "confidence": round(conf, 3),
+                            "side": side_label,
+                            "zone": e_zone,
+                            "severity": 0.5,
+                            "target": "edges",
+                        }, (max(cx1, mx - 12), max(cy1, my - 12), 24, 24)))
+                    else:
+                        z_lbl = _zone_label(mx - cx1, my - cy1, cw, ch)
+                        conf = min(0.92, 0.68 + _anom_boost(mx - cx1, my - cy1))
+                        confirmed.append(_attach_meta({
+                            "type": "dimple_dent",
+                            "is_true_defect": True,
+                            "confidence": round(conf, 3),
+                            "side": side_label,
+                            "zone": z_lbl,
+                            "severity": 0.5,
+                            "target": "surface",
+                        }, (max(ix1, mx - 12), max(iy1, my - 12), 24, 24)))
                     break
 
     # D. Sleeve Smudge / Haze (low-frequency saturation drop + lifted black floor without sharp edges)
@@ -816,11 +906,28 @@ def _inspect_single_side(
             }, best_chip_box))
 
     white_thr_corner = max(188.0, border_l_med + (55.0 if light_border_mode else 30.0))
+    manual_geom = (ov.get("manual_geometry") or {}).get(side_label.lower(), {}) if isinstance(ov.get("manual_geometry"), dict) else {}
+    manual_corners = manual_geom.get("corners") if isinstance(manual_geom.get("corners"), dict) else {}
+    ox_roi, oy_roi = roi_origin
+    iw_full, ih_full = img_size
+
+    def _corner_box_from_pt(pt_norm, default_box):
+        if not (isinstance(pt_norm, (list, tuple)) and len(pt_norm) == 2):
+            return default_box
+        px = int(round(float(pt_norm[0]) * iw_full)) - ox_roi
+        py = int(round(float(pt_norm[1]) * ih_full)) - oy_roi
+        half = max(12, c_span // 2)
+        kx1 = max(0, min(roi_rgb.shape[1] - 16, px - half))
+        ky1 = max(0, min(roi_rgb.shape[0] - 16, py - half))
+        kx2 = min(roi_rgb.shape[1], kx1 + c_span)
+        ky2 = min(roi_rgb.shape[0], ky1 + c_span)
+        return (kx1, ky1, kx2, ky2)
+
     corner_zones = [
-        ("Top-Left", (cx1, cy1, cx1 + c_span, cy1 + c_span)),
-        ("Top-Right", (cx2 - c_span, cy1, cx2, cy1 + c_span)),
-        ("Bot-Left", (cx1, cy2 - c_span, cx1 + c_span, cy2)),
-        ("Bot-Right", (cx2 - c_span, cy2 - c_span, cx2, cy2)),
+        ("Top-Left", _corner_box_from_pt(manual_corners.get("tl"), (cx1, cy1, cx1 + c_span, cy1 + c_span))),
+        ("Top-Right", _corner_box_from_pt(manual_corners.get("tr"), (cx2 - c_span, cy1, cx2, cy1 + c_span))),
+        ("Bot-Left", _corner_box_from_pt(manual_corners.get("bl"), (cx1, cy2 - c_span, cx1 + c_span, cy2))),
+        ("Bot-Right", _corner_box_from_pt(manual_corners.get("br"), (cx2 - c_span, cy2 - c_span, cx2, cy2))),
     ]
     for c_name, (kx1, ky1, kx2, ky2) in corner_zones:
         if kx2 <= kx1 + 8 or ky2 <= ky1 + 8:
@@ -892,6 +999,7 @@ def _inspect_single_side(
                         confirmed[idx_c]["confidence"] = round(max(confirmed[idx_c]["confidence"], pred["confidence"]), 3)
 
     raw_confirmed = [c for c in confirmed if c.get("is_true_defect") and c.get("confidence", 0.0) >= _CONFIRMED_DEFECT_CONF_MIN]
+    raw_confirmed = _cluster_and_nms_defects(raw_confirmed, dist_thresh=0.035)
     confirmed = [c for c in raw_confirmed if c.get("id") not in dismissed_ids]
 
     return {
@@ -975,6 +1083,7 @@ def inspect_card_surface_through_sleeve(
         "print_spot_fisheye": "print spot/fisheye",
         "corner_whitening": "corner whitening",
         "edge_chipping": "edge chipping",
+        "edge_dent": "edge dent/ding",
     }
     for d in confirmed_all[:6]:
         t_lbl = _lbl_map.get(d["type"], d["type"])
