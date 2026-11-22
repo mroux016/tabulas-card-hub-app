@@ -106,7 +106,7 @@ _TABULAS_HTML_SHELL_V2 = r"""<!DOCTYPE html>
     (function () {
       function reportClientError(stage, message, stack, snippet) {
         try {
-          fetch('http://localhost:5000/api/client-error', {
+          fetch('/api/client-error', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -156,14 +156,14 @@ _TABULAS_HTML_SHELL_V2 = r"""<!DOCTYPE html>
         if (rbBtn) {
           rbBtn.onclick = function () {
             rbBtn.textContent = '⏳ Checking snapshots...';
-            fetch('http://localhost:5000/api/updater')
+            fetch('/api/updater')
               .then(function (r) { return r.json(); })
               .then(function (d) {
                 var snaps = (d && d.snapshots) || [];
                 var prevSnap = snaps.find(function (s) { return !s.is_current; });
                 if (!prevSnap) { rbBtn.textContent = 'No prior snapshot found'; return; }
                 rbBtn.textContent = '⏪ Rolling back to v' + prevSnap.version + '...';
-                return fetch('http://localhost:5000/api/updater/action', {
+                return fetch('/api/updater/action', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ action: 'rollback', targetVersion: prevSnap.version }),
@@ -982,7 +982,8 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route in ("/", "/index.html"):
-            jsx_path = (APP_DIR / "App.jsx") if (APP_DIR / "App.jsx").exists() else (HUB_DIR / "App.jsx")
+            _script_jsx = Path(__file__).resolve().parent / "App.jsx"
+            jsx_path = _script_jsx if _script_jsx.exists() else ((APP_DIR / "App.jsx") if (APP_DIR / "App.jsx").exists() else (HUB_DIR / "App.jsx"))
             body = _build_tabulas_react_html_v2(jsx_path).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2982,6 +2983,12 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
 def main():
     parser = argparse.ArgumentParser(description="Launch Tabulas Card Management Hub")
     parser.add_argument("--browser", action="store_true", help="Open in default web browser instead of standalone desktop window")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("TABULAS_PORT", 5000)),
+        help="Port to bind the local server (default: TABULAS_PORT env or 5000)",
+    )
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
 
@@ -2991,7 +2998,7 @@ def main():
         cli_p = (APP_DIR / "cli.py") if (APP_DIR / "cli.py").exists() else (HUB_DIR / "cli.py")
         subprocess.run([sys.executable, str(cli_p), "--version"], cwd=str(HUB_DIR))
         return
-    launch_zero_node_python_react_server(port=5000, force_browser=bool(args.browser))
+    launch_zero_node_python_react_server(port=args.port, force_browser=bool(args.browser))
 
 
 if __name__ == "__main__":

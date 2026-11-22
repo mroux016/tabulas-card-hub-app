@@ -5,7 +5,8 @@ const APP_VERSION = '0.24.0-beta.45';
 const LAST_UPDATED = '2026-11-21 15:05:00';
 const STORAGE_ROOT = 'C:\\Tabulas Card Hub';
 const SET_LIBRARY_ROOT = 'D:\\Tabulas Set Library';
-const NODE_API_BASE = 'http://localhost:5000/api';
+const API_ORIGIN = window.location.origin;
+const NODE_API_BASE = `${API_ORIGIN}/api`;
 
 // ============================================================================
 // 9 CHROME-PULSE SKINS (GRADIENTS, 3D DEPTH & SNAPPY MOTION)
@@ -545,8 +546,8 @@ function SideBySideCardComparison({
     return () => { active = false; };
   }, [setName, subsetName, cardNumber, initialTmplFrontRel, initialTmplBackRel]);
 
-  const tmplFrontUrl = tmplRef.front_rel ? `http://localhost:5000/static/templates/${tmplRef.front_rel.split('/').map(encodeURIComponent).join('/')}` : '';
-  const tmplBackUrl = tmplRef.back_rel ? `http://localhost:5000/static/templates/${tmplRef.back_rel.split('/').map(encodeURIComponent).join('/')}` : '';
+  const tmplFrontUrl = tmplRef.front_rel ? `${API_ORIGIN}/static/templates/${tmplRef.front_rel.split('/').map(encodeURIComponent).join('/')}` : '';
+  const tmplBackUrl = tmplRef.back_rel ? `${API_ORIGIN}/static/templates/${tmplRef.back_rel.split('/').map(encodeURIComponent).join('/')}` : '';
   const cols = cornersUrl ? 'grid-cols-2 sm:grid-cols-5' : 'grid-cols-2 sm:grid-cols-4';
   return (
     <div className={`grid ${cols} gap-2`}>
@@ -811,9 +812,9 @@ function GuidedReviewCardItem({
       )}
 
       <SideBySideCardComparison
-        scanFrontUrl={card.Front_File ? `http://localhost:5000/static/batches/${bEnc}/${encodeURIComponent(card.Front_File)}${bustQ}` : ''}
-        scanBackUrl={card.Back_File ? `http://localhost:5000/static/batches/${bEnc}/${encodeURIComponent(card.Back_File)}${bustQ}` : ''}
-        cornersUrl={card.Corners_File ? `http://localhost:5000/static/batches/${bEnc}/${encodeURIComponent(card.Corners_File)}${bustQ}` : ''}
+        scanFrontUrl={card.Front_File ? `${API_ORIGIN}/static/batches/${bEnc}/${encodeURIComponent(card.Front_File)}${bustQ}` : ''}
+        scanBackUrl={card.Back_File ? `${API_ORIGIN}/static/batches/${bEnc}/${encodeURIComponent(card.Back_File)}${bustQ}` : ''}
+        cornersUrl={card.Corners_File ? `${API_ORIGIN}/static/batches/${bEnc}/${encodeURIComponent(card.Corners_File)}${bustQ}` : ''}
         setName={curSet}
         subsetName={curSub}
         cardNumber={curCnum}
@@ -1215,9 +1216,9 @@ function InventoryGuidedCardItem({
 
       {/* SIDE-BY-SIDE SCAN vs TCDB REFERENCE + 8-CORNER SHEET */}
       <SideBySideCardComparison
-        scanFrontUrl={card.Front_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}${bustQ}` : ''}
-        scanBackUrl={card.Back_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}${bustQ}` : ''}
-        cornersUrl={card.Corners_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}${bustQ}` : ''}
+        scanFrontUrl={card.Front_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}${bustQ}` : ''}
+        scanBackUrl={card.Back_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}${bustQ}` : ''}
+        cornersUrl={card.Corners_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}${bustQ}` : ''}
         setName={curSet}
         subsetName={curSub}
         cardNumber={curCnum}
@@ -6868,7 +6869,7 @@ export default function App() {
                       <div className="p-2.5 bg-emerald-950/50 border border-emerald-700 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs shrink-0">
                         <div className="font-bold text-emerald-300 truncate">📄 Ready: {lastLabelPdf.pdfName}</div>
                         <div className="flex gap-1.5 shrink-0">
-                          <a href={`http://localhost:5000${lastLabelPdf.pdfUrl}`} target="_blank" rel="noreferrer" className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold">⬇️ Open PDF</a>
+                          <a href={`${API_ORIGIN}${lastLabelPdf.pdfUrl}`} target="_blank" rel="noreferrer" className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold">⬇️ Open PDF</a>
                           {Array.isArray(lastLabelPdf.printedSkus) && lastLabelPdf.printedSkus.length > 0 && (
                             <button onClick={() => handleMarkSkusPrinted(lastLabelPdf.printedSkus, 'PDF batch')} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 font-semibold">
                               ✅ Mark {lastLabelPdf.printedSkus.length} Printed
@@ -7826,9 +7827,9 @@ export default function App() {
                         </div>
                       </div>
                       <SideBySideCardComparison
-                        scanFrontUrl={card.Front_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}` : ''}
-                        scanBackUrl={card.Back_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}` : ''}
-                        cornersUrl={card.Corners_File ? `http://localhost:5000/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}` : ''}
+                        scanFrontUrl={card.Front_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}` : ''}
+                        scanBackUrl={card.Back_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}` : ''}
+                        cornersUrl={card.Corners_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}` : ''}
                         setName={card.Set} subsetName={card.Subset} cardNumber={card['Card Number']}
                         initialTmplFrontRel={card.Matched_Template_Front} initialTmplBackRel={card.Matched_Template_Back}
                         heightClass="h-72"
