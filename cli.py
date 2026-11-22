@@ -2040,7 +2040,8 @@ def main():
         resume_saved_run()
         return
 
-    subprocess.run([sys.executable, "-m", "streamlit", "run", str(BASE_DIR / "app.py")], cwd=str(BASE_DIR))
+    parser.print_help()
+    print("\nTip: Launch the Tabulas Card Management Hub desktop app via `python App/launch_tabulas_hub.py`.")
 
 
 if __name__ == "__main__":

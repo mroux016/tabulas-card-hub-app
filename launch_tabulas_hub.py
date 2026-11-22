@@ -530,13 +530,13 @@ def _get_cached_checklist_df(set_name: str = ""):
 
 
 def consolidate_single_react_app_file():
-    app_jsx = HUB_DIR / "App.jsx"
-    app_tsx = HUB_DIR / "app.tsx"
+    app_jsx = APP_DIR / "App.jsx"
+    app_tsx = APP_DIR / "app.tsx"
     if app_tsx.exists():
         try:
             if not app_jsx.exists() or app_tsx.stat().st_size > app_jsx.stat().st_size:
                 shutil.copy2(app_tsx, app_jsx)
-            backup_dir = HUB_DIR / "Core" / ".verified_backups"
+            backup_dir = APP_DIR / "Core" / ".verified_backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(app_tsx, backup_dir / "app.tsx.bak")
             app_tsx.unlink()
@@ -769,96 +769,6 @@ def _save_tracked_sets_list(items: list[dict]):
             "last_upgraded": "" if str(r.get("Last_Upgraded", "")).upper() == "NEVER" else str(r.get("Last_Upgraded", "")),
         }
     save_all_tracked_sets(new_dict)
-
-
-def _build_browser_ready_react_html(app_jsx_path: Path) -> str:
-    if not app_jsx_path.exists():
-        return "<html><body style='background:#020617;color:#f8fafc;font-family:sans-serif;padding:2rem;'><h3>App.jsx not found in C:\\Tabulas Card Hub. Save App.jsx into C:\\Tabulas Card Hub\\App.jsx and refresh!</h3></body></html>"
-
-    raw_jsx = app_jsx_path.read_text(encoding="utf-8-sig", errors="replace")
-    jsx_lines = raw_jsx.splitlines()
-    while jsx_lines and jsx_lines[0].strip().startswith("`"):
-        jsx_lines.pop(0)
-    while jsx_lines and jsx_lines[-1].strip().startswith("`"):
-        jsx_lines.pop()
-    raw_jsx = "\n".join(jsx_lines)
-
-    cleaned_jsx = re.sub(
-        r"import\s+React\s*,\s*\{([^}]+)\}\s*from\s*['\"]react['\"];?",
-        r"const {\1} = React;",
-        raw_jsx,
-        flags=re.DOTALL,
-    )
-    cleaned_jsx = re.sub(r"import\s+\{([^}]+)\}\s*from\s*['\"]lucide-react['\"];?", "", cleaned_jsx, flags=re.DOTALL)
-    cleaned_jsx = re.sub(r"export\s+default\s+function\s+App", "function App", cleaned_jsx)
-
-    return f"""<!doctype html>
-<html lang="en" class="dark">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tabulas Card Management Hub — C:\\Tabulas Card Hub</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    html {{ font-size: 17.5px; }}
-    [class*="text-[9px]"] {{ font-size: 10.5px !important; }}
-    [class*="text-[9.5px]"] {{ font-size: 11px !important; }}
-    [class*="text-[10px]"] {{ font-size: 11.5px !important; }}
-    [class*="text-[11px]"] {{ font-size: 12.5px !important; }}
-  </style>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-</head>
-<body class="bg-slate-950 text-slate-100 antialiased">
-  <div id="root"></div>
-  <script type="text/babel">
-    const _makeIcon = (glyph) => ({{ className = "w-4 h-4" }}) => (
-      <span className={{`inline-flex items-center justify-center ${{className}}`}} style={{{{fontSize: '0.9em', lineHeight: 1}}}} >{{glyph}}</span>
-    );
-    const Search = _makeIcon("🔍");
-    const Tag = _makeIcon("🏷️");
-    const Settings = _makeIcon("⚙️");
-    const Globe = _makeIcon("🌐");
-    const DollarSign = _makeIcon("💰");
-    const Store = _makeIcon("🏪");
-    const Clock = _makeIcon("⏰");
-    const Info = _makeIcon("ℹ️");
-    const Play = _makeIcon("▶️");
-    const Square = _makeIcon("⏹️");
-    const RefreshCw = _makeIcon("🔄");
-    const Plus = _makeIcon("➕");
-    const Trash2 = _makeIcon("🗑️");
-    const CheckCircle2 = _makeIcon("✅");
-    const AlertTriangle = _makeIcon("⚠️");
-    const Download = _makeIcon("⬇️");
-    const Upload = _makeIcon("📂");
-    const FolderOpen = _makeIcon("📁");
-    const Layers = _makeIcon("📚");
-    const FileSpreadsheet = _makeIcon("📊");
-    const Printer = _makeIcon("🖨️");
-    const Sliders = _makeIcon("🎛️");
-    const ShieldCheck = _makeIcon("🛡️");
-    const ExternalLink = _makeIcon("↗️");
-    const Sparkles = _makeIcon("✨");
-    const Filter = _makeIcon("⚡");
-    const Eye = _makeIcon("👁️");
-    const Check = _makeIcon("✔️");
-    const ChevronRight = _makeIcon("›");
-    const ChevronDown = _makeIcon("⌄");
-    const Terminal = _makeIcon("🖥️");
-    const Cpu = _makeIcon("🧠");
-    const HardDrive = _makeIcon("💾");
-    const Package = _makeIcon("📦");
-    const Percent = _makeIcon("%");
-
-    {cleaned_jsx}
-
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<App />);
-  </script>
-</body>
-</html>"""
 
 
 class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
@@ -2915,7 +2825,6 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
 
 def main():
     parser = argparse.ArgumentParser(description="Launch Tabulas Card Management Hub")
-    parser.add_argument("--streamlit", action="store_true")
     parser.add_argument("--browser", action="store_true", help="Open in default web browser instead of standalone desktop window")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
@@ -2926,13 +2835,7 @@ def main():
         cli_p = (APP_DIR / "cli.py") if (APP_DIR / "cli.py").exists() else (HUB_DIR / "cli.py")
         subprocess.run([sys.executable, str(cli_p), "--version"], cwd=str(HUB_DIR))
         return
-    if args.streamlit:
-        env = os.environ.copy()
-        env["CARDS_BASE_DIR"] = str(HUB_DIR)
-        env["TABULAS_SET_LIBRARY_DIR"] = str(SET_LIBRARY_ROOT)
-        subprocess.run([sys.executable, "-m", "streamlit", "run", str(HUB_DIR / "app.py"), "--server.port", "8501"], cwd=str(HUB_DIR), env=env)
-    else:
-        launch_zero_node_python_react_server(port=5000, force_browser=bool(args.browser))
+    launch_zero_node_python_react_server(port=5000, force_browser=bool(args.browser))
 
 
 if __name__ == "__main__":

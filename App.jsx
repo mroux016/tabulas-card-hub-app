@@ -1,12 +1,5 @@
 // @ts-nocheck
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import {
-  Search, Tag, Settings, Globe, DollarSign, Store, Clock, Info,
-  Play, Square, RefreshCw, Plus, Trash2, CheckCircle2, AlertTriangle,
-  Download, Upload, FolderOpen, Layers, FileSpreadsheet, Printer,
-  Sliders, ShieldCheck, ExternalLink, Sparkles, Filter, Eye, Check,
-  ChevronRight, ChevronDown, Terminal, Cpu, HardDrive, Package, Percent
-} from 'lucide-react';
 
 const APP_VERSION = '0.24.0-beta.45';
 const LAST_UPDATED = '2026-11-21 15:05:00';
@@ -364,7 +357,14 @@ function ThumbtackPinIcon({ pinned, className = 'w-3.5 h-3.5' }) {
 }
 
 function sanitizeFolderName(val) {
-  return String(val || '').trim().replace(/[\\/:*?"<>|\[\]]+/g, '_').replace(/\s+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '') || 'Unknown';
+  return String(val || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/[\\/:*?"<>|\[\]]+/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '') || 'Unknown';
 }
 
 function expandSkuRangeTokens(rawInput) {
@@ -1807,12 +1807,15 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDocClick);
   }, [showNotifPopup]);
 
-  const [backendConnected, setBackendConnected] = useState(false);
+  const [backendConnected, setBackendConnected] = useState(null);
   const [inventory, setInventory] = useState([]);
   const [inventoryDirty, setInventoryDirty] = useState(false);
   const [incomingScans, setIncomingScans] = useState([]);
   const [batches, setBatches] = useState([]);
   const [trackedSets, setTrackedSets] = useState([]);
+  const [trackedSetsDirty, setTrackedSetsDirty] = useState(false);
+  const trackedSetsDirtyRef = useRef(false);
+  trackedSetsDirtyRef.current = trackedSetsDirty;
   const [directoryRows, setDirectoryRows] = useState([]);
   const [setCart, setSetCart] = useState([]);
   const [showCartSidebar, setShowCartSidebar] = useState(false);
@@ -1839,8 +1842,6 @@ export default function App() {
   const [updaterInfo, setUpdaterInfo] = useState({ status: 'UP_TO_DATE', current_version: APP_VERSION, pending_count: 0, message: 'Click "Check for Updates".', packages: [], snapshots: [] });
   const [liveLanes, setLiveLanes] = useState({});
   const [liveLogs, setLiveLogs] = useState({});
-  const [runLogFiles, setRunLogFiles] = useState([]);
-  const [selectedRunLogRel, setSelectedRunLogRel] = useState('');
   const [selectedTrackedUrls, setSelectedTrackedUrls] = useState([]);
   const [trackedSearch, setTrackedSearch] = useState('');
   const [trackedSportF, setTrackedSportF] = useState('All Sports');
@@ -1881,8 +1882,6 @@ export default function App() {
   const [compPage, setCompPage] = useState(1);
   const [compPageSize, setCompPageSize] = useState(250);
   const [preselectSubsets, setPreselectSubsets] = useState(['Base']);
-  const [editorLookup, setEditorLookup] = useState({ subsets: ['Base'], matches: [] });
-  const [editorTypeaheadQ, setEditorTypeaheadQ] = useState('');
   const [manualSubsets, setManualSubsets] = useState(['Base']);
 
   const [chkData, setChkData] = useState({ rows: [], knownSets: ['2026 Topps Baseball'], knownYears: [], knownSubsets: [], totalRecords: 0, totalMatchingCount: 0, glossary: DEFAULT_GLOSSARY });
@@ -1934,7 +1933,6 @@ export default function App() {
   const [invStatusFilter, setInvStatusFilter] = useState('All Statuses');
   const [invSearch, setInvSearch] = useState('');
   const [selectedInvSkus, setSelectedInvSkus] = useState([]);
-  const [editForm, setEditForm] = useState({ Set: '', CardNumber: '', Player: '', Subset: 'Base', Team: '', PrintRun: '', HoldTag: 'For Sale', RawPrice: '1.00', RecSalePrice: '1.49' });
   const [invEditorIdx, setInvEditorIdx] = useState(0);
   const [invEditorImgBust, setInvEditorImgBust] = useState(0);
   const [batchImgBust, setBatchImgBust] = useState(0);
@@ -1991,7 +1989,6 @@ export default function App() {
   const [clPageSize, setClPageSize] = useState(250);
 
   const [cleanSlateChecklists, setCleanSlateChecklists] = useState(false);
-  const [resetDestOnMigrate, setResetDestOnMigrate] = useState(true);
   const [showMaintenanceWidget, setShowMaintenanceWidget] = useState(false);
 
   const [dirSearch, setDirSearch] = useState('');
@@ -2049,6 +2046,7 @@ export default function App() {
   const [completionModeIdx, setCompletionModeIdx] = useState(0);
   const [completionExclSN, setCompletionExclSN] = useState(false);
   const [completionData, setCompletionData] = useState({ modes: [], owned: [], missing: [], bySubset: [], byPlayer: [] });
+  const [completionLoading, setCompletionLoading] = useState(false);
   const [compTableView, setCompTableView] = useState('missing');
   const [compSearch, setCompSearch] = useState('');
   const [compSubsetF, setCompSubsetF] = useState('All Subsets');
@@ -2223,7 +2221,9 @@ export default function App() {
     fetch(`${NODE_API_BASE}/incoming-scans`).then((r) => r.json()).then((d) => Array.isArray(d) && setIncomingScans(d)).catch(() => {});
     loadBatchesFromDisk(preferredBatch);
     if (!opts.preserveChecklist) fetchFilteredChecklists();
-    fetch(`${NODE_API_BASE}/config/tracked-sets`).then((r) => r.json()).then((d) => Array.isArray(d) && setTrackedSets(d)).catch(() => {});
+    fetch(`${NODE_API_BASE}/config/tracked-sets`).then((r) => r.json()).then((d) => {
+      if (Array.isArray(d) && !trackedSetsDirtyRef.current) setTrackedSets(d);
+    }).catch(() => {});
     fetch(`${NODE_API_BASE}/directory`).then((r) => r.json()).then((d) => Array.isArray(d) && setDirectoryRows(d)).catch(() => {});
     fetch(`${NODE_API_BASE}/config/set-cart`).then((r) => r.json()).then((c) => { if (Array.isArray(c)) { setSetCart(c); if (c.length > 0) setShowCartSidebar(true); } }).catch(() => {});
     fetch(`${NODE_API_BASE}/market-data`).then((r) => r.json()).then((m) => {
@@ -2282,10 +2282,6 @@ export default function App() {
 
           setLiveLanes(d.lanes);
           setLiveLogs(d.logs || {});
-          if (Array.isArray(d.runLogFiles)) {
-            setRunLogFiles(d.runLogFiles);
-            setSelectedRunLogRel((prev) => prev || (d.runLogFiles[0]?.relPath || ''));
-          }
 
           if (finishedJobs.length > 0) {
             const hasNewIngest = finishedJobs.some((fj) => fj.jobType === 'scan_ingest');
@@ -2324,23 +2320,6 @@ export default function App() {
                 setInventory(rows);
                 setInventoryDirty(false);
                 setInvEditorImgBust((v) => v + 1);
-                const curEdSku = activeInvEditorSkuRef.current;
-                if (curEdSku) {
-                  const freshCard = rows.find((c) => String(c.SKU).trim() === String(curEdSku).trim());
-                  if (freshCard) {
-                    setEditForm({
-                      Set: freshCard.Set || '',
-                      CardNumber: String(freshCard['Card Number'] || '').replace(/^#/, ''),
-                      Player: freshCard.Player || '',
-                      Subset: freshCard.Subset || 'Base',
-                      Team: freshCard.Team || '',
-                      PrintRun: freshCard['Print Run'] || '',
-                      HoldTag: freshCard.Hold_Tag || 'For Sale',
-                      RawPrice: freshCard.Raw_Price || '1.00',
-                      RecSalePrice: freshCard.Rec_Sale_Price || freshCard.Raw_Price || '1.49',
-                    });
-                  }
-                }
               }).catch(() => {});
             }
 
@@ -2396,7 +2375,7 @@ export default function App() {
   useEffect(() => { setChkPage(1); }, [chkSetF, chkYearF, chkSubsetF, chkAttrF, chkStatusF, chkSearchF]);
   useEffect(() => { setInvPage(1); }, [invSetFilter, invHoldFilter, invStatusFilter, invSearch]);
   useEffect(() => { setDirPage(1); }, [dirSportFilter, dirMfgFilter, dirCategoryFilter, dirEraFilter, dirSearch, dirHideTracked]);
-  useEffect(() => { setCompPage(1); }, [completionSet, completionModeIdx, compTableView, compSubsetF, compSearch]);
+  useEffect(() => { setCompPage(1); }, [completionSet, completionModeIdx, completionExclSN, compTableView, compSubsetF, compSearch]);
   useEffect(() => { setBatchPage(1); }, [activeBatchName, batchReviewFilter, batchConfFilter, batchSubsetFilter, batchSearchQ]);
 
   useEffect(() => {
@@ -2461,10 +2440,16 @@ export default function App() {
   }, [isIngestLaneRunning, activePage, batchDraftEdits]);
 
   useEffect(() => {
-    if (activePage === 'set_completion' && completionSet) {
-      const p = new URLSearchParams({ set: completionSet, modeIdx: String(completionModeIdx), excludeSN: String(completionExclSN) });
-      fetch(`${NODE_API_BASE}/completion?${p.toString()}`).then((r) => r.json()).then((d) => d && setCompletionData(d)).catch(() => {});
-    }
+    if (activePage !== 'set_completion' || !completionSet) return;
+    let cancelled = false;
+    setCompletionLoading(true);
+    const p = new URLSearchParams({ set: completionSet, modeIdx: String(completionModeIdx), excludeSN: String(completionExclSN) });
+    fetch(`${NODE_API_BASE}/completion?${p.toString()}`)
+      .then((r) => r.json())
+      .then((d) => { if (!cancelled && d) setCompletionData(d); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setCompletionLoading(false); });
+    return () => { cancelled = true; };
   }, [activePage, completionSet, completionModeIdx, completionExclSN]);
 
   useEffect(() => {
@@ -2487,18 +2472,6 @@ export default function App() {
       .then((d) => d && Array.isArray(d.subsets) && setPreselectSubsets(d.subsets.length > 0 ? d.subsets : ['Base']))
       .catch(() => setPreselectSubsets(['Base']));
   }, [preselectSet]);
-
-  useEffect(() => {
-    if (activePage !== 'inventory_editor' || !editForm.Set) return;
-    const timer = setTimeout(() => {
-      const p = new URLSearchParams({ set: editForm.Set, q: editorTypeaheadQ, limit: '45' });
-      fetch(`${NODE_API_BASE}/checklists/lookup?${p.toString()}`)
-        .then((r) => r.json())
-        .then((d) => d && setEditorLookup({ subsets: d.subsets || ['Base'], matches: d.matches || [] }))
-        .catch(() => {});
-    }, editorTypeaheadQ ? 200 : 0);
-    return () => clearTimeout(timer);
-  }, [activePage, editForm.Set, editorTypeaheadQ]);
 
   useEffect(() => {
     if (!showManualAddInv || !manualCard.Set) return;
@@ -2553,11 +2526,6 @@ export default function App() {
 
   const currentBatchObj = useMemo(() => batches.find((b) => b.batchName === activeBatchName) || batches[0] || null, [batches, activeBatchName]);
   const batchCards = currentBatchObj?.cards || [];
-  const guidedBatchCards = useMemo(() => {
-    if (batchSelectedSkus.length > 0) return batchCards.filter((c) => batchSelectedSkus.includes(c.SKU));
-    const flagged = batchCards.filter((c) => String(c.Needs_Review).toLowerCase() === 'true');
-    return flagged.length > 0 ? flagged : batchCards.slice(0, 25);
-  }, [batchCards, batchSelectedSkus]);
 
   const filteredInventory = useMemo(() => inventory.filter((c) => {
     if (invSetFilter !== 'All Sets' && c.Set !== invSetFilter) return false;
@@ -2696,22 +2664,6 @@ export default function App() {
       });
   };
 
-  const syncEditFormFromInventoryCard = (card) => {
-    if (!card) return;
-    activeInvEditorSkuRef.current = String(card.SKU || '').trim();
-    setEditForm({
-      Set: card.Set || '',
-      CardNumber: String(card['Card Number'] || '').replace(/^#/, ''),
-      Player: card.Player || '',
-      Subset: card.Subset || 'Base',
-      Team: card.Team || '',
-      PrintRun: card['Print Run'] || '',
-      HoldTag: card.Hold_Tag || 'For Sale',
-      RawPrice: card.Raw_Price || '1.00',
-      RecSalePrice: card.Rec_Sale_Price || card.Raw_Price || '1.49',
-    });
-  };
-
   const openInventoryEditorForSkus = (skus, mode = 'individual') => {
     const list = Array.isArray(skus) ? skus : [skus];
     if (list.length === 0) return;
@@ -2739,7 +2691,7 @@ export default function App() {
       Needs_Review: String(first.Needs_Review).toLowerCase() === 'true' ? 'True' : 'False',
       Grading_Notes: first.Grading_Notes || '',
     });
-    syncEditFormFromInventoryCard(first);
+    activeInvEditorSkuRef.current = String(first.SKU || '').trim();
     openHiddenPage('inventory_editor');
   };
 
@@ -3421,9 +3373,9 @@ export default function App() {
                   🎨
                 </div>
                 {navExpanded && (
-                  <div className="text-left min-w-0">
+                  <div className="text-left min-w-0 flex-1">
                     <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Theme Skin</div>
-                    <div className={`text-xs font-bold truncate ${skin.accentText}`}>{skin.name}</div>
+                    <div className={`text-[11px] font-bold leading-tight whitespace-normal break-words ${skin.accentText}`}>{skin.name}</div>
                   </div>
                 )}
               </div>
@@ -3470,8 +3422,14 @@ export default function App() {
       {/* CENTER WORKSPACE + TOP BAR */}
       <div className="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
         <header className={`${skin.railBg} border-b ${skin.border} px-4 py-2 flex items-center justify-between gap-3 shrink-0 z-20`}>
-          {/* Error-Only API Status Pill (Hidden When Connected & Healthy) */}
-          {!backendConnected && (
+          {/* Connecting / Error-Only API Status Pill (Hidden Once Connected & Healthy) */}
+          {backendConnected === null && (
+            <span className="px-2.5 py-1 rounded-xl text-[11px] font-semibold bg-slate-900/90 text-slate-300 border border-slate-700/80 flex items-center gap-1.5 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse" />
+              <span>Connecting...</span>
+            </span>
+          )}
+          {backendConnected === false && (
             <button
               onClick={() => refreshAllHubData()}
               title="Local Python Disk API is unreachable — click to retry connection"
@@ -4107,12 +4065,16 @@ export default function App() {
                                     fetch(`${NODE_API_BASE}/batches/clear`, {
                                       method: 'POST', headers: { 'Content-Type': 'application/json' },
                                       body: JSON.stringify({ batchName: currentBatchObj.batchName, clearAll: false }),
-                                    }).then(() => {
-                                      setBatchDraftEdits({});
-                                      setBatchSelectedSkus([]);
-                                      refreshAllHubData('');
-                                      pushNotification('Batch Cleared', `Cleared '${currentBatchObj.batchName}' and restored raw PDFs.`, 'Batch', 'warning');
-                                    });
+                                    }).then((r) => r.json()).then((res) => {
+                                      if (res && res.success) {
+                                        setBatchDraftEdits({});
+                                        setBatchSelectedSkus([]);
+                                        refreshAllHubData('');
+                                        pushNotification('Batch Cleared', `Cleared '${currentBatchObj.batchName}' and restored raw PDFs.`, 'Batch', 'warning');
+                                      } else {
+                                        pushNotification('Clear Batch Failed', res?.error || 'Could not clear batch.', 'Batch', 'error');
+                                      }
+                                    }).catch((e) => pushNotification('Clear Batch Error', e.message, 'Batch', 'error'));
                                   }}
                                   className="px-2.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
                                 >
@@ -4963,8 +4925,10 @@ export default function App() {
                             setInventory(res.rows || []);
                             setSelectedInvSkus([]);
                             pushNotification('SKUs Deleted', `Removed ${res.deleted_rows || selectedInvSkus.length} SKU(s) from Inventory.csv.`, 'Inventory', 'warning');
+                          } else {
+                            pushNotification('Delete Failed', res?.error || 'Could not delete selected SKUs.', 'Inventory', 'error');
                           }
-                        });
+                        }).catch((e) => pushNotification('Delete Error', e.message, 'Inventory', 'error'));
                       }}
                       disabled={selectedInvSkus.length === 0}
                       className="px-2.5 py-1.5 rounded-xl bg-rose-950/80 hover:bg-rose-900 border border-rose-800 text-rose-200 font-semibold text-xs disabled:opacity-40"
@@ -5059,7 +5023,11 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70">
-                      {filteredInventory.slice((invPage - 1) * invPageSize, invPage * invPageSize).map((card) => {
+                      {(() => {
+                        const invTotP = Math.max(1, Math.ceil(filteredInventory.length / invPageSize));
+                        const safeInvP = Math.min(invPage, invTotP);
+                        return filteredInventory.slice((safeInvP - 1) * invPageSize, safeInvP * invPageSize);
+                      })().map((card) => {
                         const isSel = selectedInvSkus.includes(card.SKU);
                         return (
                           <tr key={card.SKU} className={isSel ? 'bg-cyan-950/35' : 'hover:bg-slate-800/40'}>
@@ -5101,19 +5069,25 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
-                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 shrink-0 px-1">
-                  <span>
-                    Showing {filteredInventory.length === 0 ? 0 : ((invPage - 1) * invPageSize + 1).toLocaleString()}–{Math.min(filteredInventory.length, invPage * invPageSize).toLocaleString()} of {filteredInventory.length.toLocaleString()} matching SKU(s)
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <select value={invPageSize} onChange={(e) => { setInvPageSize(parseInt(e.target.value, 10) || 250); setInvPage(1); }} className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs">
-                      <option value={100}>100 / page</option><option value={250}>250 / page</option><option value={500}>500 / page</option>
-                    </select>
-                    <button onClick={() => setInvPage((p) => Math.max(1, p - 1))} disabled={invPage <= 1} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
-                    <span className="font-mono text-white">Page {invPage} / {Math.max(1, Math.ceil(filteredInventory.length / invPageSize))}</span>
-                    <button onClick={() => setInvPage((p) => Math.min(Math.max(1, Math.ceil(filteredInventory.length / invPageSize)), p + 1))} disabled={invPage >= Math.max(1, Math.ceil(filteredInventory.length / invPageSize))} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
-                  </div>
-                </div>
+                {(() => {
+                  const invTotP = Math.max(1, Math.ceil(filteredInventory.length / invPageSize));
+                  const safeInvP = Math.min(invPage, invTotP);
+                  return (
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 shrink-0 px-1">
+                      <span>
+                        Showing {filteredInventory.length === 0 ? 0 : ((safeInvP - 1) * invPageSize + 1).toLocaleString()}–{Math.min(filteredInventory.length, safeInvP * invPageSize).toLocaleString()} of {filteredInventory.length.toLocaleString()} matching SKU(s)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <select value={invPageSize} onChange={(e) => { setInvPageSize(parseInt(e.target.value, 10) || 250); setInvPage(1); }} className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs">
+                          <option value={100}>100 / page</option><option value={250}>250 / page</option><option value={500}>500 / page</option>
+                        </select>
+                        <button onClick={() => setInvPage((p) => Math.max(1, Math.min(invTotP, p) - 1))} disabled={safeInvP <= 1} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
+                        <span className="font-mono text-white">Page {safeInvP} / {invTotP}</span>
+                        <button onClick={() => setInvPage((p) => Math.min(invTotP, Math.min(invTotP, p) + 1))} disabled={safeInvP >= invTotP} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
@@ -6404,10 +6378,21 @@ export default function App() {
                         </button>
                       </div>
                       <button
-                        onClick={() => fetch(`${NODE_API_BASE}/config/tracked-sets`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(trackedSets) }).then((r) => r.json()).then((res) => { if (res && res.success) { setTrackedSets(res.trackedSets || trackedSets); pushNotification('Tracked Sets Saved', `Saved ${trackedSets.length} set(s) to tracked_sets.json.`, 'Scraper', 'success'); } })}
-                        className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
+                        onClick={() => fetch(`${NODE_API_BASE}/config/tracked-sets`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(trackedSets) })
+                          .then((r) => r.json())
+                          .then((res) => {
+                            if (res && res.success) {
+                              setTrackedSets(res.trackedSets || trackedSets);
+                              setTrackedSetsDirty(false);
+                              pushNotification('Tracked Sets Saved', `Saved ${(res.trackedSets || trackedSets).length} set(s) to tracked_sets.json.`, 'Scraper', 'success');
+                            } else {
+                              pushNotification('Save Queue Failed', res?.error || 'Could not save tracked sets.', 'Scraper', 'error');
+                            }
+                          })
+                          .catch((e) => pushNotification('Save Queue Error', e.message, 'Scraper', 'error'))}
+                        className={`px-3 py-1.5 rounded-xl font-bold text-xs ${trackedSetsDirty ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 animate-pulse shadow-lg shadow-amber-950/60' : 'bg-emerald-600 hover:bg-emerald-500 text-white'}`}
                       >
-                        💾 Save Queue
+                        {trackedSetsDirty ? '💾 Save Queue (Unsaved Changes)' : '💾 Save Queue'}
                       </button>
                     </div>
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-2 shrink-0">
@@ -6466,7 +6451,7 @@ export default function App() {
                                 <td className="p-1.5">{ts.Manufacturer}</td>
                                 <td className="p-1.5 font-mono text-emerald-400">{ts.Last_Scraped || 'NEVER'}</td>
                                 <td className="p-1.5"><a href={ts.TCDB_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Open ↗</a></td>
-                                <td className="p-1.5"><button onClick={() => setTrackedSets((prev) => prev.filter((x) => x.TCDB_URL !== ts.TCDB_URL))} className="text-rose-400 hover:text-rose-200 px-1">🗑️</button></td>
+                                <td className="p-1.5"><button onClick={() => { setTrackedSets((prev) => prev.filter((x) => x.TCDB_URL !== ts.TCDB_URL)); setSelectedTrackedUrls((prev) => prev.filter((u) => u !== ts.TCDB_URL)); setTrackedSetsDirty(true); }} title="Remove from queue (click Save Queue to persist)" className="text-rose-400 hover:text-rose-200 px-1">🗑️</button></td>
                               </tr>
                             );
                           })}
@@ -6697,7 +6682,7 @@ export default function App() {
                               ].map(([lbl, sy, ey]) => (
                                 <button
                                   key={lbl}
-                                  onClick={() => setCrawlOpts((p) => ({ ...p, startYear: sy, endYear: ey, fetchImagePct: sy >= 2020 ? p.fetchImagePct : false }))}
+                                  onClick={() => setCrawlOpts((p) => ({ ...p, startYear: sy, endYear: ey }))}
                                   className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10.5px] text-slate-200 font-medium"
                                 >
                                   {lbl}
@@ -6705,8 +6690,12 @@ export default function App() {
                               ))}
                             </div>
                           </div>
-                          <div className="md:col-span-2 p-2 rounded-lg bg-emerald-950/35 border border-emerald-700/40 text-[10px] text-emerald-200 leading-snug">
-                            ⚡ <b>Single-Pass HTML:</b> Exact TCDB Categories &amp; <code>Img %</code> are extracted automatically with zero extra requests!
+                          <div className="md:col-span-2 p-2 rounded-lg bg-emerald-950/35 border border-emerald-700/40 text-[10px] text-emerald-200 leading-snug space-y-1">
+                            <label className="flex items-center gap-1.5 font-bold text-emerald-100 cursor-pointer">
+                              <input type="checkbox" checked={!!crawlOpts.fetchImagePct} onChange={(e) => setCrawlOpts((p) => ({ ...p, fetchImagePct: e.target.checked }))} />
+                              <span>⚡ Fetch Live Img % &amp; Categories</span>
+                            </label>
+                            <div className="text-emerald-200/80">Single-pass HTML extracts exact Categories &amp; <code>Img %</code> with zero extra requests.</div>
                           </div>
                           <div className="md:col-span-2">
                             <button
@@ -7423,7 +7412,31 @@ export default function App() {
                           <input type="checkbox" checked={newSale.Seller_Paid_Shipping} onChange={(e) => setNewSale({ ...newSale, Seller_Paid_Shipping: e.target.checked })} />
                           Seller Paid Shipping
                         </label>
-                        <button onClick={() => fetch(`${NODE_API_BASE}/sold-cards`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...newSale, markInventorySold: true }) }).then((r) => r.json()).then((res) => { if (res.success) { setSoldCards(res.rows || []); setShowRecordSaleForm(false); refreshAllHubData(); pushNotification('Sale Recorded', `Logged sale of ${newSale.Player || newSale.SKU}.`, 'Sales', 'success'); } })} className="w-full py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs">💾 Save Sale</button>
+                        <button
+                          onClick={() => fetch(`${NODE_API_BASE}/sold-cards`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...newSale, markInventorySold: true }) })
+                            .then((r) => r.json())
+                            .then((res) => {
+                              if (res && res.success) {
+                                const soldLabel = newSale.Player || newSale.SKU || 'Card';
+                                setSoldCards(res.rows || []);
+                                setShowRecordSaleForm(false);
+                                setNewSale({
+                                  Sale_Date: new Date().toISOString().slice(0, 10),
+                                  SKU: '', Set: '', Subset: 'Base', Card_Number: '', Player: '',
+                                  Platform: newSale.Platform || 'eBay', Sale_Price: '5.00', Shipping_Collected: '1.25',
+                                  Marketplace_Fees: '0.96', Shipping_Cost: '0.73', Seller_Paid_Shipping: false, Cost_Basis: '0.50', Notes: '',
+                                });
+                                refreshAllHubData();
+                                pushNotification('Sale Recorded', `Logged sale of ${soldLabel}.`, 'Sales', 'success');
+                              } else {
+                                pushNotification('Save Sale Failed', res?.error || 'Could not record sale.', 'Sales', 'error');
+                              }
+                            })
+                            .catch((e) => pushNotification('Save Sale Error', e.message, 'Sales', 'error'))}
+                          className="w-full py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
+                        >
+                          💾 Save Sale
+                        </button>
                       </div>
                     </div>
                   )}
@@ -7707,7 +7720,10 @@ export default function App() {
               <div className="flex-1 flex flex-col gap-3 min-h-0">
                 <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3 shrink-0`}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h2 className="text-sm font-bold text-white">🏆 5-Mode Set Completion Dashboard</h2>
+                    <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                      <span>🏆 5-Mode Set Completion Dashboard</span>
+                      {completionLoading && <span className="px-2 py-0.5 rounded-full bg-sky-950 border border-sky-600/70 text-sky-300 text-[10.5px] font-semibold animate-pulse">⏳ Calculating completion...</span>}
+                    </h2>
                     <div className="flex flex-wrap items-center gap-2">
                       <select value={completionSet} onChange={(e) => { setCompletionSet(e.target.value); setCompSubsetF('All Subsets'); }} className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5 text-xs">
                         {dynamicSetsNewestFirst.map((s) => <option key={s}>{s}</option>)}
@@ -7763,42 +7779,49 @@ export default function App() {
                       <button onClick={() => { setCompSubsetF('All Subsets'); setCompSearch(''); }} className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">🧹 Clear Filters</button>
                     </div>
                   </div>
-                  <div className="flex-1 min-h-0 overflow-auto border border-slate-800 rounded-xl">
-                    <table className="w-full text-left text-xs whitespace-nowrap">
-                      <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10"><tr><th className="p-2">Card #</th><th className="p-2">Player</th><th className="p-2">Subset</th><th className="p-2">Team</th><th className="p-2">Print Run</th><th className="p-2">Attributes</th></tr></thead>
-                      <tbody className="divide-y divide-slate-800">
-                        {(compTableView === 'missing' ? (completionData.missing || []) : (completionData.owned || []))
-                          .filter((r) => (compSubsetF === 'All Subsets' || r.Subset === compSubsetF) && (!compSearch.trim() || `${r['Card Number']} ${r.Player} ${r.Team} ${r.Subset}`.toLowerCase().includes(compSearch.toLowerCase())))
-                          .slice((compPage - 1) * compPageSize, compPage * compPageSize)
-                          .map((r, i) => (
-                            <tr key={i} className="hover:bg-slate-800/40">
-                              <td className="p-2 font-mono">#{r['Card Number']}</td>
-                              <td className="p-2 font-bold text-white">{r.Player}</td>
-                              <td className="p-2">{r.Subset}</td>
-                              <td className="p-2 text-slate-300">{r.Team}</td>
-                              <td className="p-2 font-mono text-amber-300">{r['Print Run'] ? `#/${r['Print Run']}` : '—'}</td>
-                              <td className="p-2"><AttributeBadges attributesStr={r.Attributes} glossary={chkData.glossary} /></td>
-                            </tr>
-                          ))}
-                      </tbody>
-                    </table>
-                  </div>
                   {(() => {
-                    const compFilteredCnt = (compTableView === 'missing' ? (completionData.missing || []) : (completionData.owned || []))
-                      .filter((r) => (compSubsetF === 'All Subsets' || r.Subset === compSubsetF) && (!compSearch.trim() || `${r['Card Number']} ${r.Player} ${r.Team} ${r.Subset}`.toLowerCase().includes(compSearch.toLowerCase()))).length;
+                    const compFiltered = (compTableView === 'missing' ? (completionData.missing || []) : (completionData.owned || []))
+                      .filter((r) => (compSubsetF === 'All Subsets' || r.Subset === compSubsetF) && (!compSearch.trim() || `${r['Card Number']} ${r.Player} ${r.Team} ${r.Subset}`.toLowerCase().includes(compSearch.toLowerCase())));
+                    const compFilteredCnt = compFiltered.length;
                     const totPages = Math.max(1, Math.ceil(compFilteredCnt / compPageSize));
+                    const safeCompP = Math.min(compPage, totPages);
                     return (
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 shrink-0">
-                        <span>Showing {compFilteredCnt === 0 ? 0 : ((compPage - 1) * compPageSize + 1).toLocaleString()}–{Math.min(compFilteredCnt, compPage * compPageSize).toLocaleString()} of {compFilteredCnt.toLocaleString()} cards</span>
-                        <div className="flex items-center gap-2">
-                          <select value={compPageSize} onChange={(e) => { setCompPageSize(parseInt(e.target.value, 10) || 250); setCompPage(1); }} className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs">
-                            <option value={100}>100 / page</option><option value={250}>250 / page</option><option value={500}>500 / page</option>
-                          </select>
-                          <button onClick={() => setCompPage((p) => Math.max(1, p - 1))} disabled={compPage <= 1} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
-                          <span className="font-mono text-white">Page {compPage} / {totPages}</span>
-                          <button onClick={() => setCompPage((p) => Math.min(totPages, p + 1))} disabled={compPage >= totPages} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
+                      <>
+                        <div className="flex-1 min-h-0 overflow-auto border border-slate-800 rounded-xl">
+                          <table className="w-full text-left text-xs whitespace-nowrap">
+                            <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10"><tr><th className="p-2">Card #</th><th className="p-2">Player</th><th className="p-2">Subset</th><th className="p-2">Team</th><th className="p-2">Print Run</th><th className="p-2">Attributes</th></tr></thead>
+                            <tbody className="divide-y divide-slate-800">
+                              {completionLoading && compFilteredCnt === 0 ? (
+                                <tr><td colSpan={6} className="p-6 text-center text-sky-300 font-semibold animate-pulse">⏳ Loading checklist &amp; inventory completion for {completionSet}...</td></tr>
+                              ) : (
+                                compFiltered
+                                  .slice((safeCompP - 1) * compPageSize, safeCompP * compPageSize)
+                                  .map((r, i) => (
+                                    <tr key={i} className="hover:bg-slate-800/40">
+                                      <td className="p-2 font-mono">#{r['Card Number']}</td>
+                                      <td className="p-2 font-bold text-white">{r.Player}</td>
+                                      <td className="p-2">{r.Subset}</td>
+                                      <td className="p-2 text-slate-300">{r.Team}</td>
+                                      <td className="p-2 font-mono text-amber-300">{r['Print Run'] ? `#/${r['Print Run']}` : '—'}</td>
+                                      <td className="p-2"><AttributeBadges attributesStr={r.Attributes} glossary={chkData.glossary} /></td>
+                                    </tr>
+                                  ))
+                              )}
+                            </tbody>
+                          </table>
                         </div>
-                      </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 shrink-0">
+                          <span>Showing {compFilteredCnt === 0 ? 0 : ((safeCompP - 1) * compPageSize + 1).toLocaleString()}–{Math.min(compFilteredCnt, safeCompP * compPageSize).toLocaleString()} of {compFilteredCnt.toLocaleString()} cards</span>
+                          <div className="flex items-center gap-2">
+                            <select value={compPageSize} onChange={(e) => { setCompPageSize(parseInt(e.target.value, 10) || 250); setCompPage(1); }} className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs">
+                              <option value={100}>100 / page</option><option value={250}>250 / page</option><option value={500}>500 / page</option>
+                            </select>
+                            <button onClick={() => setCompPage((p) => Math.max(1, Math.min(totPages, p) - 1))} disabled={safeCompP <= 1} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">◀ Prev</button>
+                            <span className="font-mono text-white">Page {safeCompP} / {totPages}</span>
+                            <button onClick={() => setCompPage((p) => Math.min(totPages, Math.min(totPages, p) + 1))} disabled={safeCompP >= totPages} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 font-semibold">Next ▶</button>
+                          </div>
+                        </div>
+                      </>
                     );
                   })()}
                 </div>
@@ -7819,7 +7842,10 @@ export default function App() {
                     <select value={plannerSet} onChange={(e) => { setPlannerSet(e.target.value); setPlannerSubset('All Subsets'); setPlannerPlayer(''); }} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">{dynamicSetsNewestFirst.map((s) => <option key={s}>{s}</option>)}</select>
                     <select value={plannerSubset} onChange={(e) => setPlannerSubset(e.target.value)} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs"><option>All Subsets</option>{(plannerData.subsets || []).slice(0, 300).map((sub) => <option key={sub}>{sub}</option>)}</select>
                     <input value={plannerPlayer} onChange={(e) => setPlannerPlayer(e.target.value)} placeholder="Player Rainbow..." className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs" />
-                    <input type="number" min="0" step="1" value={plannerMaxBudget} onChange={(e) => setPlannerMaxBudget(parseFloat(e.target.value) || 0)} placeholder="Max $/Card" className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs font-mono" />
+                    <label className="flex items-center gap-1.5 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1 text-xs">
+                      <span className="text-[10.5px] text-slate-400 shrink-0 font-semibold">Max $/Card</span>
+                      <input type="number" min="0" step="1" value={plannerMaxBudget} onChange={(e) => setPlannerMaxBudget(parseFloat(e.target.value) || 0)} placeholder="0 = Any" className="w-full min-w-0 bg-transparent text-xs font-mono text-white focus:outline-none" />
+                    </label>
                     <label className="flex items-center gap-1.5 text-xs text-slate-300 px-2"><input type="checkbox" checked={plannerExclSN} onChange={(e) => setPlannerExclSN(e.target.checked)} /> Excl. Limited #/N</label>
                     <button onClick={() => { setPlannerSubset('All Subsets'); setPlannerPlayer(''); setPlannerMaxBudget(0); setPlannerExclSN(false); }} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300">🧹 Clear Filters</button>
                   </div>
@@ -8100,7 +8126,7 @@ export default function App() {
             )}
 
             {/* 21. GENERAL SETTINGS — FULL-WIDTH DYNAMIC COLLAGE LAYOUT */}
-            {(activePage === 'general_settings' || activePage === 'scheduler' || activePage === 'developer_tools') && (() => {
+            {activePage === 'general_settings' && (() => {
               const modSpan = (key, defaultSpan) => {
                 const st = settingsLayout[key] || { collapsed: false, wide: false };
                 if (st.collapsed) return 'lg:col-span-4';
@@ -8213,7 +8239,7 @@ export default function App() {
                             <div className={settingsLayout.alerts?.wide ? 'md:col-span-1' : 'col-span-2'}><label className="block text-[10px] text-slate-400 mb-0.5">Recipient Email</label><input value={alertCfg.recipient_email || ''} onChange={(e) => setAlertCfg({ ...alertCfg, recipient_email: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5" /></div>
                           </div>
                           <div className="flex flex-wrap gap-2">
-                            <button onClick={() => fetch(`${NODE_API_BASE}/market/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'save_alert_settings', settings: alertCfg }) }).then(() => pushNotification('Alert Settings Saved', 'Saved Market Alert thresholds & delivery method.', 'Settings', 'success'))} className={`px-3 py-1.5 rounded-xl font-bold text-xs ${skin.accentBtn}`}>💾 Save Alert Settings</button>
+                            <button onClick={() => fetch(`${NODE_API_BASE}/market/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'save_alert_settings', settings: alertCfg }) }).then((r) => r.json()).then((res) => { if (res && res.success) { pushNotification('Alert Settings Saved', 'Saved Market Alert thresholds & delivery method.', 'Settings', 'success'); } else { pushNotification('Save Alert Settings Failed', res?.error || 'Could not save alert settings.', 'Settings', 'error'); } }).catch((e) => pushNotification('Save Alert Settings Error', e.message, 'Settings', 'error'))} className={`px-3 py-1.5 rounded-xl font-bold text-xs ${skin.accentBtn}`}>💾 Save Alert Settings</button>
                             <button onClick={() => fetch(`${NODE_API_BASE}/market/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'test_alert', settings: alertCfg }) }).then((r) => r.json()).then((res) => pushNotification(res.success ? 'Test Alert Sent' : 'Test Alert Notice', res.message || 'Done', 'Settings', res.success ? 'success' : 'warning'))} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold">🚀 Send Test Alert</button>
                           </div>
                         </div>
@@ -8256,7 +8282,25 @@ export default function App() {
                               >
                                 ➕ Add
                               </button>
-                              <button onClick={() => fetch(`${NODE_API_BASE}/schedules`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedules) }).then((r) => r.json()).then((res) => { if (res.schedules) setSchedules(res.schedules); pushNotification('Schedules Saved', 'Synced schedules with Windows Task Scheduler.', 'Scheduler', 'success'); })} className={`px-2.5 py-1 rounded-lg font-bold text-[11px] ${skin.accentBtn}`}>💾 Sync</button>
+                              <button
+                                onClick={() => fetch(`${NODE_API_BASE}/schedules`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(schedules) })
+                                  .then((r) => r.json())
+                                  .then((res) => {
+                                    if (res && res.schedules) setSchedules(res.schedules);
+                                    const msgs = Array.isArray(res?.messages) ? res.messages : [];
+                                    const hasWarn = msgs.some((m) => String(m).includes('⚠️') || /fail|error/i.test(String(m)));
+                                    pushNotification(
+                                      hasWarn ? 'Schedules Synced with Warnings' : 'Schedules Saved',
+                                      msgs.length > 0 ? msgs.join(' | ') : 'Synced schedules with Windows Task Scheduler.',
+                                      'Scheduler',
+                                      hasWarn ? 'warning' : 'success'
+                                    );
+                                  })
+                                  .catch((e) => pushNotification('Schedule Sync Error', e.message, 'Scheduler', 'error'))}
+                                className={`px-2.5 py-1 rounded-lg font-bold text-[11px] ${skin.accentBtn}`}
+                              >
+                                💾 Sync
+                              </button>
                             </div>
                           )
                         }
@@ -9044,7 +9088,23 @@ export default function App() {
               </div>
               {setCart.length > 0 && (
                 <div className="space-y-1.5">
-                  <button onClick={() => fetch(`${NODE_API_BASE}/config/set-cart`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'commit', cart: setCart }) }).then(() => { setSetCart([]); setShowCartSidebar(false); refreshAllHubData(); pushNotification('Set Cart Committed', 'Added all staged sets to tracked_sets.json.', 'Set Browser', 'success'); })} className="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs">
+                  <button
+                    onClick={() => fetch(`${NODE_API_BASE}/config/set-cart`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'commit', cart: setCart }) })
+                      .then((r) => r.json())
+                      .then((res) => {
+                        if (res && res.success) {
+                          setSetCart([]);
+                          setShowCartSidebar(false);
+                          setTrackedSetsDirty(false);
+                          refreshAllHubData();
+                          pushNotification('Set Cart Committed', `Added ${res.committedCount ?? setCart.length} staged set(s) to tracked_sets.json.`, 'Set Browser', 'success');
+                        } else {
+                          pushNotification('Commit Cart Failed', res?.error || 'Could not commit set cart.', 'Set Browser', 'error');
+                        }
+                      })
+                      .catch((e) => pushNotification('Commit Cart Error', e.message, 'Set Browser', 'error'))}
+                    className="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
+                  >
                     ✅ Commit {setCart.length} Set(s) to Tracked Queue
                   </button>
                   <button
