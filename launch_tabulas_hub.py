@@ -2240,12 +2240,17 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
         if route == "/api/scraper/plan-preview" and isinstance(payload, dict):
             from Core.scraper_engine import build_scraper_execution_plan
-            plan = build_scraper_execution_plan(
+            res = build_scraper_execution_plan(
                 target_queue=payload.get("target_queue") or None,
                 mode_key=str(payload.get("mode") or "checklist_only"),
                 force_refresh=bool(payload.get("force_refresh", False)),
+                all_modes=True,
             )
-            self._send_json({"success": True, "plan": plan})
+            self._send_json({
+                "success": True,
+                "plan": res["plan"],
+                "plans_by_mode": res["plans_by_mode"],
+            })
             return
 
         if route == "/api/notifications" and isinstance(payload, dict):

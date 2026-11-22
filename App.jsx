@@ -2039,12 +2039,14 @@ export default function App() {
   const [cleanSlateChecklists, setCleanSlateChecklists] = useState(false);
   const [forceFullReverify, setForceFullReverify] = useState(false);
   const [planPreview, setPlanPreview] = useState(null);
+  const [plansByMode, setPlansByMode] = useState(null);
   const [planPreviewLoading, setPlanPreviewLoading] = useState(false);
   const [planPreviewMode, setPlanPreviewMode] = useState('checklist_only');
   const [showMaintenanceWidget, setShowMaintenanceWidget] = useState(false);
 
-  const fetchScraperPlanPreview = (modeKey, targetMap) => {
+  const fetchScraperPlanPreview = (modeKey, targetMap, forceRefreshOverride) => {
     const useMode = modeKey || planPreviewMode || 'checklist_only';
+    const useForce = typeof forceRefreshOverride === 'boolean' ? forceRefreshOverride : forceFullReverify;
     setPlanPreviewMode(useMode);
     setPlanPreviewLoading(true);
     fetch(`${NODE_API_BASE}/scraper/plan-preview`, {
@@ -2053,17 +2055,31 @@ export default function App() {
       body: JSON.stringify({
         mode: useMode,
         target_queue: targetMap || null,
-        force_refresh: forceFullReverify,
+        force_refresh: useForce,
       }),
     })
       .then((r) => r.json())
       .then((res) => {
-        if (res && res.success && res.plan) {
-          setPlanPreview(res.plan);
+        if (res && res.success) {
+          if (res.plans_by_mode && typeof res.plans_by_mode === 'object') {
+            setPlansByMode(res.plans_by_mode);
+            setPlanPreview(res.plans_by_mode[useMode] || res.plan || null);
+          } else if (res.plan) {
+            setPlanPreview(res.plan);
+          }
         }
       })
       .catch(() => {})
       .finally(() => setPlanPreviewLoading(false));
+  };
+
+  const selectPlanPreviewMode = (mk, targetMap) => {
+    setPlanPreviewMode(mk);
+    if (plansByMode && plansByMode[mk]) {
+      setPlanPreview(plansByMode[mk]);
+      return;
+    }
+    fetchScraperPlanPreview(mk, targetMap);
   };
 
   const [dirSearch, setDirSearch] = useState('');
@@ -7206,7 +7222,17 @@ export default function App() {
                           🧹 Clean-Slate Build (Archive existing CSVs in Checklists\ before building)
                         </label>
                         <label className="flex items-center gap-2 text-xs text-slate-300">
-                          <input type="checkbox" checked={forceFullReverify} onChange={(e) => setForceFullReverify(e.target.checked)} />
+                          <input
+                            type="checkbox"
+                            checked={forceFullReverify}
+                            onChange={(e) => {
+                              const nextVal = e.target.checked;
+                              setForceFullReverify(nextVal);
+                              if (planPreview) {
+                                fetchScraperPlanPreview(planPreviewMode, targetScraperQueueMap, nextVal);
+                              }
+                            }}
+                          />
                           🔄 Force Full Re-Verify (Ignore Incremental Checkpoints)
                         </label>
                       </div>
@@ -7235,8 +7261,16 @@ export default function App() {
                         🔎 Missing Backs ({scopeLbl})
                       </button>
                     </div>
-                    {planPreview && (
-                      <div className="p-3 rounded-xl bg-slate-950/90 border border-sky-500/40 space-y-2.5 text-xs">
+                    {(planPreview || planPreviewLoading) && (
+                      <div className="relative p-3 rounded-xl bg-slate-950/90 border border-sky-500/40 space-y-2.5 text-xs overflow-hidden">
+                        {planPreviewLoading && (
+                          <div className="absolute inset-0 z-10 bg-slate-950/80 backdrop-blur-[1px] flex items-center justify-center gap-2.5">
+                            <span className="inline-block w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
+                            <span className="text-sky-200 font-bold text-xs">Computing execution plan across tracked sets...</span>
+                          </div>
+                        )}
+                        {planPreview && (
+                          <>
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-extrabold text-sky-300">📋 Execution Preview ({planPreview.total_sets} set{planPreview.total_sets === 1 ? '' : 's'}):</span>
@@ -7249,7 +7283,7 @@ export default function App() {
                             ].map(([mk, ml]) => (
                               <button
                                 key={mk}
-                                onClick={() => fetchScraperPlanPreview(mk, targetScraperQueueMap)}
+                                onClick={() => selectPlanPreviewMode(mk, targetScraperQueueMap)}
                                 className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold border ${planPreview.mode === mk ? 'bg-sky-600 text-white border-sky-400' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
                               >
                                 {ml}
@@ -7308,6 +7342,8 @@ export default function App() {
                               </tbody>
                             </table>
                           </div>
+                        )}
+                          </>
                         )}
                       </div>
                     )}

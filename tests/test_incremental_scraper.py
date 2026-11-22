@@ -98,6 +98,7 @@ class IncrementalScraperTests(unittest.TestCase):
         self.cfg = cfg
         self.se = se
         self.rl = rl
+        se._PLAN_SET_STATS_CACHE.clear()
 
         # Redirect module-level paths in config, rate_learner, and scraper_engine to isolated temp dirs
         self.set_checklists_dir = self.root / "Data" / "Checklists_and_Resources" / "Set_Checklists"
@@ -383,6 +384,50 @@ class IncrementalScraperTests(unittest.TestCase):
         self.assertEqual(plan["missing_front_images_queued"], 1)
         self.assertEqual(plan["missing_back_images_queued"], 0)
         self.assertGreater(plan["estimated_http_requests"], 0)
+
+    def test_plan_all_modes_single_pass_and_mtime_cache_invalidation(self):
+        """build_scraper_execution_plan(all_modes=True) returns all 5 modes in 1 pass and caches by file mtime/size."""
+        folder = "2024_Cache_Set"
+        set_name = "2024 Cache Set"
+        set_url = "https://www.tcdb.com/ViewSet.cfm/sid/101/2024-Cache-Set"
+        self.se.save_all_tracked_sets({set_url: {"folder_name": folder, "priority": 1}})
+
+        csv_p = self.set_checklists_dir / f"{folder}.csv"
+        rows_base = [{"Set": set_name, "Subset": "Base", "Card Number": "1", "Player": "P1", "Team": "T", "Print Run": "", "Attributes": "", "TCDB_CID": "9001", "Front_Downloaded": "No", "Back_Downloaded": "No", "TCDB_Image_Status": "Front & Back on TCDB"}]
+        pd.DataFrame(rows_base).to_csv(csv_p, index=False, encoding="utf-8-sig")
+        self.se.save_catalog(folder, {
+            "Base": {
+                "9001": {
+                    "cid": "9001", "card_number": "1", "player": "P1",
+                    "front_file": "9001_F.jpg", "back_file": "9001_B.jpg",
+                    "url_rep_front": "https://www.tcdb.com/Images/Large/9001RepFr.jpg",
+                    "url_std_front": "https://www.tcdb.com/Images/Large/9001Fr.jpg",
+                    "url_rep_back": "https://www.tcdb.com/Images/Large/9001RepBk.jpg",
+                    "url_std_back": "https://www.tcdb.com/Images/Large/9001Bk.jpg",
+                    "front_tier_hint": "R", "back_tier_hint": "R",
+                }
+            }
+        })
+
+        res1 = self.se.build_scraper_execution_plan(target_queue={set_url: folder}, mode_key="checklist_only", all_modes=True)
+        pbm = res1["plans_by_mode"]
+        for mk in ("checklist_only", "checklist_and_images", "images_only", "upgrade", "image_update", "missing_back"):
+            self.assertIn(mk, pbm)
+        self.assertEqual(pbm["checklist_only"]["subsets_unchanged_skipped"], 1)
+        self.assertEqual(pbm["checklist_and_images"]["missing_front_images_queued"], 1)
+        self.assertEqual(pbm["checklist_and_images"]["missing_back_images_queued"], 1)
+        self.assertEqual(pbm["images_only"]["missing_images_queued"], 2)
+
+        # Second call with unchanged files MUST hit mtime/size cache (0 CSV re-parses)
+        with mock.patch.object(self.se, "_fast_scan_set_csv_for_plan", side_effect=AssertionError("Should hit mtime cache!")) as _:
+            res2 = self.se.build_scraper_execution_plan(target_queue={set_url: folder}, mode_key="images_only", all_modes=True)
+        self.assertEqual(res2["plan"]["missing_images_queued"], 2)
+
+        # Modify CSV (new subset row + different size/mtime) -> cache must invalidate and re-scan
+        rows_updated = rows_base + [{"Set": set_name, "Subset": "Inserts", "Card Number": "1", "Player": "P2", "Team": "T", "Print Run": "", "Attributes": "", "TCDB_CID": "9002", "Front_Downloaded": "No", "Back_Downloaded": "No", "TCDB_Image_Status": "No Image on TCDB"}]
+        pd.DataFrame(rows_updated).to_csv(csv_p, index=False, encoding="utf-8-sig")
+        res3 = self.se.build_scraper_execution_plan(target_queue={set_url: folder}, mode_key="checklist_only", all_modes=True)
+        self.assertEqual(res3["plans_by_mode"]["checklist_only"]["subsets_unchanged_skipped"], 2)
 
 
 if __name__ == "__main__":

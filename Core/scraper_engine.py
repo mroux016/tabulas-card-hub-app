@@ -4,6 +4,7 @@ from __future__ import annotations
 # & TEMPLATE SCRAPER (WITH TCDB_CID, FULL FRONT/BACK DOWNLOAD & LIBRARY STATUS)
 # ==============================================================================
 import asyncio
+import csv
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime
@@ -5179,190 +5181,433 @@ def _format_eta_compact(seconds: float) -> str:
     return f"{hrs}h {rem_m}m" if rem_m else f"{hrs}h"
 
 
+_PLAN_CACHE_LOCK = threading.RLock()
+_PLAN_SET_STATS_CACHE: dict[tuple, dict] = {}
+_PLAN_MODES_CANON = ("checklist_only", "checklist_and_images", "images_only", "upgrade", "missing_back")
+
+
+def _stat_mtime_size(path: Optional[Path]) -> tuple[float, int]:
+    if path is None:
+        return 0.0, 0
+    try:
+        st = path.stat()
+        return float(st.st_mtime), int(st.st_size)
+    except Exception:
+        return 0.0, 0
+
+
+def _fast_index_set_dir_by_cid_scandir(set_dir: Path) -> tuple[set[tuple[str, str]], set[str]]:
+    """
+    Uses `os.scandir()` (zero `Path.glob()`/`rglob()` overhead) to index all `.jpg`
+    reference images in `set_dir` into `(cid_side_set, filename_set)`.
+    """
+    cid_side_set: set[tuple[str, str]] = set()
+    filenames_set: set[str] = set()
+    try:
+        with os.scandir(set_dir) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                if not name.lower().endswith(".jpg"):
+                    continue
+                filenames_set.add(name)
+                parsed = parse_unified_card_filename(name)
+                if parsed and parsed.get("is_template") and parsed.get("cid"):
+                    cid_side_set.add((normalize_numeric_tcdb_cid(parsed["cid"]), str(parsed.get("side") or "F").upper()))
+    except Exception:
+        pass
+    return cid_side_set, filenames_set
+
+
+def _fast_scan_set_csv_for_plan(csv_path: Optional[Path]) -> dict[str, dict]:
+    """
+    Lightweight `csv.reader` streamer (no `pandas.read_csv` overhead) that scans
+    `Set_Checklists/*.csv` once and returns per-subset counts, populated CID counts,
+    and canonical `rows_sha256` matching `compute_subset_rows_checksum()`.
+    """
+    if csv_path is None or not csv_path.exists():
+        return {}
+    by_key: dict[str, dict] = {}
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header:
+                return {}
+            col_idx = {str(h).strip(): i for i, h in enumerate(header)}
+            idx_sub = col_idx.get("Subset")
+            if idx_sub is None:
+                return {}
+            idx_cnum = col_idx.get("Card Number")
+            idx_plr = col_idx.get("Player")
+            idx_cid = col_idx.get("TCDB_CID")
+
+            for row in reader:
+                if not row or idx_sub >= len(row):
+                    continue
+                sub_disp = str(row[idx_sub] or "Base").strip() or "Base"
+                sk = canonical_subset_key(sub_disp)
+                cnum = str(row[idx_cnum] if idx_cnum is not None and idx_cnum < len(row) else "").strip().lstrip("#")
+                cid = str(row[idx_cid] if idx_cid is not None and idx_cid < len(row) else "").strip()
+                if cid == "0":
+                    cid = ""
+                plr = str(row[idx_plr] if idx_plr is not None and idx_plr < len(row) else "").strip()
+
+                bucket = by_key.get(sk)
+                if bucket is None:
+                    bucket = {"count": 0, "populated_cids": 0, "tuples": []}
+                    by_key[sk] = bucket
+                bucket["count"] += 1
+                if cid and cid not in ("nan", "None"):
+                    bucket["populated_cids"] += 1
+                bucket["tuples"].append((cnum, cid, plr, sk))
+    except Exception:
+        return {}
+
+    for bucket in by_key.values():
+        t_list = bucket.pop("tuples", [])
+        t_list.sort()
+        payload = json.dumps(t_list, separators=(",", ":"), ensure_ascii=False)
+        bucket["rows_sha256"] = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return by_key
+
+
+def _resolve_plan_file_paths(chk_title: str, folder_name: str) -> tuple[Optional[Path], Optional[Path], Optional[Path], Path]:
+    csv_p = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(chk_title)}.csv"
+    if not csv_p.exists() and folder_name:
+        alt_csv = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(folder_name)}.csv"
+        csv_p = alt_csv if alt_csv.exists() else None
+    elif not csv_p.exists():
+        csv_p = None
+
+    cp_p = checkpoint_file_path(chk_title)
+    if not cp_p.exists() and folder_name:
+        alt_cp = checkpoint_file_path(folder_name)
+        cp_p = alt_cp if alt_cp.exists() else None
+    elif not cp_p.exists():
+        cp_p = None
+
+    cat_fname = f"{sanitize_filename_part(folder_name)}_catalog.json"
+    cat_p: Optional[Path] = None
+    for cand_dir in (_catalog_dir(), SET_LIBRARY_CACHE_DIR):
+        cand = cand_dir / cat_fname
+        if cand.exists():
+            cat_p = cand
+            break
+
+    set_dir = REFERENCE_TEMPLATES_DIR / sanitize_filename_part(folder_name)
+    return csv_p, cp_p, cat_p, set_dir
+
+
+def _compute_set_plan_metrics_cached(
+    set_url: str,
+    folder_name: str,
+    chk_title: str,
+    dead_backs: dict[str, float],
+    dead_fronts: dict[str, float],
+    dead_backs_mtime: float,
+    dead_fronts_mtime: float,
+    force_refresh: bool,
+) -> dict:
+    """
+    Scans a single set's CSV, checkpoint JSON, catalog JSON, and Reference_Library folder
+    ONCE and computes per-set metrics for all 5 modes (`checklist_only`, `checklist_and_images`,
+    `images_only`, `upgrade`, `missing_back`), caching the result by file mtimes & sizes.
+    """
+    csv_p, cp_p, cat_p, set_dir = _resolve_plan_file_paths(chk_title, folder_name)
+    csv_mt, csv_sz = _stat_mtime_size(csv_p)
+    cp_mt, _ = _stat_mtime_size(cp_p)
+    cat_mt, _ = _stat_mtime_size(cat_p)
+    ref_mt, _ = _stat_mtime_size(set_dir if set_dir.exists() else None)
+
+    cache_key = (
+        folder_name,
+        chk_title,
+        csv_mt,
+        csv_sz,
+        cp_mt,
+        cat_mt,
+        ref_mt,
+        dead_backs_mtime,
+        dead_fronts_mtime,
+        bool(force_refresh),
+    )
+    with _PLAN_CACHE_LOCK:
+        cached = _PLAN_SET_STATS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    cp = {} if force_refresh else load_set_checkpoint(chk_title, alt_folder_name=folder_name)
+    cp_subsets = cp.get("subsets") if isinstance(cp.get("subsets"), dict) else {}
+    csv_by_key = _fast_scan_set_csv_for_plan(csv_p)
+    catalog = load_catalog(folder_name)
+    disk_cid_side, disk_names = _fast_index_set_dir_by_cid_scandir(set_dir)
+
+    complete_keys: set[str] = set()
+    if not force_refresh:
+        for cp_ent in cp_subsets.values():
+            if not isinstance(cp_ent, dict):
+                continue
+            sk = canonical_subset_key(str(cp_ent.get("subset_name") or ""))
+            loc_info = csv_by_key.get(sk)
+            exp_c = int(cp_ent.get("expected_cards") or 0)
+            if (
+                loc_info
+                and cp_ent.get("status") == "complete"
+                and (exp_c <= 0 or loc_info["count"] == exp_c)
+                and loc_info["rows_sha256"] == cp_ent.get("rows_sha256")
+            ):
+                complete_keys.add(sk)
+
+        for sk, loc_info in csv_by_key.items():
+            if sk in complete_keys or loc_info["count"] <= 0:
+                continue
+            if loc_info["populated_cids"] > 0 and loc_info["populated_cids"] >= int(loc_info["count"] * 0.95):
+                complete_keys.add(sk)
+
+    all_known_keys = set(csv_by_key.keys()) | {
+        canonical_subset_key(str(k)) for k in catalog.keys() if isinstance(catalog.get(k), dict)
+    }
+
+    if not all_known_keys:
+        chk_skip_subs = 0
+        chk_upd_subs = 1
+        chk_reqs = 3
+    else:
+        chk_skip_subs = len(complete_keys)
+        chk_upd_subs = max(0, len(all_known_keys) - len(complete_keys))
+        chk_reqs = 1 + (chk_upd_subs * 2) + (1 if force_refresh else 0)
+
+    # Single pass over catalog to accumulate image stats for all image-aware modes
+    img_disk_ok = 0
+    ci_miss_f = 0
+    ci_miss_b = 0
+    ci_dead_skip = 0
+    ci_img_reqs = 0
+    mb_miss_b = 0
+    mb_dead_skip = 0
+    mb_reqs = 0
+    upg_s_fronts = 0
+    upg_s_backs = 0
+    upg_s_subsets = 0
+
+    for _, cards_d in catalog.items():
+        if not isinstance(cards_d, dict):
+            continue
+        sub_has_s_tier = False
+        for cid, ent in cards_d.items():
+            if str(cid).startswith("_") or not isinstance(ent, dict):
+                continue
+            cid_n = normalize_numeric_tcdb_cid(cid)
+            f_file = str(ent.get("front_file") or "")
+            b_file = str(ent.get("back_file") or "")
+            has_f_disk = (cid_n, "F") in disk_cid_side or (f_file and f_file in disk_names)
+            has_b_disk = (cid_n, "B") in disk_cid_side or (b_file and b_file in disk_names)
+            has_f_url = bool(ent.get("url_rep_front") or ent.get("url_std_front"))
+            has_b_url = bool(ent.get("url_rep_back") or ent.get("url_std_back"))
+
+            if has_f_disk:
+                img_disk_ok += 1
+            if has_b_disk:
+                img_disk_ok += 1
+
+            is_dead_f = cid_n in dead_fronts or str(cid) in dead_fronts
+            is_dead_b = cid_n in dead_backs or str(cid) in dead_backs
+
+            if has_f_url and not has_f_disk:
+                if is_dead_f:
+                    ci_dead_skip += 1
+                else:
+                    ci_miss_f += 1
+                    ci_img_reqs += 1 if (ent.get("front_tier_hint") or ent.get("front_thumb")) else 2
+            if (has_f_disk or (has_f_url and not is_dead_f)) and has_b_url and not has_b_disk:
+                if is_dead_b:
+                    ci_dead_skip += 1
+                else:
+                    ci_miss_b += 1
+                    ci_img_reqs += 1 if (ent.get("back_tier_hint") or ent.get("back_thumb")) else 2
+
+            if has_f_disk and not has_b_disk and has_b_url:
+                if is_dead_b:
+                    mb_dead_skip += 1
+                else:
+                    mb_miss_b += 1
+                    mb_reqs += 1 if (ent.get("back_tier_hint") or ent.get("back_thumb")) else 2
+
+            for s_key in ("front", "back"):
+                s_meta = ent.get(s_key)
+                if isinstance(s_meta, dict) and s_meta.get("quality") == "S":
+                    sub_has_s_tier = True
+                    if s_key == "front":
+                        upg_s_fronts += 1
+                    else:
+                        upg_s_backs += 1
+        if sub_has_s_tier:
+            upg_s_subsets += 1
+
+    per_mode = {
+        "checklist_only": {
+            "subsets_skipped": chk_skip_subs,
+            "subsets_to_update": chk_upd_subs,
+            "missing_fronts": 0,
+            "missing_backs": 0,
+            "already_on_disk": img_disk_ok,
+            "dead_cached_skipped": 0,
+            "estimated_requests": chk_reqs,
+        },
+        "checklist_and_images": {
+            "subsets_skipped": chk_skip_subs,
+            "subsets_to_update": chk_upd_subs,
+            "missing_fronts": ci_miss_f,
+            "missing_backs": ci_miss_b,
+            "already_on_disk": img_disk_ok,
+            "dead_cached_skipped": ci_dead_skip,
+            "estimated_requests": chk_reqs + ci_img_reqs,
+        },
+        "images_only": {
+            "subsets_skipped": 0,
+            "subsets_to_update": 0,
+            "missing_fronts": ci_miss_f,
+            "missing_backs": ci_miss_b,
+            "already_on_disk": img_disk_ok,
+            "dead_cached_skipped": ci_dead_skip,
+            "estimated_requests": ci_img_reqs,
+        },
+        "upgrade": {
+            "subsets_skipped": max(0, len(all_known_keys) - upg_s_subsets),
+            "subsets_to_update": upg_s_subsets,
+            "missing_fronts": upg_s_fronts,
+            "missing_backs": upg_s_backs,
+            "already_on_disk": img_disk_ok,
+            "dead_cached_skipped": 0,
+            "estimated_requests": upg_s_subsets * 2,
+        },
+        "missing_back": {
+            "subsets_skipped": 0,
+            "subsets_to_update": 0,
+            "missing_fronts": 0,
+            "missing_backs": mb_miss_b,
+            "already_on_disk": img_disk_ok,
+            "dead_cached_skipped": mb_dead_skip,
+            "estimated_requests": mb_reqs,
+        },
+    }
+    res_obj = {
+        "set_url": set_url,
+        "folder_name": folder_name,
+        "set_name": chk_title,
+        "per_mode": per_mode,
+    }
+    with _PLAN_CACHE_LOCK:
+        if len(_PLAN_SET_STATS_CACHE) >= 500:
+            _PLAN_SET_STATS_CACHE.clear()
+        _PLAN_SET_STATS_CACHE[cache_key] = res_obj
+    return res_obj
+
+
 def build_scraper_execution_plan(
     target_queue: Optional[dict[str, str]] = None,
     mode_key: str = "checklist_only",
     force_refresh: bool = False,
+    all_modes: bool = False,
 ) -> dict:
     """
-    Purely local dry-run execution planner (0 TCDB HTTP requests, <1s):
-    Inspects `Set_Checklists/*.csv`, `<set>_checkpoint.json`, `<set>_catalog.json`,
-    `Reference_Library` images on disk, `dead_backs_cache`, `dead_fronts_cache`,
-    and `AdaptiveRateLearner` pacing to preview exact skip/update/download counts & ETA.
+    Purely local single-pass dry-run execution planner (0 TCDB HTTP requests):
+    Inspects `Set_Checklists/*.csv` (via `csv.reader`), `<set>_checkpoint.json`,
+    `<set>_catalog.json`, `Reference_Library` images (via `os.scandir()`),
+    `dead_backs_cache`, `dead_fronts_cache`, and `AdaptiveRateLearner` pacing once per set
+    using an mtime/size-keyed in-memory cache.
+    When `all_modes=True`, returns `{"plan": selected_plan, "plans_by_mode": {...}}`
+    for instant zero-API mode-tab switching in the UI.
     """
     ensure_directories()
     meta_map = load_tracked_sets_meta(prioritize=True)
     queue = target_queue or {u: m["folder_name"] for u, m in meta_map.items()}
     dead_backs = load_dead_backs_cache()
     dead_fronts = load_dead_fronts_cache()
+    db_mt, _ = _stat_mtime_size(DEAD_BACKS_CACHE_FILE if DEAD_BACKS_CACHE_FILE.exists() else None)
+    df_mt, _ = _stat_mtime_size(DEAD_FRONTS_CACHE_FILE if DEAD_FRONTS_CACHE_FILE.exists() else None)
     learner = get_rate_learner()
     tcdb_ep = (learner._state.get("endpoints") or {}).get("tcdb_domain") or {}
     safe_rpm = max(8.0, float(tcdb_ep.get("safe_rpm", 23.5) or 23.5))
 
-    subsets_unchanged_skipped = 0
-    subsets_to_update = 0
-    missing_fronts_total = 0
-    missing_backs_total = 0
-    already_on_disk_total = 0
-    skipped_dead_total = 0
-    est_http_requests_total = 0
-    per_set: list[dict] = []
+    agg = {
+        mk: {
+            "subsets_unchanged_skipped": 0,
+            "subsets_to_update": 0,
+            "missing_front_images_queued": 0,
+            "missing_back_images_queued": 0,
+            "already_on_disk_images": 0,
+            "skipped_dead_cached": 0,
+            "estimated_http_requests": 0,
+            "per_set": [],
+        }
+        for mk in _PLAN_MODES_CANON
+    }
 
     for set_url, folder_name in queue.items():
         chk_title = canonicalize_checklist_set_title(folder_name.replace("_", " ").strip())
-        cp = {} if force_refresh else load_set_checkpoint(chk_title, alt_folder_name=folder_name)
-        cp_subsets = cp.get("subsets") if isinstance(cp.get("subsets"), dict) else {}
-        local_rows_by_key, names_by_key, _ = _load_local_set_csv_rows_by_subset(chk_title, folder_name=folder_name)
-        catalog = load_catalog(folder_name)
-        set_dir = REFERENCE_TEMPLATES_DIR / sanitize_filename_part(folder_name)
-        disk_idx = _index_existing_set_dir_by_cid(set_dir)
+        set_data = _compute_set_plan_metrics_cached(
+            set_url, folder_name, chk_title,
+            dead_backs, dead_fronts, db_mt, df_mt, force_refresh,
+        )
+        for mk in _PLAN_MODES_CANON:
+            m = set_data["per_mode"][mk]
+            a = agg[mk]
+            a["subsets_unchanged_skipped"] += m["subsets_skipped"]
+            a["subsets_to_update"] += m["subsets_to_update"]
+            a["missing_front_images_queued"] += m["missing_fronts"]
+            a["missing_back_images_queued"] += m["missing_backs"]
+            a["already_on_disk_images"] += m["already_on_disk"]
+            a["skipped_dead_cached"] += m["dead_cached_skipped"]
+            a["estimated_http_requests"] += m["estimated_requests"]
+            set_eta_s = (m["estimated_requests"] / safe_rpm) * 60.0 if m["estimated_requests"] > 0 else 0.0
+            a["per_set"].append({
+                "set_url": set_url,
+                "folder_name": folder_name,
+                "set_name": chk_title,
+                "subsets_skipped": m["subsets_skipped"],
+                "subsets_to_update": m["subsets_to_update"],
+                "missing_fronts": m["missing_fronts"],
+                "missing_backs": m["missing_backs"],
+                "already_on_disk": m["already_on_disk"],
+                "dead_cached_skipped": m["dead_cached_skipped"],
+                "estimated_requests": m["estimated_requests"],
+                "estimated_eta_seconds": int(round(set_eta_s)),
+                "estimated_eta_display": _format_eta_compact(set_eta_s),
+                "status": "Up to date" if (m["subsets_to_update"] == 0 and m["missing_fronts"] == 0 and m["missing_backs"] == 0) else "Pending work",
+            })
 
-        set_skip_subs = 0
-        set_upd_subs = 0
-        set_miss_f = 0
-        set_miss_b = 0
-        set_disk_ok = 0
-        set_dead_skip = 0
-        set_reqs = 0
-
-        # Evaluate known subsets from checkpoint + local CSV
-        complete_keys: set[str] = set()
-        for cp_ent in cp_subsets.values():
-            if not isinstance(cp_ent, dict):
-                continue
-            sk = canonical_subset_key(str(cp_ent.get("subset_name") or ""))
-            loc_rows = local_rows_by_key.get(sk, [])
-            exp_c = int(cp_ent.get("expected_cards") or 0)
-            if (
-                not force_refresh
-                and cp_ent.get("status") == "complete"
-                and loc_rows
-                and (exp_c <= 0 or len(loc_rows) == exp_c)
-                and compute_subset_rows_checksum(loc_rows) == cp_ent.get("rows_sha256")
-            ):
-                complete_keys.add(sk)
-
-        # Also count CSV-bootstrappable subsets when checkpoint is missing/partial
-        if not force_refresh:
-            for sk, loc_rows in local_rows_by_key.items():
-                if sk in complete_keys or not loc_rows:
-                    continue
-                pop_cids = sum(1 for r in loc_rows if str(r.get("TCDB_CID") or "").strip() not in ("", "0", "nan", "None"))
-                if pop_cids > 0 and pop_cids >= int(len(loc_rows) * 0.95):
-                    complete_keys.add(sk)
-
-        all_known_keys = set(local_rows_by_key.keys()) | {
-            canonical_subset_key(str(k)) for k in catalog.keys() if isinstance(catalog.get(k), dict)
+    plans_by_mode: dict[str, dict] = {}
+    for mk in _PLAN_MODES_CANON:
+        a = agg[mk]
+        reqs = a["estimated_http_requests"]
+        total_eta_s = (reqs / safe_rpm) * 60.0 if reqs > 0 else 0.0
+        plans_by_mode[mk] = {
+            "mode": mk,
+            "force_refresh": bool(force_refresh),
+            "total_sets": len(queue),
+            "subsets_unchanged_skipped": a["subsets_unchanged_skipped"],
+            "subsets_to_update": a["subsets_to_update"],
+            "missing_front_images_queued": a["missing_front_images_queued"],
+            "missing_back_images_queued": a["missing_back_images_queued"],
+            "missing_images_queued": a["missing_front_images_queued"] + a["missing_back_images_queued"],
+            "already_on_disk_images": a["already_on_disk_images"],
+            "skipped_dead_cached": a["skipped_dead_cached"],
+            "estimated_http_requests": reqs,
+            "safe_rpm": round(safe_rpm, 1),
+            "estimated_eta_seconds": int(round(total_eta_s)),
+            "estimated_eta_display": _format_eta_compact(total_eta_s),
+            "per_set": a["per_set"],
         }
+    plans_by_mode["image_update"] = plans_by_mode["upgrade"]
 
-        if mode_key in ("checklist_only", "checklist_and_images"):
-            if not all_known_keys:
-                # Brand-new set not yet scraped locally -> estimate 1 Base + Inserts index
-                set_upd_subs = 1
-                set_reqs += 3
-            else:
-                set_skip_subs = len(complete_keys)
-                set_upd_subs = max(0, len(all_known_keys) - len(complete_keys))
-                # 1 Inserts.cfm check per set + ~1-2 pages per subset to update
-                set_reqs += 1 + (set_upd_subs * 2)
-                if force_refresh:
-                    set_reqs += 1
-
-        if mode_key in ("checklist_and_images", "images_only", "missing_back", "upgrade"):
-            for sub_n, cards_d in catalog.items():
-                if not isinstance(cards_d, dict):
-                    continue
-                sub_has_s_tier = False
-                for cid, ent in cards_d.items():
-                    if str(cid).startswith("_") or not isinstance(ent, dict):
-                        continue
-                    cid_n = normalize_numeric_tcdb_cid(cid)
-                    f_file = str(ent.get("front_file") or "")
-                    b_file = str(ent.get("back_file") or "")
-                    has_f_disk = (cid_n, "F") in disk_idx or (f_file and (set_dir / f_file).exists())
-                    has_b_disk = (cid_n, "B") in disk_idx or (b_file and (set_dir / b_file).exists())
-                    has_f_url = bool(ent.get("url_rep_front") or ent.get("url_std_front"))
-                    has_b_url = bool(ent.get("url_rep_back") or ent.get("url_std_back"))
-
-                    if has_f_disk:
-                        set_disk_ok += 1
-                    if has_b_disk:
-                        set_disk_ok += 1
-
-                    if mode_key in ("checklist_and_images", "images_only"):
-                        if has_f_url and not has_f_disk:
-                            if cid_n in dead_fronts or str(cid) in dead_fronts:
-                                set_dead_skip += 1
-                            else:
-                                set_miss_f += 1
-                                set_reqs += 1 if ent.get("front_tier_hint") or ent.get("front_thumb") else 2
-                        if (has_f_disk or (has_f_url and cid_n not in dead_fronts)) and has_b_url and not has_b_disk:
-                            if cid_n in dead_backs or str(cid) in dead_backs:
-                                set_dead_skip += 1
-                            else:
-                                set_miss_b += 1
-                                set_reqs += 1 if ent.get("back_tier_hint") or ent.get("back_thumb") else 2
-                    elif mode_key == "missing_back":
-                        if has_f_disk and not has_b_disk and has_b_url:
-                            if cid_n in dead_backs or str(cid) in dead_backs:
-                                set_dead_skip += 1
-                            else:
-                                set_miss_b += 1
-                                set_reqs += 1 if ent.get("back_tier_hint") or ent.get("back_thumb") else 2
-                    elif mode_key == "upgrade":
-                        for s_key in ("front", "back"):
-                            s_meta = ent.get(s_key)
-                            if isinstance(s_meta, dict) and s_meta.get("quality") == "S":
-                                sub_has_s_tier = True
-                                set_miss_f += 1 if s_key == "front" else 0
-                                set_miss_b += 1 if s_key == "back" else 0
-                if mode_key == "upgrade" and sub_has_s_tier:
-                    set_upd_subs += 1
-                    set_reqs += 2
-
-        subsets_unchanged_skipped += set_skip_subs
-        subsets_to_update += set_upd_subs
-        missing_fronts_total += set_miss_f
-        missing_backs_total += set_miss_b
-        already_on_disk_total += set_disk_ok
-        skipped_dead_total += set_dead_skip
-        est_http_requests_total += set_reqs
-
-        set_eta_s = (set_reqs / safe_rpm) * 60.0 if set_reqs > 0 else 0.0
-        per_set.append({
-            "set_url": set_url,
-            "folder_name": folder_name,
-            "set_name": chk_title,
-            "subsets_skipped": set_skip_subs,
-            "subsets_to_update": set_upd_subs,
-            "missing_fronts": set_miss_f,
-            "missing_backs": set_miss_b,
-            "already_on_disk": set_disk_ok,
-            "dead_cached_skipped": set_dead_skip,
-            "estimated_requests": set_reqs,
-            "estimated_eta_seconds": int(round(set_eta_s)),
-            "estimated_eta_display": _format_eta_compact(set_eta_s),
-            "status": "Up to date" if (set_upd_subs == 0 and set_miss_f == 0 and set_miss_b == 0) else "Pending work",
-        })
-
-    total_eta_s = (est_http_requests_total / safe_rpm) * 60.0 if est_http_requests_total > 0 else 0.0
-    return {
-        "mode": mode_key,
-        "force_refresh": bool(force_refresh),
-        "total_sets": len(queue),
-        "subsets_unchanged_skipped": subsets_unchanged_skipped,
-        "subsets_to_update": subsets_to_update,
-        "missing_front_images_queued": missing_fronts_total,
-        "missing_back_images_queued": missing_backs_total,
-        "missing_images_queued": missing_fronts_total + missing_backs_total,
-        "already_on_disk_images": already_on_disk_total,
-        "skipped_dead_cached": skipped_dead_total,
-        "estimated_http_requests": est_http_requests_total,
-        "safe_rpm": round(safe_rpm, 1),
-        "estimated_eta_seconds": int(round(total_eta_s)),
-        "estimated_eta_display": _format_eta_compact(total_eta_s),
-        "per_set": per_set,
-    }
+    norm_mode = "upgrade" if mode_key == "image_update" else (mode_key if mode_key in plans_by_mode else "checklist_only")
+    selected_plan = plans_by_mode[norm_mode]
+    if all_modes:
+        return {"plan": selected_plan, "plans_by_mode": plans_by_mode}
+    return selected_plan
 
 
 # ==============================================================================
