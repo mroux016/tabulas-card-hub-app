@@ -1782,6 +1782,8 @@ def run_background_job_from_file(payload_path: Path):
                 target_queue=payload.get("target_queue"),
                 cooldown_seconds=int(payload.get("cooldown_seconds", 5)),
                 download_all_cataloged=True,
+                incremental=bool(payload.get("incremental", True)),
+                force_refresh=bool(payload.get("force_refresh", False)),
             )
         elif job_type == "tcdb_download_all_images":
             mode_download_all_catalog_images(target_queue=payload.get("target_queue"))
@@ -1790,6 +1792,8 @@ def run_background_job_from_file(payload_path: Path):
                 target_queue=payload.get("target_queue") or payload.get("selected_tcdb_sets"),
                 clean_slate_reset=bool(payload.get("clean_slate_reset", False)),
                 cooldown_seconds=int(payload.get("cooldown_seconds", 5)),
+                incremental=bool(payload.get("incremental", True)),
+                force_refresh=bool(payload.get("force_refresh", False)),
             )
         elif job_type == "tcdb_upgrade":
             mode_image_update_pipeline(target_queue=payload.get("target_queue"))
@@ -1801,6 +1805,8 @@ def run_background_job_from_file(payload_path: Path):
             run_tcdb_checklist_pipeline(
                 selected_tcdb_sets=payload.get("selected_tcdb_sets"),
                 clean_slate_reset=bool(payload.get("clean_slate_reset", False)),
+                incremental=bool(payload.get("incremental", True)),
+                force_refresh=bool(payload.get("force_refresh", False)),
             )
         elif job_type == "repair_checklists":
             repair_corrupted_checklists_and_processed_cards()

@@ -284,6 +284,8 @@ if IS_REORGANIZED_V24:
 
     FEATURE_CACHE_FILE = CACHE_LIBRARY_DIR / "template_feature_cache_v22.pkl"
     DEAD_BACKS_CACHE_PATH = CACHE_LIBRARY_DIR / "tcdb_dead_backs_cache.json"
+    DEAD_FRONTS_CACHE_PATH = CACHE_LIBRARY_DIR / "tcdb_dead_fronts_cache.json"
+    CACHE_CHECKPOINTS_DIR = CACHE_CHECKLISTS_DIR / "Checkpoints"
 
     ACTIVE_BATCH_FILE = CACHE_INVENTORY_DIR / "Active_Staging_Batch.csv"
     BATCH_REVIEW_SELECTION_FILE = CACHE_INVENTORY_DIR / "batch_review_selection.json"
@@ -309,6 +311,8 @@ else:
     FEATURE_CACHE_FILE = SET_LIBRARY_CACHE_DIR / "template_feature_cache_v22.pkl"
     CHECKLIST_CACHE_FILE = SET_LIBRARY_CACHE_DIR / "checklist_cache_v22.pkl"
     DEAD_BACKS_CACHE_PATH = SET_LIBRARY_CACHE_DIR / "tcdb_dead_backs_cache.json"
+    DEAD_FRONTS_CACHE_PATH = SET_LIBRARY_CACHE_DIR / "tcdb_dead_fronts_cache.json"
+    CACHE_CHECKPOINTS_DIR = SET_LIBRARY_CACHE_DIR / "Checkpoints"
     BATCH_REVIEW_SELECTION_FILE = LOGS_DIR / "batch_review_selection.json"
 
 
@@ -1079,13 +1083,14 @@ def ensure_directories():
             CACHE_CATALOGS_DIR,
             NEURAL_MODELS_DIR,
             CACHE_CHECKLISTS_DIR,
+            CACHE_CHECKPOINTS_DIR,
             CACHE_INVENTORY_DIR,
             CACHE_SALES_MARKET_DIR,
             CACHE_SYSTEM_DIR,
             RUNTIME_DIR,
         ])
     else:
-        dirs_to_create.extend([LOGS_DIR, SET_LIBRARY_CACHE_DIR])
+        dirs_to_create.extend([LOGS_DIR, SET_LIBRARY_CACHE_DIR, CACHE_CHECKPOINTS_DIR])
 
     for d in dirs_to_create:
         try:

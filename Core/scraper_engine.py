@@ -4,6 +4,7 @@ from __future__ import annotations
 # & TEMPLATE SCRAPER (WITH TCDB_CID, FULL FRONT/BACK DOWNLOAD & LIBRARY STATUS)
 # ==============================================================================
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -46,12 +47,14 @@ from Core.config import (
     BASE_DIR,
     BN_TRACKING_FILE,
     CACHE_CATALOGS_DIR,
+    CACHE_CHECKPOINTS_DIR,
     CHECKLIST_BACKUP_PATH,
     CHECKLIST_CACHE_FILE,
     CHECKLIST_COLUMNS,
     CHECKLIST_DIR,
     CHECKLIST_PATH,
     DEAD_BACKS_CACHE_PATH,
+    DEAD_FRONTS_CACHE_PATH,
     INVENTORY_DIR,
     IS_REORGANIZED_V24,
     LOGS_DIR,
@@ -88,6 +91,8 @@ BASE_URL = "https://www.tcdb.com"
 # Legacy compatibility symbol only — Download_Level has been removed; all sets download 100% of available images
 DOWNLOAD_LEVELS = ("Full",)
 DEAD_BACKS_TTL_DAYS = 30
+DEAD_FRONTS_TTL_DAYS = 14
+CHECKPOINT_SCHEMA_VERSION = 1
 
 TCDB_SPORT_CODES = {
     "Baseball": 1,
@@ -130,6 +135,7 @@ MASTER_DIRECTORY_FILE = MASTER_DIRECTORY_CSV_FILE
 SET_CART_FILE = SET_CART_JSON_FILE
 SCHEDULE_CONFIG_FILE = LOGS_DIR / "pipeline_schedule_config.json"
 DEAD_BACKS_CACHE_FILE = DEAD_BACKS_CACHE_PATH
+DEAD_FRONTS_CACHE_FILE = DEAD_FRONTS_CACHE_PATH
 
 WINDOWS_TASK_NAME = "Tabulas_Scheduled_Pipeline_Job"
 WINDOWS_DIR_TASK_NAME = "Tabulas_Scheduled_Directory_Crawl_Job"
@@ -2423,6 +2429,8 @@ def parse_tcdb_checklist_table_rows(
             "TCDB_Image_Status": img_status,
             "_front_thumb": front_thumb_url,
             "_back_thumb": back_thumb_url,
+            "_front_tier_hint": ("R" if "rep" in front_thumb_url.lower() else ("S" if front_thumb_url else "")),
+            "_back_tier_hint": ("R" if "rep" in back_thumb_url.lower() else ("S" if back_thumb_url else "")),
             "_referer": current_url,
             "_page_num": page_num,
         })
@@ -2483,6 +2491,168 @@ def save_dead_backs_cache(cache_dict: dict[str, float]):
         atomic_write_text(DEAD_BACKS_CACHE_FILE, json.dumps(cache_dict, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def load_dead_fronts_cache() -> dict[str, float]:
+    """Loads `tcdb_dead_fronts_cache.json` and auto-prunes entries older than `DEAD_FRONTS_TTL_DAYS`."""
+    ensure_directories()
+    if not DEAD_FRONTS_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(DEAD_FRONTS_CACHE_FILE.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw, dict):
+            return {}
+        cutoff = time.time() - (DEAD_FRONTS_TTL_DAYS * 86400.0)
+        return {str(k): float(v) for k, v in raw.items() if float(v or 0) >= cutoff}
+    except Exception:
+        return {}
+
+
+def save_dead_fronts_cache(cache_dict: dict[str, float]):
+    ensure_directories()
+    try:
+        atomic_write_text(DEAD_FRONTS_CACHE_FILE, json.dumps(cache_dict, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def checkpoint_file_path(set_name_or_key: str) -> Path:
+    return CACHE_CHECKPOINTS_DIR / f"{sanitize_filename_part(set_name_or_key)}_checkpoint.json"
+
+
+def load_set_checkpoint(set_name_or_key: str, alt_folder_name: str = "") -> dict:
+    """Loads per-set subset-level validation checkpoint JSON."""
+    ensure_directories()
+    candidates = [checkpoint_file_path(set_name_or_key)]
+    if alt_folder_name and sanitize_filename_part(alt_folder_name) != sanitize_filename_part(set_name_or_key):
+        candidates.append(checkpoint_file_path(alt_folder_name))
+    for path in candidates:
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(data, dict):
+                    data.setdefault("schema_version", CHECKPOINT_SCHEMA_VERSION)
+                    data.setdefault("subsets", {})
+                    return data
+            except Exception:
+                pass
+    return {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "set_key": sanitize_filename_part(set_name_or_key),
+        "set_name": str(set_name_or_key),
+        "subsets": {},
+    }
+
+
+def save_set_checkpoint(set_name_or_key: str, checkpoint: dict):
+    ensure_directories()
+    try:
+        CACHE_CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+        checkpoint["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+        atomic_write_text(checkpoint_file_path(set_name_or_key), json.dumps(checkpoint, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def compute_subset_rows_checksum(rows: list[dict]) -> str:
+    """
+    Computes a canonical SHA-256 checksum over sorted
+    `(Card Number, TCDB_CID, Player, canonical_subset_key)` tuples so harmless row
+    reordering never triggers false re-scrapes.
+    """
+    tuples_list = []
+    for r in rows or []:
+        cnum = str(r.get("Card Number") or "").strip().lstrip("#")
+        cid = str(r.get("TCDB_CID") or "").strip()
+        if cid == "0":
+            cid = ""
+        plr = str(r.get("Player") or "").strip()
+        sub_k = canonical_subset_key(str(r.get("Subset") or "Base").strip() or "Base")
+        tuples_list.append((cnum, cid, plr, sub_k))
+    tuples_list.sort()
+    payload = json.dumps(tuples_list, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_local_set_csv_rows_by_subset(
+    chk_title: str,
+    folder_name: str = "",
+) -> tuple[dict[str, list[dict]], dict[str, str], Optional[Path]]:
+    """
+    Reads `Set_Checklists/<Set>.csv` and groups rows by `canonical_subset_key(Subset)`.
+    Returns `(rows_by_canon_key, display_name_by_canon_key, csv_path_used)`.
+    """
+    rows_by_key: dict[str, list[dict]] = defaultdict(list)
+    names_by_key: dict[str, str] = {}
+    candidates = [
+        SET_CHECKLISTS_DIR / f"{sanitize_filename_part(chk_title)}.csv",
+    ]
+    if folder_name:
+        candidates.append(SET_CHECKLISTS_DIR / f"{sanitize_filename_part(folder_name)}.csv")
+    csv_p = next((p for p in candidates if p.exists()), None)
+    if not csv_p:
+        return dict(rows_by_key), names_by_key, None
+    try:
+        df = pd.read_csv(csv_p, dtype=str, keep_default_na=False)
+        if df.empty or "Subset" not in df.columns:
+            return dict(rows_by_key), names_by_key, csv_p
+        for rec in df.to_dict(orient="records"):
+            sub_disp = str(rec.get("Subset") or "Base").strip() or "Base"
+            sub_k = canonical_subset_key(sub_disp)
+            rows_by_key[sub_k].append(rec)
+            names_by_key.setdefault(sub_k, sub_disp)
+    except Exception:
+        pass
+    return dict(rows_by_key), names_by_key, csv_p
+
+
+def _try_bootstrap_subset_checkpoint(
+    checkpoint: dict,
+    sid_key: str,
+    subset_url: str,
+    subset_label: str,
+    expected_cards: int,
+    local_rows: list[dict],
+    is_base: bool = False,
+) -> Optional[dict]:
+    """
+    Existing-CSV Bootstrap: When `<set>_checkpoint.json` lacks `sid_key`, checks if
+    `Set_Checklists/<Set>.csv` already has `len(local_rows) == expected_cards` (> 0)
+    with populated `TCDB_CID`s, and seeds the checkpoint entry as `"complete"`.
+    """
+    if expected_cards <= 0 or not local_rows or len(local_rows) != expected_cards:
+        return None
+    populated_cids = sum(
+        1 for r in local_rows
+        if str(r.get("TCDB_CID") or "").strip() not in ("", "0", "nan", "None")
+    )
+    if populated_cids == 0 or (populated_cids < len(local_rows) and populated_cids < int(len(local_rows) * 0.95)):
+        return None
+
+    imaged_f = sum(
+        1 for r in local_rows
+        if "front" in str(r.get("TCDB_Image_Status") or "").lower()
+    )
+    imaged_b = sum(
+        1 for r in local_rows
+        if "back" in str(r.get("TCDB_Image_Status") or "").lower()
+        and "no back" not in str(r.get("TCDB_Image_Status") or "").lower()
+    )
+    entry = {
+        "subset_name": str(subset_label),
+        "subset_url": str(subset_url),
+        "is_base": bool(is_base),
+        "expected_cards": int(expected_cards),
+        "scraped_cards": len(local_rows),
+        "imaged_fronts_on_tcdb": imaged_f,
+        "imaged_backs_on_tcdb": imaged_b,
+        "rows_sha256": compute_subset_rows_checksum(local_rows),
+        "status": "complete",
+        "bootstrapped_from_csv": True,
+        "last_verified_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    checkpoint.setdefault("subsets", {})[str(sid_key)] = entry
+    return entry
 
 
 def _index_existing_set_dir_by_cid(set_dir: Path) -> dict[tuple[str, str], Path]:
@@ -3114,6 +3284,8 @@ def _update_catalog_from_parsed_rows(
         b_thumb = str(r.get("_back_thumb") or "").strip()
         f_urls = transform_thumb_to_large_urls(f_thumb, "Fr") if f_thumb else {}
         b_urls = transform_thumb_to_large_urls(b_thumb, "Bk") if b_thumb else {}
+        f_hint = str(r.get("_front_tier_hint") or ("R" if "rep" in f_thumb.lower() else ("S" if f_thumb else ""))).strip()
+        b_hint = str(r.get("_back_tier_hint") or ("R" if "rep" in b_thumb.lower() else ("S" if b_thumb else ""))).strip()
 
         prev_entry = catalog[sub_name].get(cid, {})
         if not isinstance(prev_entry, dict):
@@ -3132,7 +3304,12 @@ def _update_catalog_from_parsed_rows(
             "url_std_front": f_urls.get("std", prev_entry.get("url_std_front", "")),
             "url_rep_back": b_urls.get("rep", prev_entry.get("url_rep_back", "")),
             "url_std_back": b_urls.get("std", prev_entry.get("url_std_back", "")),
+            "front_thumb": f_thumb or prev_entry.get("front_thumb", ""),
+            "back_thumb": b_thumb or prev_entry.get("back_thumb", ""),
+            "front_tier_hint": f_hint or prev_entry.get("front_tier_hint", ""),
+            "back_tier_hint": b_hint or prev_entry.get("back_tier_hint", ""),
             "referer": str(r.get("_referer") or prev_entry.get("referer", "")),
+            "subset_url": str(r.get("_subset_url") or r.get("_referer") or prev_entry.get("subset_url", "")),
             "page_num": int(r.get("_page_num") or prev_entry.get("page_num") or 1),
             "front": prev_entry.get("front"),
             "back": prev_entry.get("back"),
@@ -3171,13 +3348,16 @@ def _scrape_tcdb_subset_checklist_pages(
     page_info_callback: Optional[Callable[[int, int, int], None]] = None,
     prefetched_page1_html: Optional[str] = None,
     known_subset_total: int = 0,
+    start_page: int = 1,
 ) -> list[dict]:
     all_rows = []
-    page_idx = 1
-    max_pages = 30
+    page_idx = max(1, int(start_page))
+    est_max_pages = 1
+    hard_max_pages = 200
+    seen_page_cids: set[str] = set()
     resolved_subset = clean_tcdb_subset_title(subset_name, checklist_set_name=checklist_set_name) or subset_name
 
-    while page_idx <= max_pages:
+    while page_idx <= hard_max_pages:
         page_url = (
             base_chk_url
             if page_idx == 1
@@ -3187,7 +3367,7 @@ def _scrape_tcdb_subset_checklist_pages(
             html_body = prefetched_page1_html
             log_msg(f"      [Cache Hit] Reusing pre-scanned Page 1 HTML for '{resolved_subset}' -> {page_url}")
         else:
-            log_msg(f"      [HTTP GET] Subset '{resolved_subset}' Page {page_idx}/{max_pages} -> {page_url}")
+            log_msg(f"      [HTTP GET] Subset '{resolved_subset}' Page {page_idx}/{max(est_max_pages, page_idx)} -> {page_url}")
             res = safe_get(req_session, page_url, silent_404=True)
             if not res or (page_idx > 1 and hasattr(res, "url") and res.url and "PageIndex" not in str(res.url)):
                 log_msg(f"      [Page Stop] End of pagination for '{resolved_subset}' at page {page_idx}.")
@@ -3195,18 +3375,25 @@ def _scrape_tcdb_subset_checklist_pages(
             html_body = decode_html_response(res)
 
         soup = BeautifulSoup(html_body, "html.parser")
-        if page_idx == 1:
-            if not resolved_subset or resolved_subset.lower() in ("insert", "inserts", "parallel"):
-                hdr_sub = _extract_subset_title_from_checklist_soup(soup, checklist_set_name=checklist_set_name)
-                if hdr_sub:
-                    resolved_subset = hdr_sub
+        if page_idx == 1 and (not resolved_subset or resolved_subset.lower() in ("insert", "inserts", "parallel")):
+            hdr_sub = _extract_subset_title_from_checklist_soup(soup, checklist_set_name=checklist_set_name)
+            if hdr_sub:
+                resolved_subset = hdr_sub
 
-            detected_max = 1
-            for a_p in soup.find_all("a", href=re.compile(r"PageIndex=(\d+)", re.IGNORECASE)):
-                m_p = re.search(r"PageIndex=(\d+)", a_p.get("href", ""), re.IGNORECASE)
-                if m_p:
-                    detected_max = max(detected_max, int(m_p.group(1)))
-            max_pages = min(35, detected_max)
+        # Parse pagination links on EVERY page: treat Page 1's max_pages strictly as an
+        # ETA/progress hint so truncated TCDB pagination bars never cut off large subsets early.
+        detected_link_max = page_idx
+        has_next_page_link = False
+        for a_p in soup.find_all("a", href=re.compile(r"PageIndex=(\d+)", re.IGNORECASE)):
+            href_p = str(a_p.get("href", ""))
+            m_p = re.search(r"PageIndex=(\d+)", href_p, re.IGNORECASE)
+            if m_p:
+                p_num_link = int(m_p.group(1))
+                detected_link_max = max(detected_link_max, p_num_link)
+                txt_p = trim_clean(a_p.get_text(" ", strip=True)).lower()
+                if p_num_link == page_idx + 1 or txt_p in ("next", ">", "»", "next >", "next »"):
+                    has_next_page_link = True
+        est_max_pages = max(est_max_pages, min(hard_max_pages, detected_link_max))
 
         rows_p = parse_tcdb_checklist_table_rows(
             soup,
@@ -3218,20 +3405,33 @@ def _scrape_tcdb_subset_checklist_pages(
             log_msg(f"      [Parse] 0 card rows found on '{resolved_subset}' Page {page_idx}; stopping subset.")
             break
 
+        # Guard against TCDB returning the last page repeatedly when PageIndex exceeds bounds
+        page_cids = {str(r.get("TCDB_CID") or "").strip() for r in rows_p if str(r.get("TCDB_CID") or "").strip()}
+        if page_idx > 1 and page_cids and page_cids.issubset(seen_page_cids):
+            log_msg(f"      [Page Stop] Duplicate card rows detected on '{resolved_subset}' Page {page_idx}; stopping subset.")
+            break
+        seen_page_cids.update(page_cids)
+
+        for r_item in rows_p:
+            r_item["_subset_url"] = base_chk_url
+
         if page_info_callback is not None:
             if page_idx == 1:
-                est_tot = _extract_total_cards_from_checklist_soup(soup, len(rows_p), max_pages)
-                if max_pages > 1 and known_subset_total >= len(rows_p):
+                est_tot = _extract_total_cards_from_checklist_soup(soup, len(rows_p), est_max_pages)
+                if est_max_pages > 1 and known_subset_total >= len(rows_p):
                     est_tot = known_subset_total
-                page_info_callback(page_idx, max_pages, max(len(rows_p), est_tot))
-            elif page_idx == max_pages:
-                page_info_callback(page_idx, max_pages, len(all_rows) + len(rows_p))
+                page_info_callback(page_idx, est_max_pages, max(len(rows_p), est_tot))
+            elif page_idx >= est_max_pages and not has_next_page_link:
+                page_info_callback(page_idx, page_idx, len(all_rows) + len(rows_p))
 
-        log_msg(f"      [Parse] '{resolved_subset}' Page {page_idx}/{max_pages}: extracted {len(rows_p)} card(s).")
+        log_msg(f"      [Parse] '{resolved_subset}' Page {page_idx}/{max(est_max_pages, page_idx)}: extracted {len(rows_p)} card(s).")
         if card_callback is not None:
             for c_row in rows_p:
                 card_callback(c_row)
         all_rows.extend(rows_p)
+
+        if page_idx >= est_max_pages and not has_next_page_link:
+            break
         page_idx += 1
 
     return all_rows
@@ -3591,13 +3791,15 @@ def scrape_tcdb_checklist_set(
     prefetched_insert_counts: Optional[dict[str, int]] = None,
     prefetched_base_html: Optional[str] = None,
     progress_ctx: Optional[dict] = None,
+    incremental: bool = True,
+    force_refresh: bool = False,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Single-Pass Unified Crawler:
     Scrapes Base Set, Variations/Errors, and all Inserts/Parallels/Autos/Relics from TCDB,
     extracting `TCDB_CID`, `TCDB_Image_Status`, and Front/Back image URLs in one pass.
-    When `download_images_card_by_card=True`, immediately downloads available Front (`_F.jpg`)
-    and Back (`_B.jpg`) images card-by-card as each checklist entry is parsed.
+    Supports incremental subset-level checkpointing, existing-CSV bootstrap, and
+    catalog-driven image downloads for unchanged subsets.
     """
     urls = _resolve_tcdb_set_urls(viewset_url)
     cat_key = folder_name or sanitize_filename_part(checklist_set_name)
@@ -3611,11 +3813,13 @@ def scrape_tcdb_checklist_set(
 
     disk_cid_index = _index_existing_set_dir_by_cid(target_set_dir) if download_images_card_by_card else {}
     dead_backs = load_dead_backs_cache() if download_images_card_by_card else {}
+    dead_fronts = load_dead_fronts_cache() if download_images_card_by_card else {}
     dead_backs_dirty = False
+    dead_fronts_dirty = False
     img_stats = {"front_dl": 0, "back_dl": 0, "front_skip": 0, "back_skip": 0, "no_back": 0, "back_only_skip": 0, "no_img": 0, "cards_seen": 0}
 
     def _download_card_immediately(c_row: dict):
-        nonlocal dead_backs_dirty
+        nonlocal dead_backs_dirty, dead_fronts_dirty
         img_stats["cards_seen"] += 1
         cid = str(c_row.get("TCDB_CID") or "").strip()
         sub_n = str(c_row.get("Subset") or "Base").strip() or "Base"
@@ -3624,6 +3828,8 @@ def scrape_tcdb_checklist_set(
 
         f_thumb = str(c_row.get("_front_thumb") or "").strip()
         b_thumb = str(c_row.get("_back_thumb") or "").strip()
+        f_hint = str(c_row.get("_front_tier_hint") or ("R" if "rep" in f_thumb.lower() else ("S" if f_thumb else ""))).strip()
+        b_hint = str(c_row.get("_back_tier_hint") or ("R" if "rep" in b_thumb.lower() else ("S" if b_thumb else ""))).strip()
 
         if not cid or cid == "0":
             img_stats["no_img"] += 1
@@ -3639,7 +3845,10 @@ def scrape_tcdb_checklist_set(
                 log_msg(f"        [Card #{cnum}] {plr} [{sub_n} | CID {cid}] -> No TCDB image available")
             return
 
-        # If TCDB now shows a back thumbnail for a previously dead-cached CID, evict it!
+        # If TCDB now shows a front/back thumbnail for a previously dead-cached CID, evict it!
+        if f_thumb and cid in dead_fronts:
+            dead_fronts.pop(cid, None)
+            dead_fronts_dirty = True
         if b_thumb and cid in dead_backs:
             dead_backs.pop(cid, None)
             dead_backs_dirty = True
@@ -3661,15 +3870,23 @@ def scrape_tcdb_checklist_set(
             "front_file": f_fname, "back_file": b_fname,
             "url_rep_front": f_urls.get("rep", ""), "url_std_front": f_urls.get("std", ""),
             "url_rep_back": b_urls.get("rep", ""), "url_std_back": b_urls.get("std", ""),
-            "referer": referer, "page_num": int(c_row.get("_page_num") or 1),
+            "front_thumb": f_thumb, "back_thumb": b_thumb,
+            "front_tier_hint": f_hint, "back_tier_hint": b_hint,
+            "referer": referer, "subset_url": str(c_row.get("_subset_url") or referer),
+            "page_num": int(c_row.get("_page_num") or 1),
         })
         entry["front_file"] = f_fname
         entry["back_file"] = b_fname
         entry["url_rep_front"] = f_urls.get("rep", "")
         entry["url_std_front"] = f_urls.get("std", "")
+        if f_thumb:
+            entry["front_thumb"] = f_thumb
+            entry["front_tier_hint"] = f_hint
         if b_thumb:
             entry["url_rep_back"] = b_urls.get("rep", "")
             entry["url_std_back"] = b_urls.get("std", "")
+            entry["back_thumb"] = b_thumb
+            entry["back_tier_hint"] = b_hint
 
         q_f_winner = ""
         has_front = False
@@ -3681,6 +3898,9 @@ def scrape_tcdb_checklist_set(
             f_note = existing_f_note
             if isinstance(entry.get("front"), dict):
                 q_f_winner = str(entry["front"].get("quality") or "")
+        elif cid in dead_fronts:
+            img_stats["no_img"] += 1
+            f_note = "Skip(DeadFrontCached)"
         else:
             q_f = _download_single_template_side(
                 req_session,
@@ -3690,6 +3910,7 @@ def scrape_tcdb_checklist_set(
                 f_path,
                 set_key=cat_key,
                 thumb_url=f_thumb,
+                preferred_tier=f_hint,
             )
             if q_f:
                 has_front = True
@@ -3701,7 +3922,9 @@ def scrape_tcdb_checklist_set(
                 kb_f = f_path.stat().st_size / 1024.0 if f_path.exists() else 0.0
                 f_note = f"{q_f}-Tier OK ({kb_f:.1f}KB)"
             else:
-                f_note = "Miss(404)"
+                dead_fronts[cid] = time.time()
+                dead_fronts_dirty = True
+                f_note = "Miss(404->Cached)"
 
         existing_b_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
         if existing_b_note:
@@ -3728,7 +3951,7 @@ def scrape_tcdb_checklist_set(
                 b_path,
                 set_key=cat_key,
                 thumb_url=b_thumb,
-                preferred_tier=q_f_winner,
+                preferred_tier=b_hint or q_f_winner,
             )
             if q_b:
                 img_stats["back_dl"] += 1
@@ -3743,6 +3966,82 @@ def scrape_tcdb_checklist_set(
                 b_note = "Miss(404->Cached)"
 
         log_msg(f"        [Card #{cnum}] {plr} [{sub_n} | CID {cid}] -> Front: {f_note} | Back: {b_note}")
+
+    def _download_missing_images_for_skipped_subset(sub_lbl: str):
+        """Downloads any missing front/back images for an unchanged subset directly from catalog."""
+        nonlocal dead_backs_dirty, dead_fronts_dirty
+        if not download_images_card_by_card or not isinstance(catalog, dict):
+            return
+        target_sk = canonical_subset_key(sub_lbl)
+        matched_sub_dicts = [
+            cards_d for k_sub, cards_d in catalog.items()
+            if isinstance(cards_d, dict) and canonical_subset_key(str(k_sub)) == target_sk
+        ]
+        for cards_d in matched_sub_dicts:
+            for cid, entry in cards_d.items():
+                if str(cid).startswith("_") or not isinstance(entry, dict):
+                    continue
+                cid_s = str(cid).strip()
+                url_rep_f = str(entry.get("url_rep_front") or "")
+                url_std_f = str(entry.get("url_std_front") or "")
+                url_rep_b = str(entry.get("url_rep_back") or "")
+                url_std_b = str(entry.get("url_std_back") or "")
+                if not (url_rep_f or url_std_f):
+                    continue
+                cnum = str(entry.get("card_number") or "0").strip().lstrip("#")
+                plr = str(entry.get("player") or "Unknown Player").strip()
+                f_fname = str(entry.get("front_file") or "")
+                b_fname = str(entry.get("back_file") or "")
+                if not f_fname or not b_fname:
+                    f_fname, b_fname = build_template_image_filenames(checklist_set_name, sub_lbl, cnum, plr, cid_s)
+                f_path = target_set_dir / f_fname
+                b_path = target_set_dir / b_fname
+                referer = str(entry.get("referer") or urls["checklist"])
+
+                q_f_winner = ""
+                has_front = False
+                if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "F", f_path):
+                    has_front = True
+                    img_stats["front_skip"] += 1
+                    if isinstance(entry.get("front"), dict):
+                        q_f_winner = str(entry["front"].get("quality") or "")
+                elif cid_s in dead_fronts:
+                    img_stats["no_img"] += 1
+                else:
+                    q_f = _download_single_template_side(
+                        req_session, url_rep_f, url_std_f, referer, f_path,
+                        set_key=cat_key,
+                        thumb_url=str(entry.get("front_thumb") or ""),
+                        preferred_tier=str(entry.get("front_tier_hint") or ""),
+                    )
+                    if q_f:
+                        has_front = True
+                        q_f_winner = q_f
+                        img_stats["front_dl"] += 1
+                        disk_cid_index[(cid_s, "F")] = f_path
+                        entry["front"] = {"quality": q_f, "file": f_fname}
+                        if p_ctx.get("est_remaining_dl_cards") is not None:
+                            p_ctx["est_remaining_dl_cards"] = max(0, int(p_ctx["est_remaining_dl_cards"]) - 1)
+                    else:
+                        dead_fronts[cid_s] = time.time()
+                        dead_fronts_dirty = True
+
+                if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "B", b_path):
+                    img_stats["back_skip"] += 1
+                elif has_front and (url_rep_b or url_std_b) and cid_s not in dead_backs:
+                    q_b = _download_single_template_side(
+                        req_session, url_rep_b, url_std_b, referer, b_path,
+                        set_key=cat_key,
+                        thumb_url=str(entry.get("back_thumb") or ""),
+                        preferred_tier=str(entry.get("back_tier_hint") or q_f_winner),
+                    )
+                    if q_b:
+                        img_stats["back_dl"] += 1
+                        disk_cid_index[(cid_s, "B")] = b_path
+                        entry["back"] = {"quality": q_b, "file": b_fname}
+                    else:
+                        dead_backs[cid_s] = time.time()
+                        dead_backs_dirty = True
 
     set_t0 = time.time()
     p_ctx = progress_ctx if isinstance(progress_ctx, dict) else {
@@ -3869,22 +4168,122 @@ def scrape_tcdb_checklist_set(
         )
         return rows_out
 
-    all_raw_rows = []
-    base_expected = int(p_ctx.get("active_set_base_cards") or known_sub_counts.get("Base", 0) or 0)
-    base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
-    all_raw_rows.extend(base_rows)
-    log_msg(f"  + Base Set: {len(base_rows)} card rows extracted (with TCDB_CIDs).")
+    checkpoint = load_set_checkpoint(checklist_set_name, alt_folder_name=cat_key) if (incremental and not force_refresh) else {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "set_key": set_stats_key,
+        "set_name": checklist_set_name,
+        "subsets": {},
+    }
+    checkpoint["set_sid"] = extract_tcdb_sid(viewset_url)
+    checkpoint["viewset_url"] = viewset_url
+    local_rows_by_key, _, _ = _load_local_set_csv_rows_by_subset(checklist_set_name, folder_name=cat_key)
+    subset_rows_store: dict[str, list[dict]] = {}
+    if incremental and not force_refresh and local_rows_by_key:
+        for sk_loc, rows_loc in local_rows_by_key.items():
+            subset_rows_store[sk_loc] = list(rows_loc)
 
-    err_res = safe_get(req_session, urls["errors"], silent_404=True, max_403_retries=1)
-    if err_res:
-        soup_err = BeautifulSoup(decode_html_response(err_res), "html.parser")
-        err_rows = parse_tcdb_checklist_table_rows(soup_err, subset_name="Base Variation", current_url=urls["errors"], page_num=1)
-        if err_rows:
-            if download_images_card_by_card:
-                for er in err_rows:
-                    _download_card_immediately(er)
-            all_raw_rows.extend(err_rows)
-            log_msg(f"  + Variations / Errors: {len(err_rows)} rows extracted.")
+    subsets_skipped = 0
+    subsets_fetched = 0
+    changed_since_flush = 0
+    set_csv_checkpoint = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(canonicalize_checklist_set_title(checklist_set_name))}.csv"
+
+    def _subset_is_complete_and_unchanged(sid_key: str, sub_url: str, sub_label: str, expected_cards: int, is_base: bool = False) -> tuple[bool, list[dict]]:
+        if not incremental or force_refresh:
+            return False, []
+        sub_k = canonical_subset_key(sub_label)
+        local_rows = local_rows_by_key.get(sub_k, [])
+        cp_entry = (checkpoint.get("subsets") or {}).get(str(sid_key))
+        if cp_entry is None and local_rows:
+            cp_entry = _try_bootstrap_subset_checkpoint(
+                checkpoint, str(sid_key), sub_url, sub_label, expected_cards, local_rows, is_base=is_base
+            )
+            if cp_entry is not None:
+                save_set_checkpoint(checklist_set_name, checkpoint)
+        if not isinstance(cp_entry, dict) or cp_entry.get("status") != "complete" or not local_rows:
+            return False, []
+        if expected_cards > 0 and len(local_rows) != expected_cards:
+            return False, []
+        if compute_subset_rows_checksum(local_rows) != cp_entry.get("rows_sha256"):
+            return False, []
+        return True, local_rows
+
+    def _record_subset_checkpoint(sid_key: str, sub_url: str, sub_label: str, expected_cards: int, rows_list: list[dict], is_base: bool = False):
+        imaged_f = sum(1 for r in rows_list if "front" in str(r.get("TCDB_Image_Status") or "").lower())
+        imaged_b = sum(1 for r in rows_list if "back" in str(r.get("TCDB_Image_Status") or "").lower() and "no back" not in str(r.get("TCDB_Image_Status") or "").lower())
+        checkpoint.setdefault("subsets", {})[str(sid_key)] = {
+            "subset_name": str(sub_label),
+            "subset_url": str(sub_url),
+            "is_base": bool(is_base),
+            "expected_cards": int(expected_cards or len(rows_list)),
+            "scraped_cards": len(rows_list),
+            "imaged_fronts_on_tcdb": imaged_f,
+            "imaged_backs_on_tcdb": imaged_b,
+            "rows_sha256": compute_subset_rows_checksum(rows_list),
+            "status": "complete",
+            "bootstrapped_from_csv": False,
+            "last_verified_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_set_checkpoint(checklist_set_name, checkpoint)
+
+    base_sid = extract_tcdb_sid(urls["checklist"]) or "base"
+    base_expected = int(p_ctx.get("active_set_base_cards") or known_sub_counts.get("Base", 0) or 0)
+    base_skip, local_base_rows = _subset_is_complete_and_unchanged(base_sid, urls["checklist"], "Base", base_expected, is_base=True)
+    if base_skip:
+        subsets_skipped += 1
+        p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
+        p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_base_rows)
+        subset_rows_store[canonical_subset_key("Base")] = local_base_rows
+        if download_images_card_by_card:
+            _download_missing_images_for_skipped_subset("Base")
+        log_msg(f"  [SKIP-UNCHANGED] Base Set: {len(local_base_rows)} cards verified from checkpoint/CSV.")
+    else:
+        subsets_fetched += 1
+        base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
+        subset_rows_store[canonical_subset_key("Base")] = base_rows
+        if base_rows:
+            _record_subset_checkpoint(base_sid, urls["checklist"], "Base", base_expected or len(base_rows), base_rows, is_base=True)
+            changed_since_flush += 1
+        log_msg(f"  + Base Set: {len(base_rows)} card rows extracted (with TCDB_CIDs).")
+
+    err_cp = checkpoint.get("errors_page") if isinstance(checkpoint.get("errors_page"), dict) else {}
+    if incremental and not force_refresh and base_skip:
+        if err_cp.get("status") != "complete":
+            existing_err_rows = local_rows_by_key.get(canonical_subset_key("Base Variation"), [])
+            checkpoint["errors_page"] = {
+                "url": urls["errors"],
+                "card_count": len(existing_err_rows),
+                "status": "complete",
+                "bootstrapped_from_csv": True,
+                "last_verified_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            save_set_checkpoint(checklist_set_name, checkpoint)
+        log_msg("  [SKIP-UNCHANGED] Variations / Errors: verified from checkpoint/CSV.")
+    else:
+        err_res = safe_get(req_session, urls["errors"], silent_404=True, max_403_retries=1)
+        if err_res:
+            soup_err = BeautifulSoup(decode_html_response(err_res), "html.parser")
+            err_rows = parse_tcdb_checklist_table_rows(soup_err, subset_name="Base Variation", current_url=urls["errors"], page_num=1)
+            if err_rows:
+                if download_images_card_by_card:
+                    for er in err_rows:
+                        _download_card_immediately(er)
+                subset_rows_store[canonical_subset_key("Base Variation")] = err_rows
+                log_msg(f"  + Variations / Errors: {len(err_rows)} rows extracted.")
+            checkpoint["errors_page"] = {
+                "url": urls["errors"],
+                "card_count": len(err_rows),
+                "status": "complete",
+                "last_verified_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            save_set_checkpoint(checklist_set_name, checkpoint)
+        else:
+            checkpoint["errors_page"] = {
+                "url": urls["errors"],
+                "card_count": 0,
+                "status": "complete",
+                "last_verified_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            save_set_checkpoint(checklist_set_name, checkpoint)
 
     if include_inserts:
         if prefetched_inserts is not None:
@@ -3895,31 +4294,52 @@ def scrape_tcdb_checklist_set(
             p_ctx["total_subsets"] = max(p_ctx.get("total_subsets", 1), p_ctx.get("completed_subsets", 1) + len(insert_by_sid))
         if insert_by_sid:
             log_msg(f"  📑 Processing {len(insert_by_sid)} TCDB Insert/Parallel/Auto/Relic checklists for '{checklist_set_name}'.")
-            set_csv_checkpoint = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(canonicalize_checklist_set_title(checklist_set_name))}.csv"
+            flush_every = 5 if download_images_card_by_card else 10
             for idx, (sid_k, (ins_url, sub_label)) in enumerate(insert_by_sid.items(), 1):
                 fallback_label = clean_tcdb_subset_title(sub_label, checklist_set_name=checklist_set_name) or f"Subset_{sid_k}"
                 exp_ins_cards = int(ins_counts_map.get(sid_k, 0) or known_sub_counts.get(fallback_label, 0) or 0)
+                sub_skip, local_sub_rows = _subset_is_complete_and_unchanged(sid_k, ins_url, fallback_label, exp_ins_cards)
+                if sub_skip:
+                    subsets_skipped += 1
+                    p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
+                    p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_sub_rows)
+                    subset_rows_store[canonical_subset_key(fallback_label)] = local_sub_rows
+                    if download_images_card_by_card:
+                        _download_missing_images_for_skipped_subset(fallback_label)
+                    if idx % 25 == 0 or idx == len(insert_by_sid):
+                        log_msg(f"    [{idx}/{len(insert_by_sid)}] [SKIP-UNCHANGED] {fallback_label}: {len(local_sub_rows)} rows verified.")
+                    continue
+
+                subsets_fetched += 1
                 sub_rows = _run_subset_with_telemetry(ins_url, fallback_label, expected_cards=exp_ins_cards)
                 resolved_lbl = sub_rows[0]["Subset"] if sub_rows else fallback_label
                 if sub_rows:
-                    all_raw_rows.extend(sub_rows)
+                    subset_rows_store[canonical_subset_key(resolved_lbl)] = sub_rows
+                    _record_subset_checkpoint(sid_k, ins_url, resolved_lbl, exp_ins_cards or len(sub_rows), sub_rows, is_base=False)
+                    changed_since_flush += 1
                 log_msg(f"    [{idx}/{len(insert_by_sid)}] {resolved_lbl}: {len(sub_rows)} rows extracted.")
-                if (download_images_card_by_card and idx % 5 == 0) or (idx % 25 == 0 and all_raw_rows):
-                    _update_catalog_from_parsed_rows(catalog, checklist_set_name, all_raw_rows)
-                    save_catalog(cat_key, catalog)
-                    partial_df = apply_excel_formulas_and_combine(all_raw_rows, checklist_set_name)
-                    if idx % 100 == 0:
-                        _merge_set_checklist_into_master(partial_df, checklist_set_name, replace_set_cleanly=True)
-                    else:
+                if changed_since_flush >= flush_every:
+                    merged_partial = [r for rows_l in subset_rows_store.values() for r in rows_l]
+                    if merged_partial:
+                        _update_catalog_from_parsed_rows(catalog, checklist_set_name, merged_partial)
+                        save_catalog(cat_key, catalog)
+                        save_set_checkpoint(checklist_set_name, checkpoint)
+                        partial_df = apply_excel_formulas_and_combine(merged_partial, checklist_set_name)
                         partial_df.to_csv(set_csv_checkpoint, index=False, encoding="utf-8-sig")
+                    changed_since_flush = 0
 
+    all_raw_rows = [r for rows_l in subset_rows_store.values() for r in rows_l]
     if not all_raw_rows:
         return pd.DataFrame(columns=CHECKLIST_COLUMNS), []
 
     _update_catalog_from_parsed_rows(catalog, checklist_set_name, all_raw_rows)
     save_catalog(cat_key, catalog)
+    checkpoint["last_verified_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    save_set_checkpoint(checklist_set_name, checkpoint)
     if dead_backs_dirty:
         save_dead_backs_cache(dead_backs)
+    if dead_fronts_dirty:
+        save_dead_fronts_cache(dead_fronts)
 
     final_df = apply_excel_formulas_and_combine(all_raw_rows, checklist_set_name)
     # Persist exact set-level card counts and historical run duration into the ETA cache
@@ -3948,19 +4368,25 @@ def scrape_tcdb_checklist_set(
         pass
     if download_images_card_by_card:
         log_msg(
-            f"  ✅ Combined Card-by-Card Complete for '{checklist_set_name}': {len(final_df):,} unique rows | "
+            f"  ✅ Combined Card-by-Card Complete for '{checklist_set_name}': {len(final_df):,} unique rows "
+            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped) | "
             f"Downloaded {img_stats['front_dl']:,} Fronts, {img_stats['back_dl']:,} Backs "
             f"(Skipped existing: {img_stats['front_skip']:,}F/{img_stats['back_skip']:,}B | "
             f"Back-Only skipped: {img_stats['back_only_skip']:,} | NoBack skipped: {img_stats['no_back']:,} | No TCDB img: {img_stats['no_img']:,})."
         )
     else:
-        log_msg(f"  ✅ TCDB Checklist Complete for '{checklist_set_name}': {len(final_df):,} unique card rows (with TCDB_CIDs)!")
+        log_msg(
+            f"  ✅ TCDB Checklist Complete for '{checklist_set_name}': {len(final_df):,} unique card rows "
+            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped)!"
+        )
     return final_df, all_raw_rows
 
 
 def run_tcdb_checklist_pipeline(
     selected_tcdb_sets: Optional[dict[str, str]] = None,
     clean_slate_reset: bool = False,
+    incremental: bool = True,
+    force_refresh: bool = False,
 ) -> pd.DataFrame:
     """
     Builds 11-column Set Checklists (`Set`, `Subset`, `Card Number`, `Player`, `Team`,
@@ -3998,6 +4424,15 @@ def run_tcdb_checklist_pipeline(
             p_ctx["set_index"] = idx
             p_ctx["active_set_base_cards"] = set_m.get("base_cards", 0)
             p_ctx["active_set_subset_counts"] = set_m.get("subset_card_counts", {})
+            try:
+                rem_queue = {u_r: fn_r for u_r, fn_r in queue_items[idx - 1 :]}
+                atomic_write_text(
+                    RESUME_FILE,
+                    json.dumps({"mode": "checklist_only", "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "remaining_queue": rem_queue}, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
             chk_title = canonicalize_checklist_set_title(folder_name.replace("_", " ").strip())
             log_msg(f"[{idx}/{total}] Building TCDB Checklist + CIDs for '{chk_title}' ({set_m.get('total_cards', 0):,} est. cards)...")
             df_set, _ = scrape_tcdb_checklist_set(
@@ -4010,11 +4445,14 @@ def run_tcdb_checklist_pipeline(
                 prefetched_insert_counts=pre["prefetched_insert_counts"].get(set_url),
                 prefetched_base_html=pre["prefetched_base_html"].get(set_url),
                 progress_ctx=p_ctx,
+                incremental=incremental,
+                force_refresh=force_refresh,
             )
             if not df_set.empty:
                 _merge_set_checklist_into_master(df_set, chk_title, replace_set_cleanly=True)
             if idx < total:
                 time.sleep(1.5)
+        clear_resume_state()
     finally:
         cleanup_orphaned_drivers()
 
@@ -4091,13 +4529,51 @@ def mode_scraping_pipeline(
     cooldown_seconds: int = 5,
     override_download_level: Optional[str] = None,
     download_all_cataloged: bool = True,
+    incremental: bool = True,
+    force_refresh: bool = False,
 ):
     """Unified full-archive scraper delegating directly to the smart Card-by-Card pipeline (100% of available images)."""
     mode_checklist_and_images_card_by_card(
         target_queue=target_queue,
         clean_slate_reset=False,
         cooldown_seconds=cooldown_seconds,
+        incremental=incremental,
+        force_refresh=force_refresh,
     )
+
+
+def _count_pending_catalog_downloads(
+    queue_items: list[tuple[str, str]],
+    dead_backs: dict[str, float],
+    dead_fronts: dict[str, float],
+) -> tuple[int, int]:
+    """Zero-network local pre-scan returning `(pending_fronts, pending_backs)` across `queue_items`."""
+    pending_f = 0
+    pending_b = 0
+    for _, folder_name in queue_items:
+        catalog = load_catalog(folder_name)
+        set_dir = REFERENCE_TEMPLATES_DIR / sanitize_filename_part(folder_name)
+        disk_idx = _index_existing_set_dir_by_cid(set_dir)
+        for _, cards_dict in catalog.items():
+            if not isinstance(cards_dict, dict):
+                continue
+            for cid, entry in cards_dict.items():
+                if str(cid).startswith("_") or not isinstance(entry, dict):
+                    continue
+                cid_n = normalize_numeric_tcdb_cid(cid)
+                has_f_url = bool(entry.get("url_rep_front") or entry.get("url_std_front"))
+                has_b_url = bool(entry.get("url_rep_back") or entry.get("url_std_back"))
+                if not has_f_url:
+                    continue
+                f_file = str(entry.get("front_file") or "")
+                b_file = str(entry.get("back_file") or "")
+                has_f_disk = (cid_n, "F") in disk_idx or (f_file and (set_dir / f_file).exists())
+                has_b_disk = (cid_n, "B") in disk_idx or (b_file and (set_dir / b_file).exists())
+                if not has_f_disk and cid_n not in dead_fronts and str(cid) not in dead_fronts:
+                    pending_f += 1
+                if (has_f_disk or cid_n not in dead_fronts) and has_b_url and not has_b_disk and cid_n not in dead_backs and str(cid) not in dead_backs:
+                    pending_b += 1
+    return pending_f, pending_b
 
 
 def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = None):
@@ -4113,9 +4589,16 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
         log_msg("[!] No sets in queue for image download.")
         return
 
-    log_msg(f"📥 Launching PURE Front & Back Image Download (Catalog-Only, No Checklist Scrape) for {len(queue)} set(s)...")
-    req_session = connect_session(target_domain=BASE_URL)
     queue_items = list(queue.items())
+    dead_backs_pre = load_dead_backs_cache()
+    dead_fronts_pre = load_dead_fronts_cache()
+    pend_f, pend_b = _count_pending_catalog_downloads(queue_items, dead_backs_pre, dead_fronts_pre)
+    if pend_f == 0 and pend_b == 0:
+        log_msg(f"✅ [FAST-SKIP] All {len(queue_items)} queued set(s) have 0 pending catalog image downloads on disk.")
+        return
+
+    log_msg(f"📥 Launching PURE Front & Back Image Download (Catalog-Only, {pend_f:,} fronts / {pend_b:,} backs pending) for {len(queue)} set(s)...")
+    req_session = connect_session(target_domain=BASE_URL)
     total_sets = len(queue_items)
     learner = get_rate_learner()
 
@@ -4167,7 +4650,9 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
 
             disk_cid_index = _index_existing_set_dir_by_cid(set_dir)
             dead_backs = load_dead_backs_cache()
+            dead_fronts = load_dead_fronts_cache()
             dead_backs_dirty = False
+            dead_fronts_dirty = False
 
             log_msg(
                 f"[{idx}/{total_sets}] Downloading Images Only for '{folder_name}': {total_cards_set:,} front-imaged card(s) "
@@ -4182,6 +4667,27 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
                 sub_tot = len(sub_items)
                 sub_dl_start = dl_f
                 sub_skip_start = skip_f
+
+                # Fast subset-level skip when all imaged cards in this subset are already on disk or dead-cached
+                sub_has_pending = False
+                for cid_chk, ent_chk in sub_items:
+                    cid_chk_n = normalize_numeric_tcdb_cid(cid_chk)
+                    f_f = str(ent_chk.get("front_file") or "")
+                    b_f = str(ent_chk.get("back_file") or "")
+                    has_f_d = (cid_chk_n, "F") in disk_cid_index or (f_f and (set_dir / f_f).exists())
+                    has_b_d = (cid_chk_n, "B") in disk_cid_index or (b_f and (set_dir / b_f).exists())
+                    has_b_u = bool(ent_chk.get("url_rep_back") or ent_chk.get("url_std_back"))
+                    if (not has_f_d and cid_chk_n not in dead_fronts and str(cid_chk) not in dead_fronts) or (
+                        has_f_d and has_b_u and not has_b_d and cid_chk_n not in dead_backs and str(cid_chk) not in dead_backs
+                    ):
+                        sub_has_pending = True
+                        break
+                if not sub_has_pending:
+                    skip_f += sub_tot
+                    c_idx += sub_tot
+                    completed_cards_all += sub_tot
+                    completed_subsets_all += 1
+                    continue
 
                 for sub_pos, (cid, entry) in enumerate(sub_items, 1):
                     c_idx += 1
@@ -4204,6 +4710,10 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
                     url_std_f = str(entry.get("url_std_front") or "")
                     url_rep_b = str(entry.get("url_rep_back") or "")
                     url_std_b = str(entry.get("url_std_back") or "")
+                    f_thumb_u = str(entry.get("front_thumb") or "")
+                    b_thumb_u = str(entry.get("back_thumb") or "")
+                    f_hint_t = str(entry.get("front_tier_hint") or "")
+                    b_hint_t = str(entry.get("back_tier_hint") or "")
 
                     q_f_winner = ""
                     has_front = False
@@ -4214,8 +4724,14 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
                         f_status = existing_f
                         if isinstance(entry.get("front"), dict):
                             q_f_winner = str(entry["front"].get("quality") or "")
+                    elif cid in dead_fronts or normalize_numeric_tcdb_cid(cid) in dead_fronts:
+                        skip_noback += 1
+                        f_status = "Skip(DeadFrontCached)"
                     elif url_rep_f or url_std_f:
-                        q_f = _download_single_template_side(req_session, url_rep_f, url_std_f, referer, f_path, set_key=folder_name)
+                        q_f = _download_single_template_side(
+                            req_session, url_rep_f, url_std_f, referer, f_path,
+                            set_key=folder_name, thumb_url=f_thumb_u, preferred_tier=f_hint_t,
+                        )
                         if q_f:
                             has_front = True
                             q_f_winner = q_f
@@ -4227,7 +4743,9 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
                             f_status = f"{q_f}-Tier OK ({kb_f:.1f}KB)"
                         else:
                             miss_f += 1
-                            f_status = "Miss(404)"
+                            dead_fronts[cid] = time.time()
+                            dead_fronts_dirty = True
+                            f_status = "Miss(404->Cached)"
                     else:
                         f_status = "NoURL"
 
@@ -4241,11 +4759,14 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
                     elif not (url_rep_b or url_std_b):
                         skip_noback += 1
                         b_status = "Skip(NoBackOnTCDB)"
-                    elif cid in dead_backs:
+                    elif cid in dead_backs or normalize_numeric_tcdb_cid(cid) in dead_backs:
                         skip_noback += 1
                         b_status = "Skip(DeadBackCached)"
                     else:
-                        q_b = _download_single_template_side(req_session, url_rep_b, url_std_b, referer, b_path, set_key=folder_name, preferred_tier=q_f_winner)
+                        q_b = _download_single_template_side(
+                            req_session, url_rep_b, url_std_b, referer, b_path,
+                            set_key=folder_name, thumb_url=b_thumb_u, preferred_tier=b_hint_t or q_f_winner,
+                        )
                         if q_b:
                             dl_b += 1
                             disk_cid_index[(cid, "B")] = b_path
@@ -4298,6 +4819,8 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
             save_catalog(folder_name, catalog)
             if dead_backs_dirty:
                 save_dead_backs_cache(dead_backs)
+            if dead_fronts_dirty:
+                save_dead_fronts_cache(dead_fronts)
             sync_set_library_download_status(target_set_name=chk_title, rebuild_master_checklist=True)
             learner.record_set_run_timing(
                 set_key=set_stats_key,
@@ -4324,6 +4847,8 @@ def mode_checklist_and_images_card_by_card(
     target_queue: Optional[dict[str, str]] = None,
     clean_slate_reset: bool = False,
     cooldown_seconds: int = 5,
+    incremental: bool = True,
+    force_refresh: bool = False,
 ):
     """
     COMBINED CARD-BY-CARD PIPELINE (Button #4):
@@ -4386,6 +4911,8 @@ def mode_checklist_and_images_card_by_card(
                 prefetched_insert_counts=pre["prefetched_insert_counts"].get(set_url),
                 prefetched_base_html=pre["prefetched_base_html"].get(set_url),
                 progress_ctx=p_ctx,
+                incremental=incremental,
+                force_refresh=force_refresh,
             )
             if not df_set.empty:
                 _merge_set_checklist_into_master(df_set, chk_title, replace_set_cleanly=True)
@@ -4455,9 +4982,32 @@ def mode_image_update_pipeline(target_queue: Optional[dict[str, str]] = None):
                 f"[{idx}/{total_sets}] 🔄 HTML-Guided High-Res Upgrade for '{folder_name}': "
                 f"Checking {len(s_tier_targets):,} local S-Tier image(s) via TCDB checklist thumbnails..."
             )
-            _, fresh_rows = scrape_tcdb_checklist_set(
-                req_session, set_url, chk_title, folder_name=folder_name, include_inserts=True, download_images_card_by_card=False
-            )
+            # Restrict HTML re-scan strictly to subsets that actually contain local S-Tier images
+            s_tier_sub_keys = {canonical_subset_key(sub_n) for (sub_n, _, _) in s_tier_targets.values()}
+            sub_urls_by_key: dict[str, str] = {}
+            cp = load_set_checkpoint(chk_title, alt_folder_name=folder_name)
+            for cp_ent in (cp.get("subsets") or {}).values():
+                if isinstance(cp_ent, dict) and cp_ent.get("subset_url"):
+                    sub_urls_by_key[canonical_subset_key(str(cp_ent.get("subset_name") or ""))] = str(cp_ent["subset_url"])
+            for sub_n, cards in catalog.items():
+                if not isinstance(cards, dict):
+                    continue
+                sk_c = canonical_subset_key(str(sub_n))
+                if sk_c not in sub_urls_by_key:
+                    for cid_c, ent_c in cards.items():
+                        if not str(cid_c).startswith("_") and isinstance(ent_c, dict) and (ent_c.get("subset_url") or ent_c.get("referer")):
+                            sub_urls_by_key[sk_c] = str(ent_c.get("subset_url") or ent_c.get("referer")).split("?")[0]
+                            break
+
+            if s_tier_sub_keys and all(sk in sub_urls_by_key for sk in s_tier_sub_keys):
+                fresh_rows = []
+                for sk in sorted(s_tier_sub_keys):
+                    sub_lbl_orig = next((sn for (sn, _, _) in s_tier_targets.values() if canonical_subset_key(sn) == sk), sk)
+                    fresh_rows.extend(_scrape_tcdb_subset_checklist_pages(req_session, sub_urls_by_key[sk], subset_name=sub_lbl_orig, checklist_set_name=chk_title))
+            else:
+                _, fresh_rows = scrape_tcdb_checklist_set(
+                    req_session, set_url, chk_title, folder_name=folder_name, include_inserts=True, download_images_card_by_card=False
+                )
 
             upgraded = 0
             checked_hits = 0
@@ -4528,6 +5078,31 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
 
     dead_backs = load_dead_backs_cache()
     dead_backs_dirty = False
+
+    # Zero-network pre-scan: only open TCDB session if at least 1 card has a known back URL on TCDB
+    eligible_total = 0
+    for set_url, folder_name in queue.items():
+        catalog_pre = load_catalog(folder_name)
+        set_dir_pre = REFERENCE_TEMPLATES_DIR / sanitize_filename_part(folder_name)
+        disk_pre = _index_existing_set_dir_by_cid(set_dir_pre)
+        for _, cards_p in catalog_pre.items():
+            if not isinstance(cards_p, dict):
+                continue
+            for cid_p, ent_p in cards_p.items():
+                if str(cid_p).startswith("_") or not isinstance(ent_p, dict):
+                    continue
+                cid_n_p = normalize_numeric_tcdb_cid(cid_p)
+                f_f = str(ent_p.get("front_file") or "")
+                b_f = str(ent_p.get("back_file") or "")
+                has_f = (cid_n_p, "F") in disk_pre or (f_f and (set_dir_pre / f_f).exists())
+                has_b = (cid_n_p, "B") in disk_pre or (b_f and (set_dir_pre / b_f).exists())
+                has_b_url = bool(ent_p.get("url_rep_back") or ent_p.get("url_std_back"))
+                if has_f and not has_b and b_f and has_b_url and cid_n_p not in dead_backs:
+                    eligible_total += 1
+    if eligible_total == 0:
+        log_msg(f"✅ [FAST-SKIP] Missing Back Audit: 0 eligible cards with known TCDB back URLs across {len(queue)} set(s).")
+        return
+
     req_session = connect_session(target_domain=BASE_URL)
     try:
         for idx, (set_url, folder_name) in enumerate(queue.items(), 1):
@@ -4556,8 +5131,8 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
                         cached_dead_skips += 1
                         continue
 
-                    url_rep_b = str(entry.get("url_rep_back") or "") or str(entry.get("url_rep_front", "")).replace("RepFr.jpg", "RepBk.jpg")
-                    url_std_b = str(entry.get("url_std_back") or "") or str(entry.get("url_std_front", "")).replace("Fr.jpg", "Bk.jpg")
+                    url_rep_b = str(entry.get("url_rep_back") or "")
+                    url_std_b = str(entry.get("url_std_back") or "")
                     if url_rep_b or url_std_b:
                         pref_t = str(entry.get("front", {}).get("quality") or "") if isinstance(entry.get("front"), dict) else ""
                         q_b = _download_single_template_side(
@@ -4567,7 +5142,8 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
                             entry.get("referer", set_url),
                             set_dir / b_file,
                             set_key=folder_name,
-                            preferred_tier=pref_t,
+                            thumb_url=str(entry.get("back_thumb") or ""),
+                            preferred_tier=str(entry.get("back_tier_hint") or pref_t),
                         )
                         if q_b:
                             entry["back"] = {"quality": q_b, "file": b_file}
@@ -4590,6 +5166,203 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
         cleanup_orphaned_drivers()
 
     sync_set_library_download_status(rebuild_master_checklist=True)
+
+
+def _format_eta_compact(seconds: float) -> str:
+    sec = max(0, int(round(seconds)))
+    if sec < 60:
+        return f"{sec}s"
+    mins, rem_s = divmod(sec, 60)
+    if mins < 60:
+        return f"{mins}m {rem_s}s" if rem_s else f"{mins}m"
+    hrs, rem_m = divmod(mins, 60)
+    return f"{hrs}h {rem_m}m" if rem_m else f"{hrs}h"
+
+
+def build_scraper_execution_plan(
+    target_queue: Optional[dict[str, str]] = None,
+    mode_key: str = "checklist_only",
+    force_refresh: bool = False,
+) -> dict:
+    """
+    Purely local dry-run execution planner (0 TCDB HTTP requests, <1s):
+    Inspects `Set_Checklists/*.csv`, `<set>_checkpoint.json`, `<set>_catalog.json`,
+    `Reference_Library` images on disk, `dead_backs_cache`, `dead_fronts_cache`,
+    and `AdaptiveRateLearner` pacing to preview exact skip/update/download counts & ETA.
+    """
+    ensure_directories()
+    meta_map = load_tracked_sets_meta(prioritize=True)
+    queue = target_queue or {u: m["folder_name"] for u, m in meta_map.items()}
+    dead_backs = load_dead_backs_cache()
+    dead_fronts = load_dead_fronts_cache()
+    learner = get_rate_learner()
+    tcdb_ep = (learner._state.get("endpoints") or {}).get("tcdb_domain") or {}
+    safe_rpm = max(8.0, float(tcdb_ep.get("safe_rpm", 23.5) or 23.5))
+
+    subsets_unchanged_skipped = 0
+    subsets_to_update = 0
+    missing_fronts_total = 0
+    missing_backs_total = 0
+    already_on_disk_total = 0
+    skipped_dead_total = 0
+    est_http_requests_total = 0
+    per_set: list[dict] = []
+
+    for set_url, folder_name in queue.items():
+        chk_title = canonicalize_checklist_set_title(folder_name.replace("_", " ").strip())
+        cp = {} if force_refresh else load_set_checkpoint(chk_title, alt_folder_name=folder_name)
+        cp_subsets = cp.get("subsets") if isinstance(cp.get("subsets"), dict) else {}
+        local_rows_by_key, names_by_key, _ = _load_local_set_csv_rows_by_subset(chk_title, folder_name=folder_name)
+        catalog = load_catalog(folder_name)
+        set_dir = REFERENCE_TEMPLATES_DIR / sanitize_filename_part(folder_name)
+        disk_idx = _index_existing_set_dir_by_cid(set_dir)
+
+        set_skip_subs = 0
+        set_upd_subs = 0
+        set_miss_f = 0
+        set_miss_b = 0
+        set_disk_ok = 0
+        set_dead_skip = 0
+        set_reqs = 0
+
+        # Evaluate known subsets from checkpoint + local CSV
+        complete_keys: set[str] = set()
+        for cp_ent in cp_subsets.values():
+            if not isinstance(cp_ent, dict):
+                continue
+            sk = canonical_subset_key(str(cp_ent.get("subset_name") or ""))
+            loc_rows = local_rows_by_key.get(sk, [])
+            exp_c = int(cp_ent.get("expected_cards") or 0)
+            if (
+                not force_refresh
+                and cp_ent.get("status") == "complete"
+                and loc_rows
+                and (exp_c <= 0 or len(loc_rows) == exp_c)
+                and compute_subset_rows_checksum(loc_rows) == cp_ent.get("rows_sha256")
+            ):
+                complete_keys.add(sk)
+
+        # Also count CSV-bootstrappable subsets when checkpoint is missing/partial
+        if not force_refresh:
+            for sk, loc_rows in local_rows_by_key.items():
+                if sk in complete_keys or not loc_rows:
+                    continue
+                pop_cids = sum(1 for r in loc_rows if str(r.get("TCDB_CID") or "").strip() not in ("", "0", "nan", "None"))
+                if pop_cids > 0 and pop_cids >= int(len(loc_rows) * 0.95):
+                    complete_keys.add(sk)
+
+        all_known_keys = set(local_rows_by_key.keys()) | {
+            canonical_subset_key(str(k)) for k in catalog.keys() if isinstance(catalog.get(k), dict)
+        }
+
+        if mode_key in ("checklist_only", "checklist_and_images"):
+            if not all_known_keys:
+                # Brand-new set not yet scraped locally -> estimate 1 Base + Inserts index
+                set_upd_subs = 1
+                set_reqs += 3
+            else:
+                set_skip_subs = len(complete_keys)
+                set_upd_subs = max(0, len(all_known_keys) - len(complete_keys))
+                # 1 Inserts.cfm check per set + ~1-2 pages per subset to update
+                set_reqs += 1 + (set_upd_subs * 2)
+                if force_refresh:
+                    set_reqs += 1
+
+        if mode_key in ("checklist_and_images", "images_only", "missing_back", "upgrade"):
+            for sub_n, cards_d in catalog.items():
+                if not isinstance(cards_d, dict):
+                    continue
+                sub_has_s_tier = False
+                for cid, ent in cards_d.items():
+                    if str(cid).startswith("_") or not isinstance(ent, dict):
+                        continue
+                    cid_n = normalize_numeric_tcdb_cid(cid)
+                    f_file = str(ent.get("front_file") or "")
+                    b_file = str(ent.get("back_file") or "")
+                    has_f_disk = (cid_n, "F") in disk_idx or (f_file and (set_dir / f_file).exists())
+                    has_b_disk = (cid_n, "B") in disk_idx or (b_file and (set_dir / b_file).exists())
+                    has_f_url = bool(ent.get("url_rep_front") or ent.get("url_std_front"))
+                    has_b_url = bool(ent.get("url_rep_back") or ent.get("url_std_back"))
+
+                    if has_f_disk:
+                        set_disk_ok += 1
+                    if has_b_disk:
+                        set_disk_ok += 1
+
+                    if mode_key in ("checklist_and_images", "images_only"):
+                        if has_f_url and not has_f_disk:
+                            if cid_n in dead_fronts or str(cid) in dead_fronts:
+                                set_dead_skip += 1
+                            else:
+                                set_miss_f += 1
+                                set_reqs += 1 if ent.get("front_tier_hint") or ent.get("front_thumb") else 2
+                        if (has_f_disk or (has_f_url and cid_n not in dead_fronts)) and has_b_url and not has_b_disk:
+                            if cid_n in dead_backs or str(cid) in dead_backs:
+                                set_dead_skip += 1
+                            else:
+                                set_miss_b += 1
+                                set_reqs += 1 if ent.get("back_tier_hint") or ent.get("back_thumb") else 2
+                    elif mode_key == "missing_back":
+                        if has_f_disk and not has_b_disk and has_b_url:
+                            if cid_n in dead_backs or str(cid) in dead_backs:
+                                set_dead_skip += 1
+                            else:
+                                set_miss_b += 1
+                                set_reqs += 1 if ent.get("back_tier_hint") or ent.get("back_thumb") else 2
+                    elif mode_key == "upgrade":
+                        for s_key in ("front", "back"):
+                            s_meta = ent.get(s_key)
+                            if isinstance(s_meta, dict) and s_meta.get("quality") == "S":
+                                sub_has_s_tier = True
+                                set_miss_f += 1 if s_key == "front" else 0
+                                set_miss_b += 1 if s_key == "back" else 0
+                if mode_key == "upgrade" and sub_has_s_tier:
+                    set_upd_subs += 1
+                    set_reqs += 2
+
+        subsets_unchanged_skipped += set_skip_subs
+        subsets_to_update += set_upd_subs
+        missing_fronts_total += set_miss_f
+        missing_backs_total += set_miss_b
+        already_on_disk_total += set_disk_ok
+        skipped_dead_total += set_dead_skip
+        est_http_requests_total += set_reqs
+
+        set_eta_s = (set_reqs / safe_rpm) * 60.0 if set_reqs > 0 else 0.0
+        per_set.append({
+            "set_url": set_url,
+            "folder_name": folder_name,
+            "set_name": chk_title,
+            "subsets_skipped": set_skip_subs,
+            "subsets_to_update": set_upd_subs,
+            "missing_fronts": set_miss_f,
+            "missing_backs": set_miss_b,
+            "already_on_disk": set_disk_ok,
+            "dead_cached_skipped": set_dead_skip,
+            "estimated_requests": set_reqs,
+            "estimated_eta_seconds": int(round(set_eta_s)),
+            "estimated_eta_display": _format_eta_compact(set_eta_s),
+            "status": "Up to date" if (set_upd_subs == 0 and set_miss_f == 0 and set_miss_b == 0) else "Pending work",
+        })
+
+    total_eta_s = (est_http_requests_total / safe_rpm) * 60.0 if est_http_requests_total > 0 else 0.0
+    return {
+        "mode": mode_key,
+        "force_refresh": bool(force_refresh),
+        "total_sets": len(queue),
+        "subsets_unchanged_skipped": subsets_unchanged_skipped,
+        "subsets_to_update": subsets_to_update,
+        "missing_front_images_queued": missing_fronts_total,
+        "missing_back_images_queued": missing_backs_total,
+        "missing_images_queued": missing_fronts_total + missing_backs_total,
+        "already_on_disk_images": already_on_disk_total,
+        "skipped_dead_cached": skipped_dead_total,
+        "estimated_http_requests": est_http_requests_total,
+        "safe_rpm": round(safe_rpm, 1),
+        "estimated_eta_seconds": int(round(total_eta_s)),
+        "estimated_eta_display": _format_eta_compact(total_eta_s),
+        "per_set": per_set,
+    }
 
 
 # ==============================================================================

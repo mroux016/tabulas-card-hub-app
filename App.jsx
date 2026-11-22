@@ -2037,7 +2037,34 @@ export default function App() {
   const [clPageSize, setClPageSize] = useState(250);
 
   const [cleanSlateChecklists, setCleanSlateChecklists] = useState(false);
+  const [forceFullReverify, setForceFullReverify] = useState(false);
+  const [planPreview, setPlanPreview] = useState(null);
+  const [planPreviewLoading, setPlanPreviewLoading] = useState(false);
+  const [planPreviewMode, setPlanPreviewMode] = useState('checklist_only');
   const [showMaintenanceWidget, setShowMaintenanceWidget] = useState(false);
+
+  const fetchScraperPlanPreview = (modeKey, targetMap) => {
+    const useMode = modeKey || planPreviewMode || 'checklist_only';
+    setPlanPreviewMode(useMode);
+    setPlanPreviewLoading(true);
+    fetch(`${NODE_API_BASE}/scraper/plan-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: useMode,
+        target_queue: targetMap || null,
+        force_refresh: forceFullReverify,
+      }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && res.success && res.plan) {
+          setPlanPreview(res.plan);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setPlanPreviewLoading(false));
+  };
 
   const [dirSearch, setDirSearch] = useState('');
   const [dirSportFilter, setDirSportFilter] = useState('All Sports');
@@ -7172,18 +7199,33 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    <label className="flex items-center gap-2 text-xs text-slate-300">
-                      <input type="checkbox" checked={cleanSlateChecklists} onChange={(e) => setCleanSlateChecklists(e.target.checked)} />
-                      🧹 Clean-Slate Build (Archive existing CSVs in Checklists\ before building)
-                    </label>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-4">
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input type="checkbox" checked={cleanSlateChecklists} onChange={(e) => setCleanSlateChecklists(e.target.checked)} />
+                          🧹 Clean-Slate Build (Archive existing CSVs in Checklists\ before building)
+                        </label>
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input type="checkbox" checked={forceFullReverify} onChange={(e) => setForceFullReverify(e.target.checked)} />
+                          🔄 Force Full Re-Verify (Ignore Incremental Checkpoints)
+                        </label>
+                      </div>
+                      <button
+                        onClick={() => fetchScraperPlanPreview(planPreviewMode, targetScraperQueueMap)}
+                        disabled={planPreviewLoading}
+                        className="px-3 py-1.5 rounded-xl bg-sky-700/80 hover:bg-sky-600 disabled:opacity-50 text-white font-bold text-xs border border-sky-500/40"
+                      >
+                        {planPreviewLoading ? '⏳ Computing Plan...' : '📋 Preview Plan (Dry Run)'}
+                      </button>
+                    </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2">
-                      <button onClick={() => triggerJob('set_scraper', `Build Checklists Only (${scopeLbl})`, 'tcdb_checklist_scrape', { selected_tcdb_sets: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, estimated_total: Math.max(1, targetCount) })} className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs">
+                      <button onClick={() => triggerJob('set_scraper', `Build Checklists Only (${scopeLbl})`, 'tcdb_checklist_scrape', { selected_tcdb_sets: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, incremental: !forceFullReverify, force_refresh: forceFullReverify, estimated_total: Math.max(1, targetCount) })} className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs">
                         🏛️ Checklists Only ({scopeLbl})
                       </button>
                       <button onClick={() => triggerJob('set_scraper', `Download Images Only (${scopeLbl})`, 'tcdb_download_all_images', { target_queue: targetScraperQueueMap, estimated_total: Math.max(1, targetCount) })} className={`py-2.5 px-3 rounded-xl font-bold text-xs ${skin.accentBtn}`}>
                         📥 Images Only ({scopeLbl})
                       </button>
-                      <button onClick={() => triggerJob('set_scraper', `Build Checklists + Images Card-by-Card (${scopeLbl})`, 'tcdb_checklist_and_images', { target_queue: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, estimated_total: Math.max(1, targetCount) })} className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white font-bold text-xs shadow-lg">
+                      <button onClick={() => triggerJob('set_scraper', `Build Checklists + Images Card-by-Card (${scopeLbl})`, 'tcdb_checklist_and_images', { target_queue: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, incremental: !forceFullReverify, force_refresh: forceFullReverify, estimated_total: Math.max(1, targetCount) })} className="py-2.5 px-3 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white font-bold text-xs shadow-lg">
                         ⚡ Checklists + Images ({scopeLbl})
                       </button>
                       <button onClick={() => triggerJob('set_scraper', `High-Res R-Tier Upgrade (${scopeLbl})`, 'tcdb_upgrade', { target_queue: targetScraperQueueMap, estimated_total: Math.max(1, targetCount) })} className="py-2.5 px-3 rounded-xl bg-amber-600/90 hover:bg-amber-500 text-white font-bold text-xs shadow">
@@ -7193,6 +7235,82 @@ export default function App() {
                         🔎 Missing Backs ({scopeLbl})
                       </button>
                     </div>
+                    {planPreview && (
+                      <div className="p-3 rounded-xl bg-slate-950/90 border border-sky-500/40 space-y-2.5 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="font-extrabold text-sky-300">📋 Execution Preview ({planPreview.total_sets} set{planPreview.total_sets === 1 ? '' : 's'}):</span>
+                            {[
+                              ['checklist_only', 'Checklists Only'],
+                              ['checklist_and_images', 'Checklists + Images'],
+                              ['images_only', 'Images Only'],
+                              ['upgrade', 'High-Res Upgrade'],
+                              ['missing_back', 'Missing Backs'],
+                            ].map(([mk, ml]) => (
+                              <button
+                                key={mk}
+                                onClick={() => fetchScraperPlanPreview(mk, targetScraperQueueMap)}
+                                className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold border ${planPreview.mode === mk ? 'bg-sky-600 text-white border-sky-400' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
+                              >
+                                {ml}
+                              </button>
+                            ))}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => {
+                                const m = planPreview.mode || 'checklist_only';
+                                if (m === 'checklist_only') triggerJob('set_scraper', `Build Checklists Only (${scopeLbl})`, 'tcdb_checklist_scrape', { selected_tcdb_sets: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, incremental: !forceFullReverify, force_refresh: forceFullReverify, estimated_total: Math.max(1, targetCount) });
+                                else if (m === 'images_only') triggerJob('set_scraper', `Download Images Only (${scopeLbl})`, 'tcdb_download_all_images', { target_queue: targetScraperQueueMap, estimated_total: Math.max(1, targetCount) });
+                                else if (m === 'checklist_and_images') triggerJob('set_scraper', `Build Checklists + Images Card-by-Card (${scopeLbl})`, 'tcdb_checklist_and_images', { target_queue: targetScraperQueueMap, clean_slate_reset: cleanSlateChecklists, incremental: !forceFullReverify, force_refresh: forceFullReverify, estimated_total: Math.max(1, targetCount) });
+                                else if (m === 'upgrade') triggerJob('set_scraper', `High-Res R-Tier Upgrade (${scopeLbl})`, 'tcdb_upgrade', { target_queue: targetScraperQueueMap, estimated_total: Math.max(1, targetCount) });
+                                else if (m === 'missing_back') triggerJob('set_scraper', `Missing Backs Audit (${scopeLbl})`, 'tcdb_missing_back', { target_queue: targetScraperQueueMap, estimated_total: Math.max(1, targetCount) });
+                                setPlanPreview(null);
+                              }}
+                              className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px]"
+                            >
+                              ▶ Execute Plan
+                            </button>
+                            <button onClick={() => setPlanPreview(null)} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">✕ Close</button>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-2 text-[11px]">
+                          <span className="px-2.5 py-1 rounded-lg bg-emerald-950/70 border border-emerald-700/60 text-emerald-300 font-semibold">✅ {(planPreview.subsets_unchanged_skipped || 0).toLocaleString()} subsets unchanged & skipped</span>
+                          <span className="px-2.5 py-1 rounded-lg bg-amber-950/70 border border-amber-700/60 text-amber-300 font-semibold">🔄 {(planPreview.subsets_to_update || 0).toLocaleString()} subsets to update</span>
+                          <span className="px-2.5 py-1 rounded-lg bg-violet-950/70 border border-violet-700/60 text-violet-300 font-semibold">🖼️ {(planPreview.missing_images_queued || 0).toLocaleString()} missing images queued</span>
+                          <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-300 font-semibold">🌐 ~{(planPreview.estimated_http_requests || 0).toLocaleString()} reqs @ {planPreview.safe_rpm || 23.5} req/m</span>
+                          <span className="px-2.5 py-1 rounded-lg bg-sky-950/70 border border-sky-700/60 text-sky-300 font-bold">⏱️ ETA ~{planPreview.estimated_eta_display || '0s'}</span>
+                        </div>
+                        {Array.isArray(planPreview.per_set) && planPreview.per_set.length > 0 && (
+                          <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-800">
+                            <table className="w-full text-left text-[11px]">
+                              <thead className="bg-slate-900/90 text-slate-400 sticky top-0">
+                                <tr>
+                                  <th className="py-1 px-2">Set</th>
+                                  <th className="py-1 px-2 text-right">Skip Subsets</th>
+                                  <th className="py-1 px-2 text-right">Update Subsets</th>
+                                  <th className="py-1 px-2 text-right">Missing F/B</th>
+                                  <th className="py-1 px-2 text-right">Est. Reqs</th>
+                                  <th className="py-1 px-2 text-right">ETA</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/70">
+                                {planPreview.per_set.map((ps, pi) => (
+                                  <tr key={pi} className="hover:bg-slate-900/60">
+                                    <td className="py-1 px-2 text-slate-200 font-medium truncate max-w-[240px]">{ps.set_name}</td>
+                                    <td className="py-1 px-2 text-right text-emerald-400">{ps.subsets_skipped}</td>
+                                    <td className="py-1 px-2 text-right text-amber-400">{ps.subsets_to_update}</td>
+                                    <td className="py-1 px-2 text-right text-violet-300">{ps.missing_fronts}/{ps.missing_backs}</td>
+                                    <td className="py-1 px-2 text-right text-slate-300">{ps.estimated_requests}</td>
+                                    <td className="py-1 px-2 text-right text-sky-300">{ps.estimated_eta_display}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="text-[11px] text-slate-400">
                       📥 <b>Auto-Queue Protection Active:</b> Starting additional tasks in this silo automatically queues them sequentially behind the active job so two TCDB workers never collide.
                     </div>

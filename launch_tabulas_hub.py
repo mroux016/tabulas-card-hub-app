@@ -2238,6 +2238,16 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if route == "/api/scraper/plan-preview" and isinstance(payload, dict):
+            from Core.scraper_engine import build_scraper_execution_plan
+            plan = build_scraper_execution_plan(
+                target_queue=payload.get("target_queue") or None,
+                mode_key=str(payload.get("mode") or "checklist_only"),
+                force_refresh=bool(payload.get("force_refresh", False)),
+            )
+            self._send_json({"success": True, "plan": plan})
+            return
+
         if route == "/api/notifications" and isinstance(payload, dict):
             from datetime import datetime
             from Core.config import NOTIFICATIONS_CSV_COLUMNS, NOTIFICATIONS_HISTORY_CSV
