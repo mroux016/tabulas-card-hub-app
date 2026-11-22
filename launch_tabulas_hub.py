@@ -728,7 +728,7 @@ def _get_live_lanes_and_logs() -> dict:
             clean_st["parallel_workers"] = clean_workers
             safe_states[lk] = clean_st
         logs_by_lane = {lk: cli.get_active_job_logs(max_lines=500, lane=lk) for lk in cli.PROCESS_LANES.keys()}
-        return {"lanes": safe_states, "logs": logs_by_lane, "runLogFiles": cli.list_run_log_files(limit=40)}
+        return {"lanes": safe_states, "logs": logs_by_lane, "runLogFiles": []}
     except Exception as e:
         return {"lanes": {}, "logs": {}, "error": str(e)}
 
@@ -876,13 +876,25 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_static_file(self, file_path: Path):
-        if not file_path.exists() or not file_path.is_file():
+    def _serve_static_file(self, file_path: Path, root_dir: Path | None = None):
+        try:
+            resolved_file = file_path.resolve()
+            if root_dir is not None:
+                resolved_root = root_dir.resolve()
+                if not resolved_file.is_relative_to(resolved_root):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+        except (OSError, ValueError):
+            self.send_response(400)
+            self.end_headers()
+            return
+        if not resolved_file.exists() or not resolved_file.is_file():
             self.send_response(404)
             self.end_headers()
             return
-        mime, _ = mimetypes.guess_type(str(file_path))
-        data = file_path.read_bytes()
+        mime, _ = mimetypes.guess_type(str(resolved_file))
+        data = resolved_file.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", mime or "application/octet-stream")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -902,6 +914,11 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
         route = unquote(parsed.path)
         query = parse_qs(parsed.query)
 
+        if route == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+
         if route in ("/", "/index.html"):
             jsx_path = (APP_DIR / "App.jsx") if (APP_DIR / "App.jsx").exists() else (HUB_DIR / "App.jsx")
             body = _build_tabulas_react_html_v2(jsx_path).encode("utf-8")
@@ -914,16 +931,20 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route.startswith("/static/cards/"):
-            self._serve_static_file(REVIEWED_CARDS_DIR / route[len("/static/cards/"):].lstrip("/\\"))
+            rel_part = route[len("/static/cards/"):].lstrip("/\\")
+            self._serve_static_file(REVIEWED_CARDS_DIR / rel_part, root_dir=REVIEWED_CARDS_DIR)
             return
         if route.startswith("/static/templates/"):
-            self._serve_static_file(SET_LIBRARY_DIR / route[len("/static/templates/"):].lstrip("/\\"))
+            rel_part = route[len("/static/templates/"):].lstrip("/\\")
+            self._serve_static_file(SET_LIBRARY_DIR / rel_part, root_dir=SET_LIBRARY_DIR)
             return
         if route.startswith("/static/batches/"):
-            self._serve_static_file(BATCHES_DIR / route[len("/static/batches/"):].lstrip("/\\"))
+            rel_part = route[len("/static/batches/"):].lstrip("/\\")
+            self._serve_static_file(BATCHES_DIR / rel_part, root_dir=BATCHES_DIR)
             return
         if route.startswith("/static/labels/"):
-            self._serve_static_file(LABELS_OUTPUT_DIR / route[len("/static/labels/"):].lstrip("/\\"))
+            rel_part = route[len("/static/labels/"):].lstrip("/\\")
+            self._serve_static_file(LABELS_OUTPUT_DIR / rel_part, root_dir=LABELS_OUTPUT_DIR)
             return
 
         if route == "/api/status":
@@ -993,19 +1014,44 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/logs/list":
-            import cli
-            self._send_json({"files": cli.list_run_log_files(limit=80), "logsDir": str(LOGS_DIR)})
+            from datetime import datetime
+            files_out = []
+            if DAILY_LOGS_ROOT.exists():
+                cands = [p for p in DAILY_LOGS_ROOT.rglob("*.log") if p.is_file()]
+                cands.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+                for p in cands[:80]:
+                    try:
+                        st = p.stat()
+                        files_out.append({
+                            "name": p.name,
+                            "relPath": p.relative_to(DAILY_LOGS_ROOT).as_posix(),
+                            "fullPath": str(p),
+                            "sizeKb": round(st.st_size / 1024.0, 1),
+                            "modified": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    except Exception:
+                        continue
+            self._send_json({"files": files_out, "logsDir": str(DAILY_LOGS_ROOT)})
             return
 
         if route == "/api/logs/download":
             rel_f = (query.get("file") or [""])[0].strip().lstrip("/\\")
-            if not rel_f or ".." in rel_f:
+            if not rel_f:
                 self.send_response(400)
                 self.end_headers()
                 return
-            target_log = (LOGS_DIR / rel_f).resolve()
-            logs_root = LOGS_DIR.resolve()
-            if not str(target_log).startswith(str(logs_root)) or not target_log.exists():
+            try:
+                logs_root = DAILY_LOGS_ROOT.resolve()
+                target_log = (DAILY_LOGS_ROOT / rel_f).resolve()
+                if not target_log.is_relative_to(logs_root):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+            except (OSError, ValueError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            if not target_log.exists() or not target_log.is_file():
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -1447,7 +1493,8 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             from Core.sales_engine import fetch_and_cache_set_blurb
             set_q = (query.get("set") or [""])[0].strip()
             force_ref = (query.get("forceRefresh") or ["false"])[0].lower() == "true"
-            self._send_json(fetch_and_cache_set_blurb(set_q, force_refresh=force_ref))
+            reset_def = (query.get("resetToDefault") or ["false"])[0].lower() == "true"
+            self._send_json(fetch_and_cache_set_blurb(set_q, force_refresh=force_ref, reset_to_default=reset_def))
             return
 
         if route == "/api/sales/lots":
@@ -1466,7 +1513,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json(_read_json_file(SET_CART_JSON_FILE, []))
             return
 
-        self._send_json({"ok": True})
+        self._send_json({"ok": False, "error": f"Not found: {route}"}, status=404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -2176,8 +2223,14 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             net_profit = round((sale_price + ship_col) - (fees + effective_ship_deduction + cost_basis), 2)
             sku_val = str(payload.get("SKU") or "").strip()
 
+            max_sale_num = 0
+            for ex_r in existing:
+                m_sid = re.search(r"(\d+)$", str(ex_r.get("Sale_ID") or "").strip())
+                if m_sid:
+                    max_sale_num = max(max_sale_num, int(m_sid.group(1)))
+
             new_rec = {
-                "Sale_ID": str(payload.get("Sale_ID") or f"SALE-{len(existing) + 1:05d}"),
+                "Sale_ID": str(payload.get("Sale_ID") or f"SALE-{max_sale_num + 1:05d}"),
                 "Sale_Date": str(payload.get("Sale_Date") or datetime.now().strftime("%Y-%m-%d")),
                 "SKU": sku_val,
                 "Set": str(payload.get("Set") or "").strip(),
@@ -2487,23 +2540,24 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
             save_card_level_targets(targets_map)
 
-            if not inv_df.empty and upd_by_key:
-                for r_idx, row in inv_df.iterrows():
-                    if str(row.get("Status") or "").strip().lower() == "sold":
-                        continue
-                    ck_r = build_unique_card_key(
-                        row.get("Set", ""),
-                        row.get("Subset", "Base"),
-                        row.get("Card Number", ""),
-                        row.get("Player", ""),
-                    )
-                    if ck_r in upd_by_key:
-                        u_d = upd_by_key[ck_r]
-                        if u_d.get("Unit_Raw_Price") not in (None, ""):
-                            inv_df.at[r_idx, "Raw_Price"] = f"{float(u_d['Unit_Raw_Price']):.2f}"
-                        if u_d.get("Unit_Rec_Sale_Price") not in (None, ""):
-                            inv_df.at[r_idx, "Rec_Sale_Price"] = f"{float(u_d['Unit_Rec_Sale_Price']):.2f}"
-                        updated_skus_cnt += 1
+            if not inv_df.empty and (upd_by_key or reallocate):
+                if upd_by_key:
+                    for r_idx, row in inv_df.iterrows():
+                        if str(row.get("Status") or "").strip().lower() == "sold":
+                            continue
+                        ck_r = build_unique_card_key(
+                            row.get("Set", ""),
+                            row.get("Subset", "Base"),
+                            row.get("Card Number", ""),
+                            row.get("Player", ""),
+                        )
+                        if ck_r in upd_by_key:
+                            u_d = upd_by_key[ck_r]
+                            if u_d.get("Unit_Raw_Price") not in (None, ""):
+                                inv_df.at[r_idx, "Raw_Price"] = f"{float(u_d['Unit_Raw_Price']):.2f}"
+                            if u_d.get("Unit_Rec_Sale_Price") not in (None, ""):
+                                inv_df.at[r_idx, "Rec_Sale_Price"] = f"{float(u_d['Unit_Rec_Sale_Price']):.2f}"
+                            updated_skus_cnt += 1
 
                 if reallocate:
                     inv_df, _ = auto_allocate_pc_and_sale_copies(inv_df, default_retain_qty=1)
@@ -2680,13 +2734,13 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
         if route == "/api/jobs/stop" and isinstance(payload, dict):
             import cli
-            cli.stop_active_job(lane=str(payload.get("lane") or "ingest_inventory"))
+            cli.stop_active_job(lane=str(payload.get("lane") or "slot_1"))
             self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
             return
 
         if route == "/api/lanes/clear" and isinstance(payload, dict):
             import cli
-            lane_k = str(payload.get("lane") or "ingest_inventory")
+            lane_k = str(payload.get("lane") or "slot_1")
             cli.clear_lane_monitor_log(lane=lane_k)
             self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
             return
@@ -2748,7 +2802,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
         if route == "/api/jobs/queue/remove" and isinstance(payload, dict):
             import cli
-            lane_k = str(payload.get("lane") or "set_scraper")
+            lane_k = str(payload.get("lane") or "slot_1")
             q_id = str(payload.get("queueId") or "").strip()
             cli.remove_queued_job(lane_k, q_id)
             self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
@@ -2756,12 +2810,12 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
         if route == "/api/jobs/queue/clear" and isinstance(payload, dict):
             import cli
-            lane_k = str(payload.get("lane") or "set_scraper")
+            lane_k = str(payload.get("lane") or "slot_1")
             cli.clear_lane_job_queue(lane_k)
             self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
             return
 
-        self._send_json({"success": True})
+        self._send_json({"success": False, "error": f"Not found: {route}"}, status=404)
 
 
 def _find_edge_executable() -> str | None:

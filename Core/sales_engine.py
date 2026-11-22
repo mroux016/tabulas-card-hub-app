@@ -1340,7 +1340,7 @@ def _build_default_set_blurb(set_name: str) -> str:
     )
 
 
-def fetch_and_cache_set_blurb(set_name: str, force_refresh: bool = False) -> dict:
+def fetch_and_cache_set_blurb(set_name: str, force_refresh: bool = False, reset_to_default: bool = False) -> dict:
     """Returns cached or newly generated collector prose blurb for a Card Set."""
     clean_set = strip_accents(str(set_name or "")).strip()
     if not clean_set:
@@ -1348,7 +1348,7 @@ def fetch_and_cache_set_blurb(set_name: str, force_refresh: bool = False) -> dic
     cache_map = load_set_blurbs_cache()
     s_key = norm(clean_set)
     existing = cache_map.get(s_key)
-    if existing and existing.get("blurb") and (not force_refresh or existing.get("is_custom")):
+    if not reset_to_default and existing and existing.get("blurb") and (not force_refresh or existing.get("is_custom")):
         return existing
 
     blurb = _build_default_set_blurb(clean_set)
