@@ -81,25 +81,6 @@ from PIL import Image, ImageDraw, ImageFont
 __version__ = "0.24.0-beta.43"
 __last_updated__ = "2026-11-21 03:10:00"
 
-try:
-    from rapidocr_onnxruntime import RapidOCR
-except Exception:
-    RapidOCR = None
-
-_RAPID_OCR_ENGINE = None
-
-
-def _get_rapid_ocr_engine():
-    """Lazily initializes RapidOCR on first OCR call so UI imports stay instantaneous."""
-    global _RAPID_OCR_ENGINE
-    if _RAPID_OCR_ENGINE is None and RapidOCR is not None:
-        try:
-            _RAPID_OCR_ENGINE = RapidOCR()
-        except Exception:
-            _RAPID_OCR_ENGINE = None
-    return _RAPID_OCR_ENGINE
-
-
 from Core.config import (
     ARCHIVE_DIR,
     BATCH_MANIFEST_COLUMNS,

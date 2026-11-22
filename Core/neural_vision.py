@@ -196,7 +196,9 @@ class NeuralEmbeddingEngine:
             if not self.is_ready:
                 return False
         try:
-            self.session, self.active_provider = create_onnx_session(self.model_path, prefer_gpu=self.prefer_gpu)
+            self.session, self.active_provider = create_onnx_session(
+                self.model_path, prefer_gpu=self.prefer_gpu, purpose="neural"
+            )
             inp0 = self.session.get_inputs()[0]
             self.input_name = inp0.name
             outs = self.session.get_outputs()

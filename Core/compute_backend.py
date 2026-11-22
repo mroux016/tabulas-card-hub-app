@@ -47,7 +47,6 @@ GPU_USING_JOB_TYPES = {
     "reprocess_batch_cards",
     "fix_card_rotations",
     "build_neural_index",
-    "download_dinov2_model",
 }
 
 _SETTINGS_LOCK = threading.Lock()
@@ -548,14 +547,25 @@ def _probe_opencv_opencl_info() -> dict:
     return info
 
 
-def resolve_target_onnx_provider(settings: Optional[dict] = None, ort_info: Optional[dict] = None) -> str:
-    """Resolves the active ONNX Execution Provider according to the user's mode + hardware cascade."""
+def resolve_target_onnx_provider(
+    settings: Optional[dict] = None,
+    ort_info: Optional[dict] = None,
+    purpose: str = "ocr",
+) -> str:
+    """Resolves the active ONNX Execution Provider according to the user's mode, purpose ('ocr' vs 'neural'), and hardware cascade."""
     if _PROCESS_FORCED_CPU:
         return "CPUExecutionProvider"
     cfg = settings or load_compute_settings()
     mode = str(cfg.get("compute_mode") or "auto").lower()
-    if mode == "cpu" or not cfg.get("enable_ocr_gpu", True):
+    if mode == "cpu":
         return "CPUExecutionProvider"
+    p_norm = str(purpose or "ocr").strip().lower()
+    if p_norm == "neural":
+        if not cfg.get("enable_neural_embeddings", True):
+            return "CPUExecutionProvider"
+    else:
+        if not cfg.get("enable_ocr_gpu", True):
+            return "CPUExecutionProvider"
 
     oi = ort_info or _probe_onnxruntime_info()
     if mode == "directml":
@@ -813,7 +823,7 @@ def get_active_ocr_provider_name() -> str:
 # ==============================================================================
 # SHARED ONNX SESSION FACTORY (FOUNDATION FOR WINS #2 & #4)
 # ==============================================================================
-def create_onnx_session(model_path: Path, prefer_gpu: bool = True):
+def create_onnx_session(model_path: Path, prefer_gpu: bool = True, purpose: str = "neural"):
     """
     Unified ONNX Runtime session factory used by `Core/neural_vision.py` (Wins #2 & #4).
     Automatically steers DirectML / CUDA onto the discrete GPU (`dGPU`) via exact DXGI
@@ -826,7 +836,12 @@ def create_onnx_session(model_path: Path, prefer_gpu: bool = True):
         raise FileNotFoundError(f"ONNX model not found: {m_path}")
 
     cfg = load_compute_settings()
-    target = resolve_target_onnx_provider(cfg) if prefer_gpu else "CPUExecutionProvider"
+    target = resolve_target_onnx_provider(cfg, purpose=purpose) if prefer_gpu else "CPUExecutionProvider"
+
+    if target in ("DmlExecutionProvider", "CUDAExecutionProvider") and not _PROCESS_CLAIMED_GPU:
+        granted, _, _ = claim_gpu_worker_slot(job_type=f"onnx_{purpose}")
+        if not granted:
+            target = "CPUExecutionProvider"
 
     if target in ("DmlExecutionProvider", "CUDAExecutionProvider"):
         try:

@@ -159,7 +159,7 @@ def load_version_registry() -> dict:
     files_meta = {}
     highest_ver = "0.22.0-beta.8"
     for rel in TRACKED_APP_FILES:
-        p = BASE_DIR / rel
+        p = _resolve_disk_path(rel)
         if p.exists() and p.is_file():
             v = detect_file_version_on_disk(rel)
             if is_newer_version(v, highest_ver):
@@ -991,7 +991,7 @@ def configure_scheduled_auto_updater(
         return True, f"Removed scheduled task '{WINDOWS_UPDATER_TASK_NAME}'."
 
     python_exe = sys.executable
-    updater_script = str(BASE_DIR / "updater.py")
+    updater_script = str(_resolve_disk_path("updater.py"))
     task_cmd = f'"{python_exe}" "{updater_script}" --auto'
     res = subprocess.run(
         [

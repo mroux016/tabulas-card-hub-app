@@ -1494,16 +1494,6 @@ def refresh_inventory_market_valuations(
                 fallback_raw_price=_safe_float(sample_row.get("Raw_Price"), 2.00),
             )
             comps_by_key[c_key] = comp_rec
-        elif not existing_comp:
-            comp_rec = fetch_card_market_comps(
-                set_name=sample_row.get("Set", ""),
-                subset_name=sample_row.get("Subset", "Base"),
-                card_number=sample_row.get("Card Number", ""),
-                player_name=sample_row.get("Player", ""),
-                print_run=sample_row.get("Print Run", ""),
-                fallback_raw_price=_safe_float(sample_row.get("Raw_Price"), 2.00),
-            )
-            comps_by_key[c_key] = comp_rec
 
         if progress_callback:
             progress_callback(

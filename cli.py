@@ -350,22 +350,6 @@ def get_lane_queue_file(lane: str) -> Path:
     return LOGS_DIR / f"job_queue_{base}.json"
 
 
-def _is_pid_running(pid: int) -> bool:
-    if not pid or pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            res = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=4)
-            return str(pid) in (res.stdout or "")
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
 def load_lane_job_queue(lane: str) -> list[dict]:
     ensure_directories()
     q_file = get_lane_queue_file(lane)
@@ -435,103 +419,7 @@ def _default_idle_state(lane: str) -> dict:
     }
 
 
-def write_job_state(
-    status: str,
-    job_type: str,
-    title: str,
-    current: int = 0,
-    total: int = 1,
-    current_item: str = "",
-    start_epoch: Optional[float] = None,
-    pid: int = 0,
-    error_msg: str = "",
-    lane: str = "ingest_inventory",
-    sub_current: int = 0,
-    sub_total: int = 0,
-    sub_label: str = "",
-    sub_start_epoch: Optional[float] = None,
-    active_set_name: str = "",
-    set_index: int = 0,
-    total_sets: int = 0,
-    completed_subsets: int = 0,
-    total_subsets: int = 0,
-    completed_cards: int = 0,
-    total_cards: int = 0,
-    cards_per_sec: float = 0.0,
-    eta_override: Optional[float] = None,
-    sub_eta_override: Optional[float] = None,
-    percent_override: Optional[float] = None,
-):
-    ensure_directories()
-    now_ep = time.time()
-    s_ep = float(start_epoch or now_ep)
-    elapsed = max(0.0, now_ep - s_ep)
-    tot = max(1, int(total))
-    cur = min(tot, max(0, int(current)))
-    if status == "COMPLETED":
-        pct = 100
-    elif percent_override is not None:
-        pct = min(99, max(0, int(round(float(percent_override)))))
-    else:
-        pct = min(99, int(round(100.0 * cur / tot)))
-
-    eta_sec = eta_override
-    if eta_sec is None and status == "RUNNING" and cur > 0 and tot > cur and elapsed > 0.5:
-        eta_sec = round((elapsed / float(cur)) * float(tot - cur), 1)
-
-    sub_tot = max(0, int(sub_total))
-    sub_cur = min(sub_tot, max(0, int(sub_current))) if sub_tot > 0 else 0
-    sub_pct = (100 if status == "COMPLETED" else min(99, int(round(100.0 * sub_cur / sub_tot)))) if sub_tot > 0 else 0
-    sub_elapsed_val = round(max(0.0, now_ep - float(sub_start_epoch)), 1) if sub_start_epoch else 0.0
-    sub_eta_sec = sub_eta_override
-    if sub_eta_sec is None and status == "RUNNING" and sub_tot > sub_cur > 0 and sub_start_epoch:
-        if sub_elapsed_val > 0.3:
-            sub_eta_sec = round((sub_elapsed_val / float(sub_cur)) * float(sub_tot - sub_cur), 1)
-
-    state_payload = {
-        "lane": lane,
-        "base_lane": base_lane_from_slot(lane),
-        "status": status,
-        "job_type": job_type,
-        "job_icon": JOB_TYPE_ICON_MAP.get(str(job_type), "⚡"),
-        "process_name": title,
-        "title": title,
-        "current": cur,
-        "total": tot,
-        "percent": pct,
-        "active_set_name": str(active_set_name or "")[:120],
-        "set_index": int(set_index or 0),
-        "total_sets": int(total_sets or 0),
-        "completed_subsets": int(completed_subsets or 0),
-        "total_subsets": int(total_subsets or 0),
-        "completed_cards": int(completed_cards or 0),
-        "total_cards": int(total_cards or 0),
-        "cards_per_sec": round(float(cards_per_sec or 0.0), 3),
-        "current_item": str(current_item)[:180],
-        "start_epoch": s_ep,
-        "updated_epoch": now_ep,
-        "elapsed_seconds": round(elapsed, 1),
-        "eta_seconds": eta_sec,
-        "sub_current": sub_cur,
-        "sub_total": sub_tot,
-        "sub_percent": sub_pct,
-        "sub_name": str(sub_label)[:120],
-        "sub_label": str(sub_label)[:120],
-        "sub_start_epoch": float(sub_start_epoch) if sub_start_epoch else None,
-        "sub_elapsed_seconds": sub_elapsed_val,
-        "sub_eta_seconds": sub_eta_sec,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "pid": int(pid),
-        "error_msg": str(error_msg),
-    }
-    try:
-        get_lane_state_file(lane).write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
-        ACTIVE_JOB_STATE_FILE.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def append_job_log(msg: str, lane: str = "ingest_inventory", run_log_file: Optional[Path] = None):
+def append_job_log(msg: str, lane: str = "slot_1", run_log_file: Optional[Path] = None):
     ensure_directories()
     clean = str(msg).rstrip("\r\n")
     if not clean:
@@ -547,33 +435,6 @@ def append_job_log(msg: str, lane: str = "ingest_inventory", run_log_file: Optio
                 f.write(line)
         except Exception:
             pass
-
-
-def get_active_job_state(lane: Optional[str] = None) -> dict:
-    ensure_directories()
-    raw_lane = str(lane or "slot_1").strip()
-    base_lane = base_lane_from_slot(raw_lane)
-    clean_lane = raw_lane if raw_lane.startswith(base_lane + "__p") else base_lane
-    state_file = get_lane_state_file(clean_lane)
-    if not state_file.exists():
-        return _default_idle_state(clean_lane)
-    try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-        if state.get("status") == "RUNNING":
-            pid = int(state.get("pid", 0))
-            if pid and not _is_pid_running(pid):
-                state["status"] = "INTERRUPTED"
-                state["current_item"] = "Worker process exited unexpectedly"
-                state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-            else:
-                now_t = time.time()
-                s_ep = float(state.get("start_epoch", now_t))
-                state["elapsed_seconds"] = round(max(0.0, now_t - s_ep), 1)
-                if state.get("sub_start_epoch"):
-                    state["sub_elapsed_seconds"] = round(max(0.0, now_t - float(state["sub_start_epoch"])), 1)
-        return state
-    except Exception:
-        return _default_idle_state(clean_lane)
 
 
 def get_all_lanes_state() -> dict[str, dict]:
@@ -879,7 +740,7 @@ def save_and_sync_all_scheduled_jobs(jobs_list: list[dict]) -> tuple[list[dict],
     prev_task_names = {str(j.get("Task_Name") or "").strip() for j in prev_jobs if str(j.get("Task_Name") or "").strip()}
 
     worker_py = str(TABULAS_VENV_PYTHON) if TABULAS_VENV_PYTHON.exists() else sys.executable
-    cli_script = str(BASE_DIR / "cli.py")
+    cli_script = str((APP_DIR / "cli.py") if (APP_DIR / "cli.py").exists() else (BASE_DIR / "cli.py"))
     sync_msgs: list[str] = []
     new_task_names: set[str] = set()
     cleaned_jobs: list[dict] = []
@@ -940,7 +801,7 @@ def save_and_sync_all_scheduled_jobs(jobs_list: list[dict]) -> tuple[list[dict],
     return cleaned_jobs, sync_msgs or [f"Saved {len(cleaned_jobs)} scheduled job(s)."]
 
 
-def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int = 5) -> dict:
+def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int = 5, lane: Optional[str] = None) -> dict:
     """
     Runs startup & periodic housekeeping cleanly on an idle worker slot:
       1. Archives daily log folders (`Logs\\Logs\\YYYYMMDD\\`) & reports older than 30 days to `F:\\Tabulas Archive\\Logs\\`.
@@ -950,8 +811,12 @@ def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int =
     ensure_directories()
     start_ep = time.time()
     log_file = get_task_log_file("system_startup")
-    sys_slot = _pick_first_idle_slot(preferred="slot_8") or "slot_8"
-    clear_lane_monitor_log(sys_slot)
+    explicit_lane = str(lane or "").strip()
+    if explicit_lane and explicit_lane in PROCESS_LANES:
+        sys_slot = explicit_lane
+    else:
+        sys_slot = _pick_first_idle_slot(preferred="slot_8") or "slot_8"
+        clear_lane_monitor_log(sys_slot)
 
     def _sys_log(msg: str, cur: int, tot: int):
         append_job_log(msg, lane=sys_slot, run_log_file=log_file)
@@ -982,11 +847,11 @@ def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int =
                                 f_item.unlink()
                     shutil.rmtree(nested_dir, ignore_errors=True)
             except Exception as heal_e:
-                append_job_log(f"[!] Nested library cleanup note ({nested_name}): {heal_e}", lane="system", run_log_file=log_file)
+                append_job_log(f"[!] Nested library cleanup note ({nested_name}): {heal_e}", lane=sys_slot, run_log_file=log_file)
     if rescued_nested_imgs > 0:
         append_job_log(
             f"🩹 Rescued {rescued_nested_imgs:,} image(s) from nested Reference_Library\\ into {REFERENCE_TEMPLATES_DIR} and removed stray folders.",
-            lane="system",
+            lane=sys_slot,
             run_log_file=log_file,
         )
 
@@ -1028,7 +893,7 @@ def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int =
         archived_pkgs = int(upd_arc.get("archived_packages", 0))
         archived_snaps = int(upd_arc.get("archived_snapshots", 0))
     except Exception as e:
-        append_job_log(f"[!] Update archiving skipped: {e}", lane="system", run_log_file=log_file)
+        append_job_log(f"[!] Update archiving skipped: {e}", lane=sys_slot, run_log_file=log_file)
     _sys_log(f"Update retention (keep {keep_recent_updates}): archived {archived_pkgs} package(s) & {archived_snaps} snapshot(s) -> F:\\Tabulas Archive\\Updates", 2, 3)
 
     cleaned_payloads = 0
@@ -1093,7 +958,7 @@ def run_startup_maintenance(keep_logs_days: int = 30, keep_recent_updates: int =
     if retired_scripts_cnt > 0:
         append_job_log(
             f"🧹 Retired {retired_scripts_cnt} obsolete one-time script(s) -> {retired_dst_dir}",
-            lane="system",
+            lane=sys_slot,
             run_log_file=log_file,
         )
 
@@ -1167,16 +1032,15 @@ def _atomic_write_json_file(target_path: Path, data: dict):
         pass
 
 
-_ORIG_GET_ACTIVE_JOB_STATE = get_active_job_state
-
-
 def get_active_job_state(lane: Optional[str] = None) -> dict:
     """Transient-lock-resilient job state reader with 20s startup grace window (prevents phantom Idle flickers)."""
     ensure_directories()
     raw_lane = str(lane or "slot_1").strip()
-    sf = get_lane_state_file(raw_lane)
+    base_lane = base_lane_from_slot(raw_lane)
+    clean_lane = raw_lane if raw_lane.startswith(base_lane + "__p") else base_lane
+    sf = get_lane_state_file(clean_lane)
     if not sf.exists():
-        return _default_idle_state(raw_lane)
+        return _default_idle_state(clean_lane)
 
     state = None
     for attempt in range(3):
@@ -1189,7 +1053,7 @@ def get_active_job_state(lane: Optional[str] = None) -> dict:
             time.sleep(0.025 * (attempt + 1))
 
     if not isinstance(state, dict):
-        return _default_idle_state(raw_lane)
+        return _default_idle_state(clean_lane)
 
     if state.get("status") == "RUNNING":
         now_t = time.time()
@@ -1497,7 +1361,7 @@ def run_background_job_from_file(payload_path: Path):
 
     try:
         if job_type in ("system_startup", "system_maintenance"):
-            run_startup_maintenance()
+            run_startup_maintenance(lane=target_lane)
         elif job_type == "scan_ingest":
             _worker_log_cb(f"🔍 Batch Scan Processor worker initialized (PID {my_pid}). Discovering incoming PDF batches...")
             if "enable_cardsight_fallback" in payload:
@@ -1514,7 +1378,7 @@ def run_background_job_from_file(payload_path: Path):
                 active_batches_to_run = []
                 total_remaining_pdfs = 0
                 for b_n, b_d, b_p in batches_to_run:
-                    b_out_dir = BATCHES_DIR / b_n
+                    b_out_dir = BATCHES_DIR / sanitize_filename_part(b_n)
                     b_man = b_out_dir / "Batch_Inventory_Manifest.csv"
                     b_cp = b_out_dir / ".processed_pdfs.json"
                     rem_est = len(b_p)
@@ -1790,10 +1654,12 @@ def run_background_job_from_file(payload_path: Path):
 
             for b_idx, (bn, b_dir, b_est) in enumerate(valid_batches, 1):
                 b_t0 = time.time()
+                batch_cards_done = 0
 
                 def _on_commit_card(c_i: int, t_i: int, rec: dict, _bn=bn, _bi=b_idx, _bt0=b_t0):
-                    nonlocal cards_done_all
+                    nonlocal cards_done_all, batch_cards_done
                     cards_done_all += 1
+                    batch_cards_done = c_i
                     tot_dyn = max(total_cards_all, cards_done_all)
                     state_tracker["current"] = cards_done_all
                     state_tracker["completed_cards"] = cards_done_all
@@ -1857,7 +1723,7 @@ def run_background_job_from_file(payload_path: Path):
                         start_epoch=start_ep,
                         pid=my_pid,
                         lane=target_lane,
-                        sub_current=min(_btot, cards_done_all),
+                        sub_current=min(_btot, batch_cards_done),
                         sub_total=_btot,
                         sub_label=_bn,
                         sub_start_epoch=_bt0,
@@ -2033,6 +1899,8 @@ def run_background_job_from_file(payload_path: Path):
                 nd_df = pd.DataFrame(new_drafts)
                 save_listing_drafts_df(nd_df if curr_drafts.empty else pd.concat([curr_drafts, nd_df], ignore_index=True))
             _worker_log_cb(f"✅ Completed Batch Listing Writer ({len(rows_to_gen):,} draft(s) saved to Listing_Drafts.csv).")
+        else:
+            raise ValueError(f"Unsupported background job_type: '{job_type}'")
 
         total_el_s = round(max(0.0, time.time() - start_ep), 1)
         el_m, el_sec = divmod(int(total_el_s), 60)
