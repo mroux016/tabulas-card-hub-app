@@ -290,6 +290,42 @@ class TestGradingDeepDive(unittest.TestCase):
         self.assertGreaterEqual(mbox[0], 220, f"Mini snapped to empty left sleeve: {mbox}")
         self.assertLess(m_ar, 0.63, f"Mini card aspect clipped to standard: {mbox} (ar={m_ar:.3f})")
 
+    def test_light_bed_sleeve_glare_full_bleed_centering_and_patterned_border_defects(self):
+        # 1. Light scanner bed (RGB ~226) with bright neutral specular sleeve glare at bottom/right edge
+        w, h = 800, 1120
+        light_bed = Image.new("RGB", (w, h), (225, 226, 228))
+        dl = ImageDraw.Draw(light_bed)
+        # Specular neutral sleeve glare along right & bottom scan rim
+        dl.rectangle([w - 18, 0, w - 1, h - 1], fill=(252, 252, 253))
+        dl.rectangle([0, h - 18, w - 1, h - 1], fill=(252, 252, 253))
+        # Physical card inside [45, 45, w-45, h-45] with warm ivory paper border
+        dl.rectangle([45, 45, w - 45, h - 45], fill=(232, 228, 210))
+        dl.rectangle([85, 85, w - 85, h - 85], fill=(42, 78, 128))
+        lbox = self.vg.detect_physical_card_box(light_bed)
+        self.assertLessEqual(lbox[2], w - 30, f"Light-bed right edge grabbed specular sleeve glare: {lbox}")
+        self.assertLessEqual(lbox[3], h - 30, f"Light-bed bottom edge grabbed specular sleeve glare: {lbox}")
+
+        # 2. Full-bleed / borderless card with high outer-strip texture and asymmetric interior element
+        import numpy as np
+        rng = np.random.default_rng(42)
+        bleed_arr = rng.integers(35, 215, size=(h, w, 3), dtype=np.uint8)
+        bleed_im = Image.fromarray(bleed_arr)
+        cent_bleed = self.vg._measure_side_centering(bleed_im, (40, 40, w - 40, h - 40))
+        self.assertTrue(cent_bleed.get("borderless_detected"), f"Expected borderless_detected=True: {cent_bleed}")
+        self.assertEqual(cent_bleed["lr"], "50/50")
+        self.assertEqual(cent_bleed["tb"], "50/50")
+
+        # 3. Neutral patterned white/gray border (high grayscale variance, low chroma) must NOT trigger borderless_detected
+        pat_gray = rng.integers(145, 245, size=(h, w), dtype=np.uint8)
+        pat_rgb = np.stack([pat_gray, pat_gray, pat_gray], axis=-1)
+        pat_im = Image.fromarray(pat_rgb)
+        dp = ImageDraw.Draw(pat_im)
+        # Asymmetric inner printed frame inside patterned white/gray border (left=56px, right=34px -> ~62/38)
+        dp.rectangle([40 + 56, 40 + 44, w - 40 - 34, h - 40 - 44], fill=(35, 70, 120), outline=(15, 20, 30), width=3)
+        cent_pat = self.vg._measure_side_centering(pat_im, (40, 40, w - 40, h - 40))
+        self.assertFalse(cent_pat.get("borderless_detected"), f"Patterned neutral border falsely flagged borderless: {cent_pat}")
+        self.assertNotEqual(cent_pat["lr"], "50/50")
+
 
 if __name__ == "__main__":
     unittest.main()

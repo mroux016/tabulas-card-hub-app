@@ -721,6 +721,7 @@ def _inspect_single_side(
             x_lo, x_hi = max(ix1, gx_c - r_core - 8), min(ix2, gx_c + r_core + 9)
             patch_l = lab[y_lo:y_hi, x_lo:x_hi, 0].astype(np.float32)
             halo_diff = 0.0
+            outer_std = 0.0
             if patch_l.size >= 36:
                 yy, xx = np.ogrid[y_lo:y_hi, x_lo:x_hi]
                 dist = np.sqrt((xx - gx_c) ** 2 + (yy - gy_c) ** 2)
@@ -729,11 +730,14 @@ def _inspect_single_side(
                 outer_m = (dist > r_core + 3.5) & (dist <= r_core + 8.0)
                 if np.any(ring_m) and np.any(outer_m):
                     halo_diff = abs(float(np.mean(patch_l[ring_m])) - float(np.mean(patch_l[outer_m])))
+                    outer_std = float(np.std(patch_l[outer_m]))
 
             perim = max(1.0, cv2.arcLength(cnt, True))
             circularity = float(4.0 * np.pi * area / (perim * perim))
 
-            if area >= 18.0 and halo_diff >= 9.5 and circularity >= 0.48:
+            # True fisheye sits on a relatively uniform surrounding ink field (outer_std <= 16.0),
+            # whereas printed text characters ('E', 'O', '0') or filigree edges sit inside high-variance graphics.
+            if area >= 18.0 and halo_diff >= 9.5 and circularity >= 0.48 and outer_std <= 16.0:
                 conf = min(0.94, 0.68 + min(0.18, halo_diff / 60.0) + _anom_boost(cx_c, cy_c))
                 confirmed.append(_attach_meta({
                     "type": "print_spot_fisheye",
@@ -761,8 +765,8 @@ def _inspect_single_side(
     neg_bin = (int_dog < -14.0).astype(np.uint8)
     n_p, _, st_p, cen_p = cv2.connectedComponentsWithStats(pos_bin, connectivity=8)
     n_n, _, st_n, cen_n = cv2.connectedComponentsWithStats(neg_bin, connectivity=8)
-    pos_lobes = [(cen_p[i], int(st_p[i, cv2.CC_STAT_AREA])) for i in range(1, n_p) if 10 <= st_p[i, cv2.CC_STAT_AREA] <= 420]
-    neg_lobes = [(cen_n[i], int(st_n[i, cv2.CC_STAT_AREA])) for i in range(1, n_n) if 10 <= st_n[i, cv2.CC_STAT_AREA] <= 420]
+    pos_lobes = [(cen_p[i], int(st_p[i, cv2.CC_STAT_AREA])) for i in range(1, n_p) if 10 <= st_p[i, cv2.CC_STAT_AREA] <= 240 and max(int(st_p[i, cv2.CC_STAT_WIDTH]), int(st_p[i, cv2.CC_STAT_HEIGHT])) <= 2.6 * max(1, min(int(st_p[i, cv2.CC_STAT_WIDTH]), int(st_p[i, cv2.CC_STAT_HEIGHT])))]
+    neg_lobes = [(cen_n[i], int(st_n[i, cv2.CC_STAT_AREA])) for i in range(1, n_n) if 10 <= st_n[i, cv2.CC_STAT_AREA] <= 240 and max(int(st_n[i, cv2.CC_STAT_WIDTH]), int(st_n[i, cv2.CC_STAT_HEIGHT])) <= 2.6 * max(1, min(int(st_n[i, cv2.CC_STAT_WIDTH]), int(st_n[i, cv2.CC_STAT_HEIGHT])))]
 
     used_neg = set()
     for pc, _ in pos_lobes[:20]:
@@ -770,12 +774,18 @@ def _inspect_single_side(
             if j in used_neg:
                 continue
             dist_pn = float(np.hypot(pc[0] - nc[0], pc[1] - nc[1]))
-            if 5.0 <= dist_pn <= 34.0:
+            if 5.0 <= dist_pn <= 28.0:
                 mx = int(ix1 + (pc[0] + nc[0]) * 0.5)
                 my = int(iy1 + (pc[1] + nc[1]) * 0.5)
                 ab_patch = lab[max(iy1, my - 12):min(iy2, my + 12), max(ix1, mx - 12):min(ix2, mx + 12), 1:3]
                 lap_patch = lap_abs[max(iy1, my - 10):min(iy2, my + 10), max(ix1, mx - 10):min(ix2, mx + 10)]
-                if ab_patch.size > 0 and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 10.5 and (lap_patch.size == 0 or float(np.median(lap_patch)) <= 26.0):
+                # True dimples are compact circular shading dipoles on continuous hue (std(ab) < 7.5),
+                # whereas printed ribbons/frames are elongated or have multi-color transitions.
+                if (
+                    ab_patch.size > 0
+                    and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 7.5
+                    and (lap_patch.size == 0 or float(np.median(lap_patch)) <= 22.0)
+                ):
                     used_neg.add(j)
                     # Check if dent lies inside the outer 3.5% edge strip (outside corner tips) -> edge_dent
                     edge_band_x = max(8, int(cw * 0.035))
@@ -845,8 +855,8 @@ def _inspect_single_side(
                     break
 
     # E. Edge Chipping (4 edge strips) & Corner Whitening (4 corners)
-    c_span = max(16, int(min(cw, ch) * 0.08))
-    edge_strip = max(8, int(min(cw, ch) * 0.025))
+    c_span = max(12, int(min(cw, ch) * 0.042))
+    edge_strip = max(6, int(min(cw, ch) * 0.015))
     border_band_l = np.concatenate([
         lab[cy1:cy1 + edge_strip, cx1:cx2, 0].ravel(),
         lab[cy2 - edge_strip:cy2, cx1:cx2, 0].ravel(),
@@ -854,9 +864,13 @@ def _inspect_single_side(
         lab[cy1:cy2, cx2 - edge_strip:cx2, 0].ravel(),
     ])
     border_l_med = float(np.median(border_band_l)) if border_band_l.size else 180.0
+    border_l_std = float(np.std(border_band_l)) if border_band_l.size else 0.0
 
-    white_thr_edge = max(188.0, border_l_med + (59.0 if light_border_mode else 34.0))
-    skip_light_border = light_border_mode and border_l_med >= 175.0
+    # White paper-core exposure (chipping/whitening) requires a uniform dark/colored border contrast
+    # (border_l_med < 162 and border_l_std < 38); on white/light borders or high-contrast filigree
+    # patterned borders (border_l_std >= 38), bright spots are just printed pattern or paper.
+    white_thr_edge = max(195.0, border_l_med + (62.0 if light_border_mode else 38.0))
+    skip_light_border = (border_l_med >= 162.0) or (border_l_std >= 38.0) or (light_border_mode and border_l_med >= 145.0)
 
     edge_zones = [
         ("Top edge", (cx1 + c_span, cy1, cx2 - c_span, cy1 + edge_strip)),
@@ -870,14 +884,30 @@ def _inspect_single_side(
         e_l = lab[ey1:ey2, ex1:ex2, 0]
         e_s = hsv[ey1:ey2, ex1:ex2, 1]
         e_gl = glare_mask[ey1:ey2, ex1:ex2] | streak_mask[ey1:ey2, ex1:ex2]
-        chip_m = ((e_l > white_thr_edge) & (e_s < 36) & (~e_gl)).astype(np.uint8)
+        chip_m = ((e_l > white_thr_edge) & (e_s < 34) & (~e_gl)).astype(np.uint8)
         chip_frac = float(np.count_nonzero(chip_m)) / float(max(1, e_l.size))
         n_ch, lbl_ch, st_ch, cen_ch = cv2.connectedComponentsWithStats(chip_m, connectivity=8)
+        # If multiple collinear small bright blobs appear along the strip, it is printed border text
+        if n_ch >= 6:
+            continue
         max_chip_a = 0
         best_chip_box = (ex1, ey1, max(8, ex2 - ex1), max(8, ey2 - ey1))
         for i_c in range(1, n_ch):
             a_c = int(st_ch[i_c, cv2.CC_STAT_AREA])
             if a_c < 14:
+                continue
+            bx_c = int(st_ch[i_c, cv2.CC_STAT_LEFT])
+            by_c = int(st_ch[i_c, cv2.CC_STAT_TOP])
+            bw_c = int(st_ch[i_c, cv2.CC_STAT_WIDTH])
+            bh_c = int(st_ch[i_c, cv2.CC_STAT_HEIGHT])
+            # True edge chipping must touch within 4px of the physical outer boundary of that edge
+            touches_outer = (
+                (e_name == "Top edge" and by_c <= 4)
+                or (e_name == "Bottom edge" and (by_c + bh_c) >= (ey2 - ey1 - 4))
+                or (e_name == "Left edge" and bx_c <= 4)
+                or (e_name == "Right edge" and (bx_c + bw_c) >= (ex2 - ex1 - 4))
+            )
+            if not touches_outer:
                 continue
             # If this edge notch continues into the outer holder margin, it is a sleeve scratch/streak
             ccx = int(ex1 + cen_ch[i_c][0])
@@ -898,12 +928,12 @@ def _inspect_single_side(
             if not crosses_out and a_c > max_chip_a:
                 max_chip_a = a_c
                 best_chip_box = (
-                    int(ex1 + st_ch[i_c, cv2.CC_STAT_LEFT]),
-                    int(ey1 + st_ch[i_c, cv2.CC_STAT_TOP]),
-                    max(6, int(st_ch[i_c, cv2.CC_STAT_WIDTH])),
-                    max(6, int(st_ch[i_c, cv2.CC_STAT_HEIGHT])),
+                    int(ex1 + bx_c),
+                    int(ey1 + by_c),
+                    max(6, bw_c),
+                    max(6, bh_c),
                 )
-        if max_chip_a >= 14 and chip_frac < 0.35:
+        if max_chip_a >= 14 and chip_frac < 0.28:
             sev = 1.0 if max_chip_a >= 65 else 0.5
             confirmed.append(_attach_meta({
                 "type": "edge_chipping",
@@ -915,7 +945,7 @@ def _inspect_single_side(
                 "target": "edges",
             }, best_chip_box))
 
-    white_thr_corner = max(188.0, border_l_med + (55.0 if light_border_mode else 30.0))
+    white_thr_corner = max(195.0, border_l_med + (58.0 if light_border_mode else 36.0))
     manual_geom = (ov.get("manual_geometry") or {}).get(side_label.lower(), {}) if isinstance(ov.get("manual_geometry"), dict) else {}
     manual_corners = manual_geom.get("corners") if isinstance(manual_geom.get("corners"), dict) else {}
     ox_roi, oy_roi = roi_origin
@@ -944,31 +974,42 @@ def _inspect_single_side(
             continue
         k_l = lab[ky1:ky2, kx1:kx2, 0]
         k_s = hsv[ky1:ky2, kx1:kx2, 1]
-        k_g = gray[ky1:ky2, kx1:kx2]
         k_gl = glare_mask[ky1:ky2, kx1:kx2] | streak_mask[ky1:ky2, kx1:kx2]
         if skip_light_border:
             max_wh_a = 0
             wh_frac = 0.0
             best_wh_box = (kx1, ky1, max(8, kx2 - kx1), max(8, ky2 - ky1))
         else:
-            wh_m = ((k_l > white_thr_corner) & (k_s < 38) & (~k_gl)).astype(np.uint8)
+            wh_m = ((k_l > white_thr_corner) & (k_s < 36) & (~k_gl)).astype(np.uint8)
             wh_frac = float(np.count_nonzero(wh_m)) / float(max(1, k_l.size))
             n_wh, _, st_wh, _ = cv2.connectedComponentsWithStats(wh_m, connectivity=8)
             max_wh_a = 0
             best_wh_box = (kx1, ky1, max(8, kx2 - kx1), max(8, ky2 - ky1))
+            kw_box = kx2 - kx1
+            kh_box = ky2 - ky1
             for i_w in range(1, n_wh):
                 a_w = int(st_wh[i_w, cv2.CC_STAT_AREA])
-                if a_w > max_wh_a:
+                bx_w = int(st_wh[i_w, cv2.CC_STAT_LEFT])
+                by_w = int(st_wh[i_w, cv2.CC_STAT_TOP])
+                bw_w = int(st_wh[i_w, cv2.CC_STAT_WIDTH])
+                bh_w = int(st_wh[i_w, cv2.CC_STAT_HEIGHT])
+                # Must touch near the physical outer tip of that corner
+                touches_tip = (
+                    (c_name == "Top-Left" and bx_w <= 6 and by_w <= 6)
+                    or (c_name == "Top-Right" and (bx_w + bw_w) >= (kw_box - 6) and by_w <= 6)
+                    or (c_name == "Bot-Left" and bx_w <= 6 and (by_w + bh_w) >= (kh_box - 6))
+                    or (c_name == "Bot-Right" and (bx_w + bw_w) >= (kw_box - 6) and (by_w + bh_w) >= (kh_box - 6))
+                )
+                if touches_tip and a_w > max_wh_a:
                     max_wh_a = a_w
                     best_wh_box = (
-                        int(kx1 + st_wh[i_w, cv2.CC_STAT_LEFT]),
-                        int(ky1 + st_wh[i_w, cv2.CC_STAT_TOP]),
-                        max(6, int(st_wh[i_w, cv2.CC_STAT_WIDTH])),
-                        max(6, int(st_wh[i_w, cv2.CC_STAT_HEIGHT])),
+                        int(kx1 + bx_w),
+                        int(ky1 + by_w),
+                        max(6, bw_w),
+                        max(6, bh_w),
                     )
-        lap_v = float(cv2.Laplacian(k_g, cv2.CV_64F).var())
-        if (max_wh_a >= 14 and wh_frac < 0.45) or lap_v < 42.0:
-            sev = 1.0 if (max_wh_a >= 75 or lap_v < 28.0) else 0.5
+        if max_wh_a >= 14 and wh_frac < 0.38:
+            sev = 1.0 if max_wh_a >= 75 else 0.5
             confirmed.append(_attach_meta({
                 "type": "corner_whitening",
                 "is_true_defect": True,

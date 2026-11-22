@@ -460,9 +460,18 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
     gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
 
-    # Opaque card-stock mask: avoids cool blue-gray empty sleeve (HSV S~29, B>R) while
-    # capturing warm/neutral card paper (Lab-b +6.5), high luminance delta (>22), or rich ink (S>42)
-    opaque = ((b_warm_diff > 8.5) | (l_abs_diff > 24.0) | ((hsv[:, :, 1] > 42) & (hsv[:, :, 2] > 45))).astype(np.uint8) * 255
+    # Bed-polarity-aware card-stock mask:
+    # - Light scanner beds (bg_lab[0] >= 150): ignore bright neutral sleeve glare (L > bg_lab[0])
+    #   and capture warm paper (b_warm_diff > 7.5), darker printed ink/borders, or rich chroma.
+    # - Dark scanner beds (bg_lab[0] < 150): capture dark stadium/full-bleed photo bottoms
+    #   ((L - bg_lab[0]) > 12.0), warm paper, or chroma while ignoring cool blue-gray empty sleeve.
+    if float(bg_lab[0]) >= 150.0:
+        l_dark_diff = bg_lab[0] - lab[:, :, 0]
+        opaque = ((b_warm_diff > 7.5) | (l_dark_diff > 18.0) | ((hsv[:, :, 1] > 38) & (hsv[:, :, 2] > 45))).astype(np.uint8) * 255
+    else:
+        l_bright_diff = lab[:, :, 0] - bg_lab[0]
+        opaque = ((b_warm_diff > 7.5) | (l_bright_diff > 12.0) | (l_abs_diff > 22.0) | ((hsv[:, :, 1] > 36) & (hsv[:, :, 2] > 40))).astype(np.uint8) * 255
+
     # Erase thin 1-4px sleeve rims/glare first, then bridge printed interior details
     k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
@@ -488,6 +497,21 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
         bx1, by1, bx2, by2 = best_comp
         bw_c = max(40, bx2 - bx1)
         bh_c = max(40, by2 - by1)
+
+        # Row/column projection trim: if a mini card sits inside a large sleeve where a sliver of
+        # sleeve shadow bridged across the empty half, trim columns/rows with <15% foreground occupancy
+        sub_mask = (cleaned[by1:by2, bx1:bx2] > 0)
+        col_fill = sub_mask.mean(axis=0)
+        row_fill = sub_mask.mean(axis=1)
+        valid_cols = np.where(col_fill >= 0.18)[0]
+        valid_rows = np.where(row_fill >= 0.18)[0]
+        if valid_cols.size >= 40:
+            bx1, bx2 = bx1 + int(valid_cols[0]), bx1 + int(valid_cols[-1]) + 1
+            bw_c = max(40, bx2 - bx1)
+        if valid_rows.size >= 40:
+            by1, by2 = by1 + int(valid_rows[0]), by1 + int(valid_rows[-1]) + 1
+            bh_c = max(40, by2 - by1)
+
         mid_y1, mid_y2 = int(by1 + bh_c * 0.2), int(by2 - bh_c * 0.2)
         mid_x1, mid_x2 = int(bx1 + bw_c * 0.2), int(bx2 - bw_c * 0.2)
         prof_x = np.mean(gx[max(0, mid_y1):max(1, mid_y2), :], axis=0)
@@ -516,29 +540,88 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
         cand_ar = cw_c / float(ch_c)
 
         # Multi-format prior: Standard (0.714 / 1.400) vs. Tobacco/A&G Mini (0.571 / 1.750)
+        # Check whether significant card-stock or edge evidence exists outside a narrow (<0.62) box:
+        # if a standard white-bordered card had its white left/right borders missed by `opaque`,
+        # expanding toward standard width (2.5/3.5) rather than locking to mini (0.571) recovers the true card edge.
         target_ar = None
-        if 0.65 <= cand_ar <= 0.78:
+        if 0.62 <= cand_ar <= 0.84:
             target_ar = 2.5 / 3.5
-        elif 1.28 <= cand_ar <= 1.52:
+        elif 1.22 <= cand_ar <= 1.56:
             target_ar = 1.400
-        elif 0.50 <= cand_ar <= 0.63:
-            target_ar = 1.5 / 2.625
+        elif 0.45 <= cand_ar < 0.62:
+            # Distinguish a genuine Mini (narrow card surrounded by empty sleeve/scanner bed)
+            # from a Standard white-bordered card whose neutral white side borders were trimmed:
+            # check if strong vertical card-edge gradients sit outside [x1..x2] near standard width.
+            std_w = int(round(ch_c * (2.5 / 3.5)))
+            has_outer_std_edges = False
+            if std_w <= int(sw * 0.96) and (x1 > int(sw * 0.10) or (sw - x2) > int(sw * 0.10)):
+                left_outer_band = prof_x[max(2, int(sw * 0.02)):max(3, x1 - int(sw * 0.03))]
+                right_outer_band = prof_x[min(sw - 3, x2 + int(sw * 0.03)):min(sw - 2, int(sw * 0.98))]
+                l_pk = float(np.max(left_outer_band)) if left_outer_band.size > 0 else 0.0
+                r_pk = float(np.max(right_outer_band)) if right_outer_band.size > 0 else 0.0
+                # Also check if the outer band has bright warm/neutral paper luminance (L > 205) vs darker inner frame
+                outer_l_patch = lab[max(0, mid_y1):max(1, mid_y2), max(2, int(sw * 0.03)):max(3, x1 - 4), 0]
+                outer_is_white_paper = outer_l_patch.size > 0 and float(np.median(outer_l_patch)) >= 210.0 and float(bg_lab[0]) >= 180.0
+                if (l_pk >= 7.5 and r_pk >= 7.5 and outer_is_white_paper):
+                    has_outer_std_edges = True
+            if has_outer_std_edges:
+                target_ar = 2.5 / 3.5
+                # Snap x1 / x2 outward to the physical paper edges in the outer bands
+                lo_l = max(2, int(sw * 0.02))
+                hi_l = max(lo_l + 1, x1 - int(sw * 0.02))
+                lo_r = min(sw - 3, x2 + int(sw * 0.02))
+                hi_r = min(sw - 2, int(sw * 0.98))
+                if hi_l > lo_l:
+                    x1 = lo_l + int(np.argmax(prof_x[lo_l:hi_l]))
+                if hi_r > lo_r:
+                    x2 = lo_r + int(np.argmax(prof_x[lo_r:hi_r]))
+                cw_c = max(40, x2 - x1)
+                cand_ar = cw_c / float(ch_c)
+            else:
+                target_ar = 1.5 / 2.625
         elif 1.58 <= cand_ar <= 1.92:
             target_ar = 2.625 / 1.5
 
-        if target_ar is not None and abs(cand_ar - target_ar) / target_ar > 0.04:
+        if target_ar is not None and abs(cand_ar - target_ar) / target_ar > 0.032:
             if cand_ar < target_ar:
                 exp_h = int(round(cw_c / target_ar))
-                excess = ch_c - exp_h
-                if excess > 2:
-                    y1 += excess // 2
-                    y2 = min(sh, y1 + exp_h)
+                if exp_h < ch_c:
+                    excess = ch_c - exp_h
+                    # Trim the edge with weaker gradient (e.g. top/bottom empty sleeve overhang on a mini)
+                    top_g = float(prof_y[min(len(prof_y) - 1, max(0, y1))])
+                    bot_g = float(prof_y[min(len(prof_y) - 1, max(0, y2))])
+                    # Also check row foreground density in top vs bottom excess band
+                    top_fill = float((cleaned[y1:min(y2, y1 + max(4, excess)), x1:x2] > 0).mean()) if excess > 0 else 1.0
+                    bot_fill = float((cleaned[max(y1, y2 - max(4, excess)):y2, x1:x2] > 0).mean()) if excess > 0 else 1.0
+                    if top_fill < bot_fill * 0.65 or top_g < bot_g * 0.75:
+                        y1 = min(y2 - 40, y2 - exp_h)
+                    elif bot_fill < top_fill * 0.65 or bot_g < top_g * 0.75:
+                        y2 = max(y1 + 40, y1 + exp_h)
+                    else:
+                        y1 += excess // 2
+                        y2 = min(sh, y1 + exp_h)
             else:
+                # cand_ar > target_ar: either height was under-detected (dark bottom with weak edge) or width overshot
+                exp_h = int(round(cw_c / target_ar))
                 exp_w = int(round(ch_c * target_ar))
-                excess = cw_c - exp_w
-                if excess > 2:
-                    x1 += excess // 2
-                    x2 = min(sw, x1 + exp_w)
+                top_g = float(prof_y[min(len(prof_y) - 1, max(0, y1))])
+                bot_g = float(prof_y[min(len(prof_y) - 1, max(0, y2))])
+                if exp_h <= int(sh * 0.985) and (sh - y2) >= (exp_h - ch_c) and float(bg_lab[0]) < 150.0 and bot_g < max(8.0, top_g * 0.45):
+                    # Dark-bed full-bleed bottom was under-detected (weak bottom edge vs top): extend y2
+                    deficit_h = exp_h - ch_c
+                    y2 = min(sh, y2 + deficit_h)
+                else:
+                    excess = cw_c - exp_w
+                    if excess > 2:
+                        left_g = float(prof_x[min(len(prof_x) - 1, max(0, x1))])
+                        right_g = float(prof_x[min(len(prof_x) - 1, max(0, x2))])
+                        if right_g < left_g * 0.75:
+                            x2 = max(x1 + 40, x1 + exp_w)
+                        elif left_g < right_g * 0.75:
+                            x1 = min(x2 - 40, x2 - exp_w)
+                        else:
+                            x1 += excess // 2
+                            x2 = min(sw, x1 + exp_w)
 
         return (
             max(0, int(round(x1 / scale))),
@@ -4559,19 +4642,91 @@ def _measure_side_centering(
         r_idx = max(1, x2 - in_x2)
         t_idx = max(1, in_y1 - y1)
         b_idx = max(1, y2 - in_y2)
+        borderless_det = False
     else:
         card_crop = img.crop((x1, y1, x2, y2))
         arr = np.array(card_crop)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
-        mid_y1, mid_y2 = int(ch * 0.25), int(ch * 0.75)
-        mid_x1, mid_x2 = int(cw * 0.25), int(cw * 0.75)
+        mid_y1, mid_y2 = int(ch * 0.20), int(ch * 0.80)
+        mid_x1, mid_x2 = int(cw * 0.20), int(cw * 0.80)
 
-        grad_x = np.abs(cv2.Sobel(gray[mid_y1:mid_y2, :], cv2.CV_32F, 1, 0, ksize=3)).mean(axis=0)
-        grad_y = np.abs(cv2.Sobel(gray[:, mid_x1:mid_x2], cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
+        gx_mat = np.abs(cv2.Sobel(gray[mid_y1:mid_y2, :], cv2.CV_32F, 1, 0, ksize=3))
+        gy_mat = np.abs(cv2.Sobel(gray[:, mid_x1:mid_x2], cv2.CV_32F, 0, 1, ksize=3))
 
-        left_span = max(8, int(cw * 0.18))
-        top_span = max(8, int(ch * 0.18))
+        # Weight 1D gradient profiles by along-edge line continuity so printed border lines
+        # outrank localized text/player edges
+        cont_x = (gx_mat > 12.0).mean(axis=0)
+        cont_y = (gy_mat > 12.0).mean(axis=1)
+        grad_x = gx_mat.mean(axis=0) * (0.5 + cont_x)
+        grad_y = gy_mat.mean(axis=1) * (0.5 + cont_y)
+
+        # Check outer 1.2%..3.2% border strips for full-bleed / borderless artwork:
+        # True full-bleed photography has BOTH high luminance variance (std > 25),
+        # high chromatic/color diversity (HSV saturation std > 18 or Lab a/b std > 6.5, rejecting
+        # neutral white/gray/silver patterned borders like 2026 Topps Base filigree),
+        # AND lacks a strong continuous printed frame line inside the 1.8%..9.0% border band.
+        hsv_crop = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+        sat_crop = hsv_crop[:, :, 1].astype(np.float32)
+
+        b_in1_x, b_in2_x = max(2, int(cw * 0.012)), max(6, int(cw * 0.032))
+        b_in1_y, b_in2_y = max(2, int(ch * 0.012)), max(6, int(ch * 0.032))
+        l_strip_std = float(np.std(gray[mid_y1:mid_y2, b_in1_x:b_in2_x])) if b_in2_x > b_in1_x else 0.0
+        r_strip_std = float(np.std(gray[mid_y1:mid_y2, max(0, cw - b_in2_x):max(1, cw - b_in1_x)])) if b_in2_x > b_in1_x else 0.0
+        t_strip_std = float(np.std(gray[b_in1_y:b_in2_y, mid_x1:mid_x2])) if b_in2_y > b_in1_y else 0.0
+        b_strip_std = float(np.std(gray[max(0, ch - b_in2_y):max(1, ch - b_in1_y), mid_x1:mid_x2])) if b_in2_y > b_in1_y else 0.0
+
+        l_sat_std = float(np.std(sat_crop[mid_y1:mid_y2, b_in1_x:b_in2_x])) if b_in2_x > b_in1_x else 0.0
+        r_sat_std = float(np.std(sat_crop[mid_y1:mid_y2, max(0, cw - b_in2_x):max(1, cw - b_in1_x)])) if b_in2_x > b_in1_x else 0.0
+        t_sat_std = float(np.std(sat_crop[b_in1_y:b_in2_y, mid_x1:mid_x2])) if b_in2_y > b_in1_y else 0.0
+        b_sat_std = float(np.std(sat_crop[max(0, ch - b_in2_y):max(1, ch - b_in1_y), mid_x1:mid_x2])) if b_in2_y > b_in1_y else 0.0
+
+        # Check if a continuous printed inner frame line Peak exists inside 1.8%..9.0%
+        # (a sharp isolated peak in grad_x / grad_y > 2.2x the median gradient of that band,
+        #  distinguishing a distinct printed frame line from dense photographic texture)
+        f_lo_x, f_hi_x = max(4, int(cw * 0.018)), max(8, int(cw * 0.095))
+        f_lo_y, f_hi_y = max(4, int(ch * 0.018)), max(8, int(ch * 0.095))
+        if f_hi_x > f_lo_x + 2:
+            gx_l_band = grad_x[f_lo_x:f_hi_x]
+            gx_r_band = grad_x[::-1][f_lo_x:f_hi_x]
+            has_lr_frame_line = (
+                float(np.max(cont_x[f_lo_x:f_hi_x])) >= 0.55
+                and float(np.max(cont_x[::-1][f_lo_x:f_hi_x])) >= 0.55
+                and float(np.max(gx_l_band)) >= 2.2 * max(1.0, float(np.median(gx_l_band)))
+                and float(np.max(gx_r_band)) >= 2.2 * max(1.0, float(np.median(gx_r_band)))
+            )
+        else:
+            has_lr_frame_line = False
+        if f_hi_y > f_lo_y + 2:
+            gy_t_band = grad_y[f_lo_y:f_hi_y]
+            gy_b_band = grad_y[::-1][f_lo_y:f_hi_y]
+            has_tb_frame_line = (
+                float(np.max(cont_y[f_lo_y:f_hi_y])) >= 0.55
+                and float(np.max(cont_y[::-1][f_lo_y:f_hi_y])) >= 0.55
+                and float(np.max(gy_t_band)) >= 2.2 * max(1.0, float(np.median(gy_t_band)))
+                and float(np.max(gy_b_band)) >= 2.2 * max(1.0, float(np.median(gy_b_band)))
+            )
+        else:
+            has_tb_frame_line = False
+
+        lr_borderless = (
+            l_strip_std > 26.0
+            and r_strip_std > 26.0
+            and l_sat_std > 18.0
+            and r_sat_std > 18.0
+            and not has_lr_frame_line
+        )
+        tb_borderless = (
+            t_strip_std > 26.0
+            and b_strip_std > 26.0
+            and t_sat_std > 18.0
+            and b_sat_std > 18.0
+            and not has_tb_frame_line
+        )
+        borderless_det = bool(lr_borderless and tb_borderless)
+
+        left_span = max(8, int(cw * 0.16))
+        top_span = max(8, int(ch * 0.16))
         min_in_x = max(6, int(cw * 0.018))
         min_in_y = max(6, int(ch * 0.018))
 
@@ -4579,17 +4734,61 @@ def _measure_side_centering(
             if prof_seg.size <= 2:
                 return default_val
             pk = float(np.max(prof_seg))
-            thr = max(12.0, pk * 0.38)
+            if pk < 7.5:
+                return default_val
+            thr = max(9.5, pk * 0.36)
             for idx_p in range(len(prof_seg)):
                 if prof_seg[idx_p] >= thr:
                     win_hi = min(len(prof_seg), idx_p + 5)
                     return min_in + idx_p + int(np.argmax(prof_seg[idx_p:win_hi]))
             return min_in + int(np.argmax(prof_seg))
 
-        l_idx = _outermost_frame_edge(grad_x[min_in_x:left_span], min_in_x, int(cw * 0.05))
-        r_idx = _outermost_frame_edge(grad_x[::-1][min_in_x:left_span], min_in_x, int(cw * 0.05))
-        t_idx = _outermost_frame_edge(grad_y[min_in_y:top_span], min_in_y, int(ch * 0.05))
-        b_idx = _outermost_frame_edge(grad_y[::-1][min_in_y:top_span], min_in_y, int(ch * 0.05))
+        def _pair_consistent(d1: int, d2: int, prof1: np.ndarray, prof2: np.ndarray, min_in: int, span_dim: int, is_full_bleed: bool) -> Tuple[int, int]:
+            sym_def = max(6, int(span_dim * 0.042))
+            if is_full_bleed:
+                return sym_def, sym_def
+            lo_b = int(span_dim * 0.018)
+            hi_b = int(span_dim * 0.088)
+            # If one side found a normal border (1.8%..8.8%) and the opposite side jumped >1.7x deeper into an inner table/photo
+            if lo_b <= d1 <= hi_b and d2 > d1 * 1.70:
+                w_lo = max(0, int(d1 * 0.55) - min_in)
+                w_hi = min(len(prof2), int(d1 * 1.55) - min_in)
+                if w_hi > w_lo + 1:
+                    sub = prof2[w_lo:w_hi]
+                    if float(np.max(sub)) >= 6.0:
+                        d2 = min_in + w_lo + int(np.argmax(sub))
+                    else:
+                        d2 = d1
+                else:
+                    d2 = d1
+            elif lo_b <= d2 <= hi_b and d1 > d2 * 1.70:
+                w_lo = max(0, int(d2 * 0.55) - min_in)
+                w_hi = min(len(prof1), int(d2 * 1.55) - min_in)
+                if w_hi > w_lo + 1:
+                    sub = prof1[w_lo:w_hi]
+                    if float(np.max(sub)) >= 6.0:
+                        d1 = min_in + w_lo + int(np.argmax(sub))
+                    else:
+                        d1 = d2
+                else:
+                    d1 = d2
+            elif d1 > hi_b and d2 > hi_b and max(d1, d2) > min(d1, d2) * 1.65:
+                return sym_def, sym_def
+            return d1, d2
+
+        seg_l = grad_x[min_in_x:left_span]
+        seg_r = grad_x[::-1][min_in_x:left_span]
+        seg_t = grad_y[min_in_y:top_span]
+        seg_b = grad_y[::-1][min_in_y:top_span]
+
+        l_raw = _outermost_frame_edge(seg_l, min_in_x, int(cw * 0.045))
+        r_raw = _outermost_frame_edge(seg_r, min_in_x, int(cw * 0.045))
+        t_raw = _outermost_frame_edge(seg_t, min_in_y, int(ch * 0.045))
+        b_raw = _outermost_frame_edge(seg_b, min_in_y, int(ch * 0.045))
+
+        l_idx, r_idx = _pair_consistent(l_raw, r_raw, seg_l, seg_r, min_in_x, cw, lr_borderless)
+        t_idx, b_idx = _pair_consistent(t_raw, b_raw, seg_t, seg_b, min_in_y, ch, tb_borderless)
+
         in_x1 = x1 + l_idx
         in_y1 = y1 + t_idx
         in_x2 = max(in_x1 + 10, x2 - r_idx)
@@ -4665,6 +4864,7 @@ def _measure_side_centering(
         "tb_top": tb_t,
         "tb_bottom": tb_b,
         "tb": f"{tb_t}/{tb_b}",
+        "borderless_detected": borderless_det,
         "sleeve_detected": sleeve_det,
         "sub_centering": sub_centering,
     }
