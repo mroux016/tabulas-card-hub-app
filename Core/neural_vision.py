@@ -207,6 +207,36 @@ def _extract_multiregion_patch_vectors(raw_out: np.ndarray) -> dict[str, Optiona
     }
 
 
+def compute_dinov2_patch_anomaly_map(patch_tokens: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Computes a local 8-neighbor cosine distance anomaly map (float32 in [0, 1]) from
+    L2-normalized DINOv2 spatial patch tokens `[N, D]` (e.g. `256 = 16x16`), highlighting
+    localized structural breaks (creases, gouges, spots) with zero extra ONNX forward passes.
+    """
+    if patch_tokens is None:
+        return None
+    pts = np.asarray(patch_tokens, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] < 16:
+        return None
+    side = int(round(np.sqrt(pts.shape[0])))
+    if side * side != pts.shape[0]:
+        return None
+    norms = np.maximum(1e-6, np.linalg.norm(pts, axis=1, keepdims=True))
+    grid = (pts / norms).reshape(side, side, pts.shape[1])
+    anom = np.zeros((side, side), dtype=np.float32)
+    for r in range(side):
+        r0, r1 = max(0, r - 1), min(side, r + 2)
+        for c in range(side):
+            c0, c1 = max(0, c - 1), min(side, c + 2)
+            nbrs = grid[r0:r1, c0:c1, :].reshape(-1, pts.shape[1])
+            cos_vals = nbrs @ grid[r, c]
+            # Exclude self-similarity (~1.0) when neighbors exist
+            if len(cos_vals) > 1:
+                mean_cos = float((np.sum(cos_vals) - 1.0) / float(len(cos_vals) - 1))
+                anom[r, c] = float(np.clip(1.0 - mean_cos, 0.0, 1.0))
+    return anom
+
+
 def extract_color_foil_descriptor(crop_rgb: np.ndarray) -> np.ndarray:
     """
     Extracts an L2-normalized 168-d color, border, corner-chroma, and refractor/foil-specular
@@ -480,11 +510,13 @@ class NeuralEmbeddingEngine:
         crops_rgb: list[np.ndarray],
         batch_size: Optional[int] = None,
         include_color_foil: bool = True,
+        include_patch_tokens: bool = False,
     ) -> list[Optional[dict]]:
         """
         Extracts multi-region descriptors (`vec`, `border_vec`, `corner_vec`, `center_vec`,
-        `color_foil_vec`) for a list of RGB crops using micro-batched DirectML/CUDA inference
-        with power-of-2 bucket padding, automatic VRAM backoff, and clean CPU fallback.
+        `color_foil_vec`, and optional in-memory `patch_tokens`) for a list of RGB crops using
+        micro-batched DirectML/CUDA inference with power-of-2 bucket padding, automatic VRAM
+        backoff, and clean CPU fallback.
         """
         if not crops_rgb or not self.ensure_loaded():
             return [None] * len(crops_rgb)
@@ -516,15 +548,18 @@ class NeuralEmbeddingEngine:
                 b_vecs = mr["border_vec"]
                 c_vecs = mr["corner_vec"]
                 m_vecs = mr["center_vec"]
+                has_spatial = bool(include_patch_tokens and raw_out.ndim == 3 and raw_out.shape[1] >= 17)
 
                 for j in range(chunk_n):
                     cf_vec = extract_color_foil_descriptor(chunk[j]) if include_color_foil else None
+                    pt_toks = _l2_normalize_rows(raw_out[j, 1:, :]).astype(np.float32) if has_spatial else None
                     results[pos + j] = {
                         "vec": vecs[j],
                         "border_vec": b_vecs[j] if b_vecs is not None else None,
                         "corner_vec": c_vecs[j] if c_vecs is not None else None,
                         "center_vec": m_vecs[j] if m_vecs is not None else None,
                         "color_foil_vec": cf_vec,
+                        "patch_tokens": pt_toks,
                         "schema_v": 2,
                     }
                 pos += chunk_n
@@ -552,10 +587,20 @@ class NeuralEmbeddingEngine:
                     pos += 1
         return results
 
-    def extract_descriptor(self, crop_rgb: np.ndarray, include_color_foil: bool = True) -> Optional[dict]:
+    def extract_descriptor(
+        self,
+        crop_rgb: np.ndarray,
+        include_color_foil: bool = True,
+        include_patch_tokens: bool = False,
+    ) -> Optional[dict]:
         if crop_rgb is None or crop_rgb.size == 0 or not self.ensure_loaded():
             return None
-        res = self.extract_descriptors_batch([crop_rgb], batch_size=1, include_color_foil=include_color_foil)
+        res = self.extract_descriptors_batch(
+            [crop_rgb],
+            batch_size=1,
+            include_color_foil=include_color_foil,
+            include_patch_tokens=include_patch_tokens,
+        )
         return res[0] if res else None
 
     def extract_embeddings_batch(self, crops_rgb: list[np.ndarray], batch_size: Optional[int] = None) -> list[Optional[np.ndarray]]:
@@ -1372,26 +1417,134 @@ def benchmark_dinov2_gpu_vs_cpu(batch_size: Optional[int] = None) -> dict:
     return out
 
 
-class LocalDefectModelInterface:
-    """Foundation interface for Win #4 (local offline scratch/print-line/corner-whitening ONNX AI)."""
+_DEFECT_MODEL_LOCK = threading.Lock()
+_SINGLETON_DEFECT_MODEL: Optional["LocalDefectModelInterface"] = None
+_DEFECT_CLASS_LABELS = (
+    ("surface_scratch", True),
+    ("print_line", True),
+    ("dimple_dent", True),
+    ("print_spot_fisheye", True),
+    ("corner_whitening", True),
+    ("edge_chipping", True),
+    ("loose_dust_speck", False),
+    ("hair_fiber", False),
+    ("sleeve_smudge", False),
+    ("specular_glare", False),
+    ("clean", False),
+)
 
-    def __init__(self):
-        self.model_path = NEURAL_MODELS_DIR / "card_defect_v1.onnx"
+
+class LocalDefectModelInterface:
+    """
+    Win #4 Local Offline Defect AI ONNX Classifier (`card_defect_v1.onnx`).
+    Runs batched `[B, 3, 128, 128]` candidate patch classification via DirectML / CUDA
+    with automatic batch-size backoff and 100% CPU fallback. When `card_defect_v1.onnx` is
+    not installed, `is_ready` is False and the hybrid OpenCL + DINOv2 engine handles
+    inspection cleanly with zero errors.
+    """
+
+    def __init__(self, model_path: Optional[Path] = None, prefer_gpu: bool = True, claim_slot: bool = True):
+        self.model_path = Path(model_path) if model_path else (NEURAL_MODELS_DIR / "card_defect_v1.onnx")
+        self.prefer_gpu = bool(prefer_gpu)
+        self.claim_slot = bool(claim_slot)
+        self.session = None
+        self.active_provider = "None"
+        self.input_name = ""
+        self.output_name = ""
+        self.input_size = (128, 128)
 
     @property
     def is_ready(self) -> bool:
-        return self.model_path.exists() and self.model_path.is_file()
+        return self.model_path.exists() and self.model_path.is_file() and self.model_path.stat().st_size > 500_000
+
+    def ensure_loaded(self) -> bool:
+        if self.session is not None:
+            return True
+        if not self.is_ready:
+            return False
+        try:
+            self.session, self.active_provider = create_onnx_session(
+                self.model_path, prefer_gpu=self.prefer_gpu, purpose="defect", claim_slot=self.claim_slot
+            )
+            inp0 = self.session.get_inputs()[0]
+            self.input_name = inp0.name
+            shape = getattr(inp0, "shape", None)
+            if isinstance(shape, (list, tuple)) and len(shape) == 4:
+                h_v, w_v = shape[2], shape[3]
+                if isinstance(h_v, int) and isinstance(w_v, int) and h_v >= 32 and w_v >= 32:
+                    self.input_size = (int(w_v), int(h_v))
+            self.output_name = self.session.get_outputs()[0].name
+            return True
+        except Exception:
+            self.session = None
+            return False
+
+    def classify_candidate_patches(self, patches_rgb: list[np.ndarray], batch_size: int = 16) -> list[Optional[dict]]:
+        if not patches_rgb or not self.ensure_loaded():
+            return [None] * len(patches_rgb)
+        results: list[Optional[dict]] = [None] * len(patches_rgb)
+        cur_bs = max(1, int(batch_size))
+        pos = 0
+        while pos < len(patches_rgb):
+            chunk = patches_rgb[pos : pos + cur_bs]
+            try:
+                tensor = preprocess_card_batch(chunk, input_size=self.input_size)
+                logits = np.asarray(self.session.run([self.output_name], {self.input_name: tensor})[0], dtype=np.float32)
+                if logits.ndim == 1:
+                    logits = logits[None, :]
+                exps = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+                probs = exps / np.maximum(1e-6, np.sum(exps, axis=1, keepdims=True))
+                for j in range(len(chunk)):
+                    row_p = probs[j]
+                    cls_idx = int(np.argmax(row_p))
+                    conf = float(row_p[cls_idx])
+                    if cls_idx < len(_DEFECT_CLASS_LABELS):
+                        lbl, is_true = _DEFECT_CLASS_LABELS[cls_idx]
+                    else:
+                        lbl, is_true = (f"class_{cls_idx}", cls_idx < 6)
+                    results[pos + j] = {"label": lbl, "is_true_defect": bool(is_true), "confidence": round(conf, 4)}
+                pos += len(chunk)
+            except Exception:
+                if cur_bs > 1:
+                    cur_bs = max(1, cur_bs // 2)
+                elif self.active_provider != "CPUExecutionProvider":
+                    try:
+                        self.prefer_gpu = False
+                        self.session, self.active_provider = create_onnx_session(
+                            self.model_path, prefer_gpu=False, purpose="defect", claim_slot=False
+                        )
+                        self.input_name = self.session.get_inputs()[0].name
+                        self.output_name = self.session.get_outputs()[0].name
+                    except Exception:
+                        pos += 1
+                else:
+                    pos += 1
+        return results
+
+
+def get_local_defect_model(load_now: bool = False, claim_slot: bool = True) -> LocalDefectModelInterface:
+    global _SINGLETON_DEFECT_MODEL
+    with _DEFECT_MODEL_LOCK:
+        if _SINGLETON_DEFECT_MODEL is None:
+            _SINGLETON_DEFECT_MODEL = LocalDefectModelInterface(prefer_gpu=True, claim_slot=claim_slot)
+        if load_now and _SINGLETON_DEFECT_MODEL.is_ready:
+            _SINGLETON_DEFECT_MODEL.ensure_loaded()
+        return _SINGLETON_DEFECT_MODEL
 
 
 def get_neural_foundation_status() -> dict:
     ensure_directories()
     installed_models = []
     dinov2_installed = False
+    defect_ai_model_installed = False
     for spec in RECOMMENDED_ONNX_MODELS:
         p = NEURAL_MODELS_DIR / spec["filename"]
-        is_inst = p.exists() and p.is_file() and p.stat().st_size > 1_000_000
+        min_sz = 500_000 if spec["key"] == "card_defect_detector" else 1_000_000
+        is_inst = p.exists() and p.is_file() and p.stat().st_size > min_sz
         if spec["key"] == "dinov2_small" and is_inst:
             dinov2_installed = True
+        if spec["key"] == "card_defect_detector" and is_inst:
+            defect_ai_model_installed = True
         installed_models.append({
             "key": spec["key"],
             "filename": spec["filename"],
@@ -1413,10 +1566,17 @@ def get_neural_foundation_status() -> dict:
             cache_updated = str(c_obj.get("updated_at") or "")
         except Exception:
             pass
+    defect_tier = (
+        "ONNX+DINOv2+OpenCL" if (defect_ai_model_installed and dinov2_installed) else
+        ("DINOv2+OpenCL" if dinov2_installed else "OpenCL/CPU Hybrid")
+    )
     return {
         "models_dir": str(NEURAL_MODELS_DIR),
         "embeddings_cache_file": str(NEURAL_EMBEDDINGS_CACHE_FILE),
         "dinov2_installed": dinov2_installed,
+        "defect_ai_model_installed": defect_ai_model_installed,
+        "defect_ai_ready": True,
+        "defect_ai_tier": defect_tier,
         "cached_embeddings_count": emb_cache_count,
         "multiregion_embeddings_count": mr_cache_count,
         "cache_schema": cache_schema,

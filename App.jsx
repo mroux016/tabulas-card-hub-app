@@ -1421,11 +1421,47 @@ function InventoryGuidedCardItem({
             <div className="md:col-span-1"><label className="block text-[10px] text-slate-400 mb-0.5">Sub Surf</label><input value={draft.Sub_Surface ?? ''} onChange={(e) => onDraftChange({ ...draft, Sub_Surface: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-mono" /></div>
             <div className="md:col-span-2"><label className="block text-[10px] text-slate-400 mb-0.5">Needs Review</label><select value={String(draft.Needs_Review).toLowerCase() === 'true' ? 'True' : 'False'} onChange={(e) => onDraftChange({ ...draft, Needs_Review: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs"><option value="False">✅ False</option><option value="True">🚩 True</option></select></div>
             <div className="md:col-span-3"><label className="block text-[10px] text-slate-400 mb-0.5">Source Batch</label><input value={draft.Source_Batch ?? ''} onChange={(e) => onDraftChange({ ...draft, Source_Batch: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs font-mono" /></div>
-            <div className="md:col-span-9"><label className="block text-[10px] text-slate-400 mb-0.5">Grading &amp; Inspection Notes</label><input value={draft.Grading_Notes ?? ''} onChange={(e) => onDraftChange({ ...draft, Grading_Notes: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs" /></div>
+            <div className="md:col-span-9">
+              <label className="flex items-center gap-2 text-[10px] text-slate-400 mb-0.5">
+                <span>Grading &amp; Inspection Notes</span>
+                {String(draft.Grading_Notes || '').includes('[Sleeve/Dust Check]') && (
+                  <span className="px-1.5 py-0.5 rounded-full bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[9px] font-bold">
+                    🧹 Holder Dust / Glare Suspected — Verify Before Penalizing
+                  </span>
+                )}
+                {/(?:Surface:|scratch|print line|dimple|fisheye|edge chipping|corner whitening)/i.test(String(draft.Grading_Notes || '')) && (
+                  <span className="px-1.5 py-0.5 rounded-full bg-rose-950/90 border border-rose-500/60 text-rose-300 text-[9px] font-bold">
+                    🔍 Confirmed Defect
+                  </span>
+                )}
+              </label>
+              <input value={draft.Grading_Notes ?? ''} onChange={(e) => onDraftChange({ ...draft, Grading_Notes: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs" />
+            </div>
           </div>
         )}
       </div>
     </div>
+  );
+}
+
+function renderGradingNotesWithBadges(notes) {
+  const txt = String(notes || '').trim();
+  const hasSleeveWarn = txt.includes('[Sleeve/Dust Check]');
+  const hasDefect = /(?:Surface:|scratch|print line|dimple|fisheye|edge chipping|corner whitening)/i.test(txt);
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      {hasSleeveWarn && (
+        <span className="px-2 py-0.5 rounded-full bg-amber-950/90 border border-amber-500/60 text-amber-300 text-[10px] font-bold">
+          🧹 Holder Dust / Glare Suspected — Verify Before Penalizing
+        </span>
+      )}
+      {hasDefect && (
+        <span className="px-2 py-0.5 rounded-full bg-rose-950/90 border border-rose-500/60 text-rose-300 text-[10px] font-bold">
+          🔍 Confirmed Defect
+        </span>
+      )}
+      <span>{txt || 'No defects noted.'}</span>
+    </span>
   );
 }
 
@@ -5452,7 +5488,7 @@ export default function App() {
                         <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Centering L/R | T/B</div><div className="font-mono font-bold text-sky-300">{ddCard.Centering_LR || '—'} | {ddCard.Centering_TB || '—'}</div></div>
                         <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Subgrades (C/Co/E/S)</div><div className="font-mono font-bold text-white">{ddCard.Sub_Centering || '—'} / {ddCard.Sub_Corners || '—'} / {ddCard.Sub_Edges || '—'} / {ddCard.Sub_Surface || '—'}</div></div>
                         <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Est. PSA / BGS</div><div className="font-mono font-bold text-emerald-300">PSA {ddCard.Est_PSA || '—'} / BGS {ddCard.Est_BGS || '—'}</div></div>
-                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 md:col-span-3"><div className="text-[10px] text-slate-400">10x Loupe Pre-Grade Notes</div><div className="text-slate-200 leading-snug">{ddCard.Grading_Notes || 'No defects noted.'}</div></div>
+                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 md:col-span-3"><div className="text-[10px] text-slate-400">10x Loupe Pre-Grade Notes</div><div className="text-slate-200 leading-snug">{renderGradingNotesWithBadges(ddCard.Grading_Notes)}</div></div>
                       </div>
                     </>
                   )}
@@ -7998,7 +8034,7 @@ export default function App() {
                       </div>
                       <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1 text-xs">
                         <div><span className="font-bold text-slate-400">Recommendation:</span> <span className="text-emerald-300 font-bold">{card.Recommended_Action}</span></div>
-                        <div><span className="font-bold text-slate-400">10x Loupe Notes:</span> <span className="text-slate-200">{card.Grading_Notes || 'No defects noted.'}</span></div>
+                        <div><span className="font-bold text-slate-400">10x Loupe Notes:</span> <span className="text-slate-200">{renderGradingNotesWithBadges(card.Grading_Notes)}</span></div>
                         <div><span className="font-bold text-slate-400">Subgrades:</span> Centering {card.Sub_Centering} • Corners {card.Sub_Corners} • Edges {card.Sub_Edges} • Surface {card.Sub_Surface}</div>
                       </div>
                     </div>
@@ -9598,12 +9634,16 @@ export default function App() {
                                   <input type="checkbox" checked={cSet.enable_neural_embeddings !== false} onChange={(e) => updateComputeCfg({ enable_neural_embeddings: e.target.checked })} />
                                   DINOv2 Embeddings (Win #2)
                                 </label>
+                                <label className="flex items-center gap-1.5 text-xs text-emerald-200 cursor-pointer">
+                                  <input type="checkbox" checked={cSet.enable_defect_ai !== false} onChange={(e) => updateComputeCfg({ enable_defect_ai: e.target.checked })} />
+                                  Through-Sleeve Defect AI (Win #4: {nf.defect_ai_tier || 'OpenCL/CPU Hybrid'})
+                                </label>
                               </div>
                             </div>
 
-                            {/* LIVE BENCHMARK RESULTS (WINS #1, #2 & #3) */}
+                            {/* LIVE BENCHMARK RESULTS (WINS #1, #2, #3 & #4) */}
                             {computeBench && (
-                              <div className="p-3 bg-slate-950 border border-emerald-500/40 rounded-xl grid grid-cols-1 lg:grid-cols-3 gap-3 font-mono text-[11px]">
+                              <div className="p-3 bg-slate-950 border border-emerald-500/40 rounded-xl grid grid-cols-1 lg:grid-cols-4 gap-3 font-mono text-[11px]">
                                 <div>
                                   <div className="text-emerald-300 font-bold mb-0.5">⏱️ Win #3 — 600 DPI Filters (1500×2100)</div>
                                   <div className="text-slate-300">
@@ -9630,6 +9670,17 @@ export default function App() {
                                     </div>
                                   ) : (
                                     <div className="text-slate-500">Download DINOv2-small below to benchmark</div>
+                                  )}
+                                </div>
+                                <div>
+                                  <div className="text-teal-300 font-bold mb-0.5">🔬 Win #4 — Through-Sleeve Defect AI</div>
+                                  {computeBench.defect_ai?.ready ? (
+                                    <div className="text-slate-300">
+                                      CPU Filter: <span className="text-white">{computeBench.defect_ai.cpu_filter_ms ?? '—'} ms</span> • Inspect:{' '}
+                                      <span className="text-cyan-300">{computeBench.defect_ai.inspection_ms ?? '—'} ms</span>
+                                    </div>
+                                  ) : (
+                                    <div className="text-slate-500">{computeBench.defect_ai?.note || 'OpenCL/CPU Hybrid Ready'}</div>
                                   )}
                                 </div>
                               </div>

@@ -40,6 +40,8 @@ DEFAULT_COMPUTE_SETTINGS = {
     "enable_opencl_cv": True,
     "enable_neural_embeddings": True,
     "enable_multiregion_neural": True,
+    "enable_defect_ai": True,
+    "holder_aware_inspection": True,
     "neural_batch_size": 32,
     "max_concurrent_gpu_workers": 2,
     "phase_b_shared_inference_server": False,
@@ -90,6 +92,8 @@ def load_compute_settings() -> dict:
     out["enable_ocr_gpu"] = bool(out.get("enable_ocr_gpu", True))
     out["enable_opencl_cv"] = bool(out.get("enable_opencl_cv", True))
     out["enable_neural_embeddings"] = bool(out.get("enable_neural_embeddings", True))
+    out["enable_defect_ai"] = bool(out.get("enable_defect_ai", True))
+    out["holder_aware_inspection"] = bool(out.get("holder_aware_inspection", True))
     out["enable_multiregion_neural"] = bool(out.get("enable_multiregion_neural", True))
     try:
         out["neural_batch_size"] = max(4, min(64, int(out.get("neural_batch_size", 32))))
@@ -125,6 +129,8 @@ def save_compute_settings(updates: dict) -> dict:
         curr["enable_ocr_gpu"] = bool(curr.get("enable_ocr_gpu", True))
         curr["enable_opencl_cv"] = bool(curr.get("enable_opencl_cv", True))
         curr["enable_neural_embeddings"] = bool(curr.get("enable_neural_embeddings", True))
+        curr["enable_defect_ai"] = bool(curr.get("enable_defect_ai", True))
+        curr["holder_aware_inspection"] = bool(curr.get("holder_aware_inspection", True))
         curr["enable_multiregion_neural"] = bool(curr.get("enable_multiregion_neural", True))
         try:
             curr["neural_batch_size"] = max(4, min(64, int(curr.get("neural_batch_size", 32))))
@@ -579,6 +585,9 @@ def resolve_target_onnx_provider(
     if p_norm == "neural":
         if not cfg.get("enable_neural_embeddings", True):
             return "CPUExecutionProvider"
+    elif p_norm == "defect":
+        if not cfg.get("enable_defect_ai", True):
+            return "CPUExecutionProvider"
     else:
         if not cfg.get("enable_ocr_gpu", True):
             return "CPUExecutionProvider"
@@ -1013,6 +1022,66 @@ def opencl_surface_gradients(gray_u8: np.ndarray) -> tuple[np.ndarray, np.ndarra
     return cv2.magnitude(sx, sy), np.abs(cv2.Laplacian(gray_u8, cv2.CV_32F, ksize=3))
 
 
+def opencl_defect_filter_bank(rgb_u8: np.ndarray, force_cpu: bool = False) -> dict[str, np.ndarray]:
+    """
+    Win #4 GPU-accelerated filter bank for through-sleeve surface defect & artifact analysis.
+    Uploads `rgb_u8` once to `cv2.UMat` when OpenCL is active and array size exceeds the PCIe
+    break-even threshold, computing LAB, HSV, grayscale, morphological Top-Hat / Black-Hat,
+    Sobel magnitude, Laplacian magnitude, and signed Difference-of-Gaussians (DoG).
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    if not force_cpu and _should_use_umat(rgb_u8, min_pixels=200_000):
+        try:
+            u_rgb = cv2.UMat(rgb_u8)
+            u_lab = cv2.cvtColor(u_rgb, cv2.COLOR_RGB2LAB)
+            u_hsv = cv2.cvtColor(u_rgb, cv2.COLOR_RGB2HSV)
+            u_gray = cv2.cvtColor(u_rgb, cv2.COLOR_RGB2GRAY)
+            u_tophat = cv2.morphologyEx(u_gray, cv2.MORPH_TOPHAT, kernel)
+            u_blackhat = cv2.morphologyEx(u_gray, cv2.MORPH_BLACKHAT, kernel)
+            u_sx = cv2.Sobel(u_gray, cv2.CV_32F, 1, 0, ksize=3)
+            u_sy = cv2.Sobel(u_gray, cv2.CV_32F, 0, 1, ksize=3)
+            u_mag = cv2.magnitude(u_sx, u_sy)
+            u_lap = cv2.Laplacian(u_gray, cv2.CV_32F, ksize=3)
+            u_g1 = cv2.GaussianBlur(u_gray, (5, 5), 1.2)
+            u_g2 = cv2.GaussianBlur(u_gray, (15, 15), 3.8)
+            return {
+                "lab": u_lab.get(),
+                "hsv": u_hsv.get(),
+                "gray": u_gray.get(),
+                "tophat": u_tophat.get(),
+                "blackhat": u_blackhat.get(),
+                "sobel_mag": u_mag.get(),
+                "lap_abs": np.abs(u_lap.get()),
+                "dog_signed": u_g1.get().astype(np.float32) - u_g2.get().astype(np.float32),
+                "backend": "OpenCL UMat GPU",
+            }
+        except Exception:
+            pass
+
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    sobel_mag = cv2.magnitude(sx, sy)
+    lap_abs = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    g1 = cv2.GaussianBlur(gray, (5, 5), 1.2).astype(np.float32)
+    g2 = cv2.GaussianBlur(gray, (15, 15), 3.8).astype(np.float32)
+    return {
+        "lab": lab,
+        "hsv": hsv,
+        "gray": gray,
+        "tophat": tophat,
+        "blackhat": blackhat,
+        "sobel_mag": sobel_mag,
+        "lap_abs": lap_abs,
+        "dog_signed": g1 - g2,
+        "backend": "CPU NumPy",
+    }
+
+
 # ==============================================================================
 # WORKER LIFECYCLE HOOK (CALLED BY cli.py FOR VISION JOBS)
 # ==============================================================================
@@ -1155,6 +1224,40 @@ def run_compute_benchmark() -> dict:
         results["dinov2"] = benchmark_dinov2_gpu_vs_cpu(batch_size=get_recommended_neural_batch_size())
     except Exception as e:
         results["dinov2"] = {"installed": False, "note": str(e)}
+
+    # 4. Win #4 Benchmark: Through-Sleeve Surface Defect Filter Bank & Inspection (no GPU slot leak)
+    had_claim_before = _PROCESS_CLAIMED_GPU
+    try:
+        from PIL import Image
+        from Core.surface_defect_engine import inspect_card_surface_through_sleeve
+
+        synth_card = np.full((1260, 900, 3), 235, dtype=np.uint8)
+        synth_card[40:1220, 40:860] = (180, 185, 195)
+        synth_card[95:1165, 95:805] = (80, 110, 140)
+        cv2.line(synth_card, (300, 350), (520, 520), (245, 245, 245), 2)
+        pil_card = Image.fromarray(synth_card)
+        box = (40, 40, 860, 1220)
+
+        t_d0 = time.perf_counter()
+        opencl_defect_filter_bank(synth_card, force_cpu=True)
+        defect_cpu_ms = (time.perf_counter() - t_d0) * 1000.0
+
+        t_d1 = time.perf_counter()
+        inspect_res = inspect_card_surface_through_sleeve(
+            pil_card, pil_card, front_box=box, back_box=box, enable_onnx_anomaly=False, claim_slot=False
+        )
+        defect_active_ms = (time.perf_counter() - t_d1) * 1000.0
+        results["defect_ai"] = {
+            "ready": True,
+            "cpu_filter_ms": round(defect_cpu_ms, 1),
+            "inspection_ms": round(defect_active_ms, 1),
+            "backend": inspect_res.get("backend_used", "OpenCL/CPU Hybrid"),
+        }
+    except Exception as e:
+        results["defect_ai"] = {"ready": False, "note": str(e)}
+    finally:
+        if not had_claim_before and _PROCESS_CLAIMED_GPU:
+            release_gpu_worker_slot()
 
     return results
 

@@ -1,0 +1,214 @@
+from __future__ import annotations
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import cv2
+import numpy as np
+from PIL import Image
+
+# Isolate all paths strictly inside %TEMP% before importing any Core module
+_TEMP_ROOT = Path(tempfile.gettempdir()) / "tabulas_win4_tests"
+_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["CARDS_BASE_DIR"] = str(_TEMP_ROOT / "Hub")
+os.environ["TABULAS_SET_LIBRARY_DIR"] = str(_TEMP_ROOT / "SetLibrary")
+os.environ["TABULAS_ARCHIVE_DIR"] = str(_TEMP_ROOT / "Archive")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from Core.compute_backend import get_active_gpu_worker_claims, run_compute_benchmark
+from Core.surface_defect_engine import inspect_card_surface_through_sleeve
+from Core.vision_grader import estimate_card_pregrade
+
+
+def _make_clean_card_in_sleeve(
+    w: int = 750,
+    h: int = 1050,
+    margin: int = 40,
+    border_rgb: tuple[int, int, int] = (45, 52, 68),
+    interior_rgb: tuple[int, int, int] = (75, 105, 140),
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Creates a clean card inside a clear sleeve with realistic subtle paper grain."""
+    rng = np.random.default_rng(42)
+    canvas = np.full((h, w, 3), 232, dtype=np.uint8)
+    x1, y1, x2, y2 = margin, margin, w - margin, h - margin
+    canvas[y1:y2, x1:x2] = border_rgb
+    b_pad = 32
+    canvas[y1 + b_pad:y2 - b_pad, x1 + b_pad:x2 - b_pad] = interior_rgb
+    # Subtle uniform texture so Laplacian variance is realistic for a crisp printed card
+    noise = rng.integers(-4, 5, size=(y2 - y1, x2 - x1, 3), dtype=np.int16)
+    card_sl = np.clip(canvas[y1:y2, x1:x2].astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    canvas[y1:y2, x1:x2] = card_sl
+    # Crisp printed player silhouette + border line
+    cv2.rectangle(canvas, (x1 + b_pad, y1 + b_pad), (x2 - b_pad, y2 - b_pad), (210, 195, 160), 2)
+    return Image.fromarray(canvas), (x1, y1, x2, y2)
+
+
+def test_clean_card():
+    f_im, f_box = _make_clean_card_in_sleeve()
+    b_im, b_box = _make_clean_card_in_sleeve(border_rgb=(60, 62, 70), interior_rgb=(95, 100, 110))
+    res = inspect_card_surface_through_sleeve(f_im, b_im, front_box=f_box, back_box=b_box, enable_onnx_anomaly=False)
+    assert res["sub_surface"] >= 9.5, res
+    assert res["sub_corners"] >= 9.5, res
+    assert res["sub_edges"] >= 9.5, res
+    assert len(res["confirmed_defects"]) == 0, res["confirmed_defects"]
+    assert res["artifact_warning"] == "", res["artifact_warning"]
+
+    pg = estimate_card_pregrade(f_im, b_im, front_box=f_box, back_box=b_box)
+    assert float(pg["Sub_Surface"]) >= 9.5, pg
+    assert "[Sleeve/Dust Check]" not in pg["Grading_Notes"], pg["Grading_Notes"]
+
+
+def test_true_defects():
+    # 1. Surface scratch
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    cv2.line(arr, (260, 320), (430, 440), (242, 242, 242), 2)
+    res_scr = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types_scr = [d["type"] for d in res_scr["confirmed_defects"]]
+    assert "surface_scratch" in types_scr, res_scr
+    assert res_scr["sub_surface"] < 9.5, res_scr
+
+    # 2. Factory print line (axis-aligned long line inside card)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    cv2.line(arr, (120, 520), (630, 520), (235, 235, 235), 2)
+    res_pl = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types_pl = [d["type"] for d in res_pl["confirmed_defects"]]
+    assert "print_line" in types_pl, res_pl
+    assert res_pl["sub_surface"] < 9.5, res_pl
+
+    # 3. Dimple / dent (bright/dark shading dipole with continuous hue)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im).astype(np.int16)
+    cv2.circle(arr, (360, 500), 8, (45, 45, 45), -1)
+    cv2.circle(arr, (370, 500), 8, (-45, -45, -45), -1)
+    # Re-apply around base color cleanly
+    base = np.array(f_im).astype(np.int16)
+    yy, xx = np.ogrid[:arr.shape[0], :arr.shape[1]]
+    lobe_p = np.exp(-((xx - 355) ** 2 + (yy - 500) ** 2) / 36.0) * 55.0
+    lobe_n = np.exp(-((xx - 371) ** 2 + (yy - 500) ** 2) / 36.0) * 55.0
+    dent_arr = np.clip(base + (lobe_p - lobe_n)[..., None], 0, 255).astype(np.uint8)
+    res_dent = inspect_card_surface_through_sleeve(Image.fromarray(dent_arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types_dent = [d["type"] for d in res_dent["confirmed_defects"]]
+    assert "dimple_dent" in types_dent, res_dent
+
+    # 4. Fisheye print spot (dark core + pale annular halo)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    cv2.circle(arr, (380, 420), 9, (220, 225, 230), -1)
+    cv2.circle(arr, (380, 420), 4, (25, 30, 35), -1)
+    res_fish = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types_fish = [d["type"] for d in res_fish["confirmed_defects"]]
+    assert "print_spot_fisheye" in types_fish, res_fish
+
+    # 5. Edge chipping & Corner whitening (on Back side to verify 2-sided inspection)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    b_im, b_box = _make_clean_card_in_sleeve()
+    b_arr = np.array(b_im)
+    # Corner whitening at Back Top-Left
+    cv2.circle(b_arr, (b_box[0] + 8, b_box[1] + 8), 8, (238, 238, 238), -1)
+    # Edge chipping on Back Right edge
+    cv2.rectangle(b_arr, (b_box[2] - 8, 450), (b_box[2], 472), (235, 235, 235), -1)
+    res_ec = inspect_card_surface_through_sleeve(f_im, Image.fromarray(b_arr), front_box=f_box, back_box=b_box, enable_onnx_anomaly=False)
+    types_ec = [d["type"] for d in res_ec["confirmed_defects"]]
+    assert "corner_whitening" in types_ec, res_ec
+    assert "edge_chipping" in types_ec, res_ec
+    assert res_ec["sub_corners"] < 9.5 and res_ec["sub_edges"] < 9.5, res_ec
+
+
+def test_superficial_artifacts_no_penalty():
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    # 1. Border-crossing sleeve scratch (starts in outer margin x=10, crosses card edge x=40 into x=160)
+    cv2.line(arr, (10, 300), (180, 340), (248, 248, 248), 2)
+    # 2. Curved hair / fiber
+    pts = np.array([[280, 620], [310, 590], [350, 600], [380, 640], [340, 670]], dtype=np.int32)
+    cv2.polylines(arr, [pts], False, (18, 18, 18), 2)
+    # 3. Loose dust specks (tiny 2x2 dots) + margin dust
+    for dx, dy in [(220, 240), (450, 280), (500, 700), (20, 120), (18, 600)]:
+        cv2.circle(arr, (dx, dy), 2, (248, 248, 248), -1)
+    # 4. Bright specular glare band (smooth L>235, S<24)
+    cv2.rectangle(arr, (200, 760), (550, 840), (246, 246, 246), -1)
+
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    assert len(res["confirmed_defects"]) == 0, f"False confirmed defects: {res['confirmed_defects']}"
+    assert res["sub_surface"] >= 9.5, res
+    assert "[Sleeve/Dust Check]" in res["artifact_warning"], res["artifact_warning"]
+
+    pg = estimate_card_pregrade(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box)
+    assert float(pg["Sub_Surface"]) >= 9.5, pg
+    assert "[Sleeve/Dust Check]" in pg["Grading_Notes"], pg["Grading_Notes"]
+
+
+def test_mixed_defect_and_artifact():
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    # Real interior scratch
+    cv2.line(arr, (250, 300), (440, 390), (245, 245, 245), 2)
+    # Plus specular glare + dust
+    cv2.rectangle(arr, (180, 740), (540, 820), (246, 246, 246), -1)
+    cv2.circle(arr, (520, 250), 2, (248, 248, 248), -1)
+
+    pg = estimate_card_pregrade(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box)
+    assert float(pg["Sub_Surface"]) < 9.5, pg
+    assert "[Sleeve/Dust Check]" in pg["Grading_Notes"], pg["Grading_Notes"]
+
+
+def test_tight_crop_fallback():
+    # Tightly cropped card with 0-2px margin outside card_box
+    f_im, f_box = _make_clean_card_in_sleeve(w=670, h=970, margin=2)
+    arr = np.array(f_im)
+    cv2.line(arr, (220, 300), (400, 400), (245, 245, 245), 2)
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    assert res["has_holder_margin_front"] is False
+    assert any(d["type"] == "surface_scratch" for d in res["confirmed_defects"]), res
+
+
+def test_precomputed_patch_tokens_reuse():
+    f_im, f_box = _make_clean_card_in_sleeve()
+    fake_tokens = np.ones((256, 64), dtype=np.float32)
+    with mock.patch("Core.surface_defect_engine.is_neural_embeddings_enabled", return_value=True), \
+         mock.patch("Core.surface_defect_engine.get_neural_embedding_engine") as mock_eng:
+        res = inspect_card_surface_through_sleeve(
+            f_im, None, front_box=f_box, front_patch_tokens=fake_tokens, enable_onnx_anomaly=True
+        )
+        mock_eng.assert_not_called()
+        assert res["sub_surface"] >= 9.5
+
+
+def test_cpu_parity_and_benchmark_no_slot_leak():
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    cv2.line(arr, (250, 300), (440, 390), (245, 245, 245), 2)
+    im_d = Image.fromarray(arr)
+    res_auto = inspect_card_surface_through_sleeve(im_d, f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False, force_cpu=False)
+    res_cpu = inspect_card_surface_through_sleeve(im_d, f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False, force_cpu=True)
+    assert res_auto["sub_surface"] == res_cpu["sub_surface"]
+    assert len(res_auto["confirmed_defects"]) == len(res_cpu["confirmed_defects"])
+
+    claims_before = len(get_active_gpu_worker_claims())
+    bench = run_compute_benchmark()
+    claims_after = len(get_active_gpu_worker_claims())
+    assert bench.get("defect_ai", {}).get("ready") is True, bench
+    assert claims_after == claims_before, f"GPU slot leaked: before={claims_before}, after={claims_after}"
+
+
+if __name__ == "__main__":
+    test_clean_card()
+    print("[PASS] test_clean_card")
+    test_true_defects()
+    print("[PASS] test_true_defects")
+    test_superficial_artifacts_no_penalty()
+    print("[PASS] test_superficial_artifacts_no_penalty")
+    test_mixed_defect_and_artifact()
+    print("[PASS] test_mixed_defect_and_artifact")
+    test_tight_crop_fallback()
+    print("[PASS] test_tight_crop_fallback")
+    test_precomputed_patch_tokens_reuse()
+    print("[PASS] test_precomputed_patch_tokens_reuse")
+    test_cpu_parity_and_benchmark_no_slot_leak()
+    print("[PASS] test_cpu_parity_and_benchmark_no_slot_leak")
+    print("ALL WIN #4 TESTS PASSED")

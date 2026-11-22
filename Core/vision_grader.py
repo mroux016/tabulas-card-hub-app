@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from Core.compute_backend import (
     demote_to_cpu_on_error,
     get_accelerated_rapidocr,
+    load_compute_settings,
     opencl_clahe_enhance,
     opencl_highpass_and_cross_weave,
 )
@@ -3327,7 +3328,10 @@ def identify_and_verify_card_pipeline(
         try:
             eng_id = get_neural_embedding_engine(load_now=True)
             if eng_id is not None and eng_id.is_ready:
-                scan_front_desc = eng_id.extract_descriptor(scan_front_crop, include_color_foil=True)
+                want_pt = bool(load_compute_settings().get("enable_defect_ai", True))
+                scan_front_desc = eng_id.extract_descriptor(
+                    scan_front_crop, include_color_foil=True, include_patch_tokens=want_pt
+                )
         except Exception:
             scan_front_desc = None
 
@@ -3740,6 +3744,7 @@ def identify_and_verify_card_pipeline(
         "Matched_Template_Back": matched_tmpl_back,
         "Needs_Review": needs_review,
         "Tier_Tag": tier_tag,
+        "front_patch_tokens": scan_front_desc.get("patch_tokens") if isinstance(scan_front_desc, dict) else None,
     }
 
 
@@ -4377,6 +4382,8 @@ def estimate_card_pregrade(
     back_img: Image.Image,
     front_box: Optional[tuple[int, int, int, int]] = None,
     back_box: Optional[tuple[int, int, int, int]] = None,
+    front_patch_tokens: Optional[np.ndarray] = None,
+    back_patch_tokens: Optional[np.ndarray] = None,
 ) -> dict:
     if front_box is None:
         front_box = detect_physical_card_box(front_img)
@@ -4425,49 +4432,77 @@ def estimate_card_pregrade(
     else:
         sub_centering = 6.0
 
-    corner_names = ["Front Top-Left", "Front Top-Right", "Front Bot-Left", "Front Bot-Right"]
-    c_span = max(16, int(min(cw, ch) * 0.08))
-    c_patches = [
-        gray[:c_span, :c_span],
-        gray[:c_span, cw - c_span:],
-        gray[ch - c_span:, :c_span],
-        gray[ch - c_span:, cw - c_span:],
-    ]
-    corner_scores = []
-    worst_corner_name = "Front Top-Left"
-    worst_corner_val = 10.0
-    for c_lbl, patch in zip(corner_names, c_patches):
-        lap_var = float(cv2.Laplacian(patch, cv2.CV_64F).var())
-        score_c = 9.5 if lap_var >= 110 else (9.0 if lap_var >= 55 else 8.5)
-        corner_scores.append(score_c)
-        if score_c < worst_corner_val:
-            worst_corner_val = score_c
-            worst_corner_name = c_lbl
-    sub_corners = round(float(min(corner_scores)), 1)
+    win4_res = None
+    try:
+        if bool(load_compute_settings().get("enable_defect_ai", True)):
+            from Core.surface_defect_engine import inspect_card_surface_through_sleeve
+            win4_res = inspect_card_surface_through_sleeve(
+                front_img=front_img,
+                back_img=back_img,
+                front_box=front_box,
+                back_box=back_box,
+                front_patch_tokens=front_patch_tokens,
+                back_patch_tokens=back_patch_tokens,
+                enable_onnx_anomaly=True,
+                claim_slot=True,
+            )
+    except Exception:
+        win4_res = None
 
-    edge_strip = max(8, int(min(cw, ch) * 0.025))
-    edge_zones = [
-        ("Front Top edge", gray[:edge_strip, c_span:cw - c_span]),
-        ("Front Bottom edge", gray[ch - edge_strip:, c_span:cw - c_span]),
-        ("Front Left edge", gray[c_span:ch - c_span, :edge_strip]),
-        ("Front Right edge", gray[c_span:ch - c_span, cw - edge_strip:]),
-    ]
-    sub_edges = 9.5
-    edge_callout = ""
-    for e_name, e_patch in edge_zones:
-        if e_patch.size == 0:
-            continue
-        std_e = float(np.std(e_patch))
-        if std_e > 48.0 and sub_edges > 8.5:
-            sub_edges = 8.5
-            edge_callout = f"edge nick/whitening on {e_name} (8.5)"
-        elif std_e > 34.0 and sub_edges > 9.0:
-            sub_edges = 9.0
-            edge_callout = f"minor edge wear on {e_name} (9.0)"
+    if isinstance(win4_res, dict):
+        sub_corners = float(win4_res["sub_corners"])
+        sub_edges = float(win4_res["sub_edges"])
+        sub_surface = float(win4_res["sub_surface"])
+        edge_callout = ""
+        worst_corner_name = "Corner"
+        defect_notes_extra = list(win4_res.get("defect_notes") or [])
+        artifact_warning = str(win4_res.get("artifact_warning") or "").strip()
+    else:
+        corner_names = ["Front Top-Left", "Front Top-Right", "Front Bot-Left", "Front Bot-Right"]
+        c_span = max(16, int(min(cw, ch) * 0.08))
+        c_patches = [
+            gray[:c_span, :c_span],
+            gray[:c_span, cw - c_span:],
+            gray[ch - c_span:, :c_span],
+            gray[ch - c_span:, cw - c_span:],
+        ]
+        corner_scores = []
+        worst_corner_name = "Front Top-Left"
+        worst_corner_val = 10.0
+        for c_lbl, patch in zip(corner_names, c_patches):
+            lap_var = float(cv2.Laplacian(patch, cv2.CV_64F).var())
+            score_c = 9.5 if lap_var >= 110 else (9.0 if lap_var >= 55 else 8.5)
+            corner_scores.append(score_c)
+            if score_c < worst_corner_val:
+                worst_corner_val = score_c
+                worst_corner_name = c_lbl
+        sub_corners = round(float(min(corner_scores)), 1)
 
-    center_patch = gray[int(ch * 0.18):int(ch * 0.82), int(cw * 0.18):int(cw * 0.82)]
-    lap_surf = float(cv2.Laplacian(center_patch, cv2.CV_64F).var()) if center_patch.size else 100.0
-    sub_surface = 9.5 if lap_surf >= 45.0 else 9.0
+        edge_strip = max(8, int(min(cw, ch) * 0.025))
+        edge_zones = [
+            ("Front Top edge", gray[:edge_strip, c_span:cw - c_span]),
+            ("Front Bottom edge", gray[ch - edge_strip:, c_span:cw - c_span]),
+            ("Front Left edge", gray[c_span:ch - c_span, :edge_strip]),
+            ("Front Right edge", gray[c_span:ch - c_span, cw - edge_strip:]),
+        ]
+        sub_edges = 9.5
+        edge_callout = ""
+        for e_name, e_patch in edge_zones:
+            if e_patch.size == 0:
+                continue
+            std_e = float(np.std(e_patch))
+            if std_e > 48.0 and sub_edges > 8.5:
+                sub_edges = 8.5
+                edge_callout = f"edge nick/whitening on {e_name} (8.5)"
+            elif std_e > 34.0 and sub_edges > 9.0:
+                sub_edges = 9.0
+                edge_callout = f"minor edge wear on {e_name} (9.0)"
+
+        center_patch = gray[int(ch * 0.18):int(ch * 0.82), int(cw * 0.18):int(cw * 0.82)]
+        lap_surf = float(cv2.Laplacian(center_patch, cv2.CV_64F).var()) if center_patch.size else 100.0
+        sub_surface = 9.5 if lap_surf >= 45.0 else 9.0
+        defect_notes_extra = []
+        artifact_warning = ""
 
     subs = sorted([sub_centering, sub_corners, sub_edges, sub_surface])
     min_sub = subs[0]
@@ -4490,10 +4525,15 @@ def estimate_card_pregrade(
     if abs(tb_t - 50) >= 6:
         shift_tb = "up (wider bottom border)" if tb_t < 50 else "down (wider top border)"
         notes_list.append(f"Centering: Front T/B shifted {shift_tb} ({tb_t}/{tb_b})")
-    if sub_corners < 9.5:
-        notes_list.append(f"Corners: {worst_corner_name} corner softness ({sub_corners:.1f})")
-    if edge_callout:
-        notes_list.append(f"Edges: {edge_callout}")
+    if defect_notes_extra:
+        notes_list.extend(defect_notes_extra)
+    else:
+        if sub_corners < 9.5:
+            notes_list.append(f"Corners: {worst_corner_name} corner softness ({sub_corners:.1f})")
+        if edge_callout:
+            notes_list.append(f"Edges: {edge_callout}")
+    if artifact_warning:
+        notes_list.append(artifact_warning)
     if len(notes_list) == 1:
         notes_list.append(f"Sharp corners & clean surface ({lr_l}/{lr_r} L/R, {tb_t}/{tb_b} T/B)")
 
@@ -4896,7 +4936,13 @@ def process_single_batch(
             set_name, chosen_sub, cnum_str, player_name, sku_str
         )
 
-        grade_info = estimate_card_pregrade(front_img, back_oriented, front_box=front_box, back_box=back_box)
+        grade_info = estimate_card_pregrade(
+            front_img,
+            back_oriented,
+            front_box=front_box,
+            back_box=back_box,
+            front_patch_tokens=id_res.get("front_patch_tokens"),
+        )
 
         # Pipeline JPEG encoding & 8-Corner sheet saving in background threads so disk I/O overlaps with the next PDF's OCR
         def _save_card_images_bg(f_im, b_im, fb, bb, fp, bp, cp):
@@ -5505,7 +5551,13 @@ def reprocess_single_batch_card(
             c_im_s.save(batch_dir / c_fname_s, format="JPEG", quality=92)
         except Exception:
             pass
-        g_res = estimate_card_pregrade(f_img, b_oriented, front_box=f_box, back_box=b_box)
+        g_res = estimate_card_pregrade(
+            f_img,
+            b_oriented,
+            front_box=f_box,
+            back_box=b_box,
+            front_patch_tokens=id_res.get("front_patch_tokens"),
+        )
         for gk, gv in g_res.items():
             df.at[r_idx, gk] = gv
 
@@ -5833,7 +5885,13 @@ def reprocess_inventory_skus(
                         log_cb(f"    ↻ [Post-ID Orient SKU {sku_s}] Front ↻{front_rot_2}° ({front_rsn_2})")
 
             if regrade_too or front_rot_ang != 0 or back_rot_ang != 0:
-                g_res = estimate_card_pregrade(f_img, b_oriented, front_box=f_box, back_box=b_box)
+                g_res = estimate_card_pregrade(
+            f_img,
+            b_oriented,
+            front_box=f_box,
+            back_box=b_box,
+            front_patch_tokens=id_res.get("front_patch_tokens"),
+        )
                 for gk, gv in g_res.items():
                     if gk in inv_df.columns:
                         inv_df.at[r_idx, gk] = gv
