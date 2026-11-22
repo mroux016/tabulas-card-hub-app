@@ -232,6 +232,9 @@ CACHE_CHECKLISTS_DIR = CACHE_DIR / "Checklists"
 CACHE_INVENTORY_DIR = CACHE_DIR / "Inventory"
 CACHE_SALES_MARKET_DIR = CACHE_DIR / "Sales_and_Market"
 CACHE_SYSTEM_DIR = CACHE_DIR / "System"
+CACHE_GRADING_DIAGNOSTICS_DIR = CACHE_DIR / "Grading_Diagnostics"
+CACHE_GRADING_FEEDBACK_DIR = CACHE_DIR / "Grading_Feedback"
+GRADING_FEEDBACK_LOG_FILE = CACHE_GRADING_FEEDBACK_DIR / "grading_feedback_log.jsonl"
 
 LOGS_ROOT_DIR = BASE_DIR / "Logs"
 DAILY_LOGS_ROOT = LOGS_ROOT_DIR / "Logs"
@@ -1089,10 +1092,18 @@ def ensure_directories():
             CACHE_INVENTORY_DIR,
             CACHE_SALES_MARKET_DIR,
             CACHE_SYSTEM_DIR,
+            CACHE_GRADING_DIAGNOSTICS_DIR,
+            CACHE_GRADING_FEEDBACK_DIR,
             RUNTIME_DIR,
         ])
     else:
-        dirs_to_create.extend([LOGS_DIR, SET_LIBRARY_CACHE_DIR, CACHE_CHECKPOINTS_DIR])
+        dirs_to_create.extend([
+            LOGS_DIR,
+            SET_LIBRARY_CACHE_DIR,
+            CACHE_CHECKPOINTS_DIR,
+            CACHE_GRADING_DIAGNOSTICS_DIR,
+            CACHE_GRADING_FEEDBACK_DIR,
+        ])
 
     for d in dirs_to_create:
         try:

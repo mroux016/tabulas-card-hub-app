@@ -196,6 +196,35 @@ def test_cpu_parity_and_benchmark_no_slot_leak():
     assert claims_after == claims_before, f"GPU slot leaked: before={claims_before}, after={claims_after}"
 
 
+def test_scanner_streaks_vs_true_defects():
+    # 1. Full-frame margin-crossing bright vertical CIS scanner streak -> scanner_streak (zero penalty)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr_v = np.array(f_im)
+    cv2.line(arr_v, (310, 0), (310, arr_v.shape[0] - 1), (242, 242, 242), 2)
+    res_v = inspect_card_surface_through_sleeve(Image.fromarray(arr_v), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    assert len(res_v["confirmed_defects"]) == 0, f"Margin-crossing scanner streak misclassified as defect: {res_v['confirmed_defects']}"
+    assert res_v["sub_surface"] >= 9.5, res_v
+    assert any(a["type"] == "scanner_streak" and len(a.get("bbox_norm", [])) == 4 for a in res_v["superficial_artifacts"]), res_v["superficial_artifacts"]
+    assert "scanner glass" in res_v["artifact_warning"].lower(), res_v["artifact_warning"]
+
+    # 2. Full-frame single-channel RGB/CIS color-cast streak (green/cyan offset) -> scanner_streak (zero penalty)
+    arr_rgb = np.array(f_im).astype(np.int16)
+    arr_rgb[:, 420:422, 1] = np.clip(arr_rgb[:, 420:422, 1] + 55, 0, 255)
+    res_rgb = inspect_card_surface_through_sleeve(Image.fromarray(arr_rgb.astype(np.uint8)), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    assert len(res_rgb["confirmed_defects"]) == 0, f"RGB CIS streak misclassified: {res_rgb['confirmed_defects']}"
+    assert res_rgb["sub_surface"] >= 9.5, res_rgb
+    assert any(a["type"] == "scanner_streak" for a in res_rgb["superficial_artifacts"]), res_rgb["superficial_artifacts"]
+
+    # 3. Tight-cropped edge-to-edge constant-column scanner streak (no margin_ring) -> scanner_streak (zero penalty)
+    t_im, t_box = _make_clean_card_in_sleeve(w=670, h=970, margin=2)
+    arr_t = np.array(t_im)
+    cv2.line(arr_t, (290, 0), (290, arr_t.shape[0] - 1), (245, 245, 245), 2)
+    res_t = inspect_card_surface_through_sleeve(Image.fromarray(arr_t), t_im, front_box=t_box, back_box=t_box, enable_onnx_anomaly=False)
+    assert len(res_t["confirmed_defects"]) == 0, f"Tight-cropped scanner streak misclassified: {res_t['confirmed_defects']}"
+    assert res_t["sub_surface"] >= 9.5, res_t
+    assert any(a["type"] == "scanner_streak" for a in res_t["superficial_artifacts"]), res_t["superficial_artifacts"]
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")
@@ -211,4 +240,6 @@ if __name__ == "__main__":
     print("[PASS] test_precomputed_patch_tokens_reuse")
     test_cpu_parity_and_benchmark_no_slot_leak()
     print("[PASS] test_cpu_parity_and_benchmark_no_slot_leak")
+    test_scanner_streaks_vs_true_defects()
+    print("[PASS] test_scanner_streaks_vs_true_defects")
     print("ALL WIN #4 TESTS PASSED")

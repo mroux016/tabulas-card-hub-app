@@ -1790,6 +1790,827 @@ function ReplaceCardImagesModal({ target, skin, onClose, onReplaced }) {
   );
 }
 
+function FlagGradingErrorModal({
+  card,
+  targetType,
+  batchName,
+  diagnostics,
+  initialSide,
+  initialTargetItemId,
+  skin,
+  onClose,
+  onSubmitted,
+}) {
+  const [errorType, setErrorType] = useState(initialTargetItemId ? 'false_positive_artifact' : 'centering_sleeve_rim');
+  const [side, setSide] = useState(initialSide || 'Front');
+  const [targetItemId, setTargetItemId] = useState(initialTargetItemId || '');
+  const [manualCat, setManualCat] = useState('surface');
+  const [manualType, setManualType] = useState('surface_scratch');
+  const [manualSeverity, setManualSeverity] = useState('0.5');
+  const [manualZone, setManualZone] = useState('mid-center');
+  const [targetSubgrade, setTargetSubgrade] = useState('surface');
+  const [correctedScore, setCorrectedScore] = useState('9.5');
+  const [notes, setNotes] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [errMsg, setErrMsg] = useState('');
+
+  const confirmedDefects = Array.isArray(diagnostics?.confirmed_defects) ? diagnostics.confirmed_defects : [];
+  const superficialArtifacts = Array.isArray(diagnostics?.superficial_artifacts) ? diagnostics.superficial_artifacts : [];
+  const ov = diagnostics?.overrides || {};
+  const hasActiveOverrides = Boolean(
+    (ov.dismissed_defect_ids && ov.dismissed_defect_ids.length > 0) ||
+    (ov.manual_defects && ov.manual_defects.length > 0) ||
+    Number(ov.sleeve_inset_pct || 0) > 0 ||
+    Boolean(ov.light_border_mode) ||
+    (ov.subgrade_overrides && Object.keys(ov.subgrade_overrides).length > 0)
+  );
+
+  const submitFlag = (overridePayload = null) => {
+    setSubmitting(true);
+    setErrMsg('');
+    const bodyPayload = overridePayload || {
+      targetType,
+      sku: card?.SKU || '',
+      batchName: batchName || card?._BatchName || '',
+      errorType,
+      side,
+      targetItemId,
+      manualDefect: errorType === 'missed_real_defect' ? {
+        category: manualCat,
+        type: manualType,
+        severity: parseFloat(manualSeverity) || 0.5,
+        zone: manualZone,
+      } : null,
+      targetSubgrade: errorType === 'subgrade_calibration' ? targetSubgrade : '',
+      correctedScore: errorType === 'subgrade_calibration' ? (parseFloat(correctedScore) || 9.5) : null,
+      notes,
+    };
+    fetch(`${NODE_API_BASE}/grading/flag-error`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bodyPayload),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res?.success) {
+          onSubmitted(res);
+          onClose();
+        } else {
+          setErrMsg(res?.error || 'Failed to apply grading feedback.');
+        }
+      })
+      .catch((e) => setErrMsg(e.message || 'Network error submitting grading feedback.'))
+      .finally(() => setSubmitting(false));
+  };
+
+  return (
+    <div
+      onClick={() => { if (!submitting) onClose(); }}
+      className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className={`w-full max-w-xl ${skin.cardBg} border ${skin.border} rounded-2xl shadow-2xl p-5 space-y-4 text-xs`}
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+          <div className="min-w-0">
+            <div className="text-[10.5px] font-mono text-rose-300 uppercase">🚩 Flag Grading Assessment Error</div>
+            <h3 className="text-sm font-extrabold text-white truncate mt-0.5">
+              SKU {card?.SKU} — {card?.Set} #{String(card?.['Card Number'] || card?.Card_Number || '').replace(/^#/, '')} {card?.Player}
+            </h3>
+          </div>
+          <button type="button" onClick={() => !submitting && onClose()} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold">✕</button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="md:col-span-2">
+            <label className="block text-[11px] font-bold text-slate-300 mb-1">Error Category</label>
+            <select value={errorType} onChange={(e) => setErrorType(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+              <option value="centering_sleeve_rim">Centering measured from penny sleeve / holder rim</option>
+              <option value="false_positive_artifact">Hair / dust / glare misclassified as real defect</option>
+              <option value="scanner_streak">Scanner glass / sensor streak misclassified as scratch / print line</option>
+              <option value="false_light_border">False edge / corner whitening on light border</option>
+              <option value="missed_real_defect">Missed real defect (add penalty)</option>
+              <option value="subgrade_calibration">Subgrade calibration mismatch</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-bold text-slate-300 mb-1">Card Side</label>
+            <select value={side} onChange={(e) => setSide(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+              <option value="Front">Front</option>
+              <option value="Back">Back</option>
+              <option value="Both">Both Sides</option>
+            </select>
+          </div>
+
+          {(errorType === 'false_positive_artifact' || errorType === 'false_light_border' || errorType === 'scanner_streak') && (
+            <div>
+              <label className="block text-[11px] font-bold text-slate-300 mb-1">Target Detected Item</label>
+              <select value={targetItemId} onChange={(e) => setTargetItemId(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                <option value="">All matching on {side}</option>
+                {confirmedDefects.map((d) => (
+                  <option key={d.id} value={d.id}>{d.label || d.id} (-{Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)})</option>
+                ))}
+                {superficialArtifacts.map((a) => (
+                  <option key={a.id} value={a.id}>[Ignored] {a.label || a.id}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {errorType === 'missed_real_defect' && (
+            <>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Defect Category</label>
+                <select value={manualCat} onChange={(e) => setManualCat(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                  <option value="surface">Surface</option>
+                  <option value="corners">Corners</option>
+                  <option value="edges">Edges</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Defect Type</label>
+                <select value={manualType} onChange={(e) => setManualType(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                  <option value="surface_scratch">Surface Scratch</option>
+                  <option value="print_line">Print Line</option>
+                  <option value="dimple_dent">Dimple / Dent</option>
+                  <option value="print_spot_fisheye">Print Spot / Fisheye</option>
+                  <option value="corner_whitening">Corner Whitening / Softness</option>
+                  <option value="edge_chipping">Edge Chipping / Wear</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Penalty Severity</label>
+                <select value={manualSeverity} onChange={(e) => setManualSeverity(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                  <option value="0.5">Minor (-0.5)</option>
+                  <option value="1.0">Moderate (-1.0)</option>
+                  <option value="1.5">Major (-1.5)</option>
+                  <option value="2.0">Severe (-2.0)</option>
+                </select>
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Location / Zone</label>
+                <input value={manualZone} onChange={(e) => setManualZone(e.target.value)} placeholder="e.g., Top-Right, mid-center, Left edge" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white" />
+              </div>
+            </>
+          )}
+
+          {errorType === 'subgrade_calibration' && (
+            <>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Subgrade</label>
+                <select value={targetSubgrade} onChange={(e) => setTargetSubgrade(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                  <option value="centering">Centering</option>
+                  <option value="corners">Corners</option>
+                  <option value="edges">Edges</option>
+                  <option value="surface">Surface</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-300 mb-1">Corrected Score</label>
+                <select value={correctedScore} onChange={(e) => setCorrectedScore(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+                  {['10.0','9.5','9.0','8.5','8.0','7.5','7.0','6.5','6.0','5.5','5.0'].map((sc) => (
+                    <option key={sc} value={sc}>{sc}</option>
+                  ))}
+                </select>
+              </div>
+            </>
+          )}
+
+          <div className="md:col-span-2">
+            <label className="block text-[11px] font-bold text-slate-300 mb-1">Inspector Notes (logged for model tuning)</label>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} placeholder="Describe what was misread (e.g. glare streak on top loader, white card border, etc.)..." className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white" />
+          </div>
+        </div>
+
+        {errMsg && (
+          <div className="p-2.5 rounded-xl bg-rose-950/80 border border-rose-600/70 text-rose-200 text-[11px] font-semibold">❌ {errMsg}</div>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800">
+          <div>
+            {hasActiveOverrides && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => submitFlag({
+                  targetType,
+                  sku: card?.SKU || '',
+                  batchName: batchName || card?._BatchName || '',
+                  errorType: 'reset_overrides',
+                  resetOverrides: true,
+                })}
+                className="px-3 py-1.5 rounded-xl bg-amber-950/80 hover:bg-amber-900 border border-amber-600/70 text-amber-200 font-bold"
+              >
+                ♻️ Reset Overrides
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button type="button" disabled={submitting} onClick={onClose} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold">Cancel</button>
+            <button type="button" disabled={submitting} onClick={() => submitFlag(null)} className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold shadow">
+              {submitting ? '⏳ Re-Evaluating...' : '🚩 Submit & Re-Evaluate Grade'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GradingDeepDiveStudio({
+  card,
+  targetType = 'inventory',
+  batchName = '',
+  cardIndex = 0,
+  totalCards = 1,
+  onPrev,
+  onNext,
+  onBack,
+  backLabel = 'Back',
+  onSwitchIndividual,
+  onCardUpdated,
+  skin,
+  pushNotification,
+}) {
+  const [activeSide, setActiveSide] = useState('Front');
+  const [diagnostics, setDiagnostics] = useState(null);
+  const [loadingDiag, setLoadingDiag] = useState(false);
+  const [diagError, setDiagError] = useState('');
+  const [activeLayers, setActiveLayers] = useState({ centering: true, corners: true, edges: true, surface: true });
+  const [showArtifacts, setShowArtifacts] = useState(false);
+  const [selectedItemId, setSelectedItemId] = useState('');
+  const [showFlagModal, setShowFlagModal] = useState(false);
+  const [naturalSize, setNaturalSize] = useState({ w: 1500, h: 2100 });
+  const canvasWrapRef = useRef(null);
+  const [fittedBox, setFittedBox] = useState({ w: 380, h: 532 });
+
+  const sku = String(card?.SKU || '').trim();
+  const effectiveBatch = batchName || card?._BatchName || '';
+
+  const fetchDiagnostics = (forceRecompute = false) => {
+    if (!sku) return;
+    setLoadingDiag(true);
+    setDiagError('');
+    fetch(`${NODE_API_BASE}/grading/inspect-card`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetType, sku, batchName: effectiveBatch, forceRecompute }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res?.success && res.diagnostics) {
+          setDiagnostics(res.diagnostics);
+          if (res.card && onCardUpdated) onCardUpdated(res);
+        } else {
+          setDiagError(res?.error || 'Could not load grading diagnostics.');
+        }
+      })
+      .catch((e) => setDiagError(e.message || 'Failed to inspect card diagnostics.'))
+      .finally(() => setLoadingDiag(false));
+  };
+
+  useEffect(() => {
+    setSelectedItemId('');
+    setDiagnostics(null);
+    fetchDiagnostics(false);
+  }, [sku, targetType, effectiveBatch]);
+
+  useEffect(() => {
+    const srcSizes = diagnostics?.source_images || {};
+    const sideSz = activeSide === 'Back' ? srcSizes.back_size : srcSizes.front_size;
+    if (Array.isArray(sideSz) && sideSz.length === 2 && sideSz[0] > 0 && sideSz[1] > 0) {
+      setNaturalSize({ w: Number(sideSz[0]), h: Number(sideSz[1]) });
+    }
+  }, [diagnostics, activeSide]);
+
+  useEffect(() => {
+    const el = canvasWrapRef.current;
+    if (!el) return;
+    const updateFit = () => {
+      const rect = el.getBoundingClientRect();
+      const availW = Math.max(120, rect.width - 12);
+      const availH = Math.max(180, rect.height - 12);
+      const natW = Math.max(1, naturalSize.w || 1500);
+      const natH = Math.max(1, naturalSize.h || 2100);
+      const ratio = natW / natH;
+      let fw = availW;
+      let fh = fw / ratio;
+      if (fh > availH) {
+        fh = availH;
+        fw = fh * ratio;
+      }
+      setFittedBox({ w: Math.max(100, Math.floor(fw)), h: Math.max(140, Math.floor(fh)) });
+    };
+    updateFit();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateFit);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', updateFit);
+    return () => window.removeEventListener('resize', updateFit);
+  }, [naturalSize.w, naturalSize.h]);
+
+  const sFold = encodeURIComponent(sanitizeFolderName(card?.Set || ''));
+  const frontUrl = card?.Front_File
+    ? (targetType === 'batch'
+        ? `${API_ORIGIN}/static/batches/${encodeURIComponent(effectiveBatch)}/${encodeURIComponent(card.Front_File)}`
+        : `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}`)
+    : '';
+  const backUrl = card?.Back_File
+    ? (targetType === 'batch'
+        ? `${API_ORIGIN}/static/batches/${encodeURIComponent(effectiveBatch)}/${encodeURIComponent(card.Back_File)}`
+        : `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}`)
+    : '';
+  const activeImgUrl = activeSide === 'Back' ? (backUrl || frontUrl) : (frontUrl || backUrl);
+
+  const toggleLayer = (cat) => setActiveLayers((prev) => ({ ...prev, [cat]: !prev[cat] }));
+
+  const psaInfo = diagnostics?.grades?.psa || {
+    overall: card?.Est_PSA || '—',
+    tier: '',
+    subgrades: {
+      centering: card?.Sub_Centering || '—',
+      corners: card?.Sub_Corners || '—',
+      edges: card?.Sub_Edges || '—',
+      surface: card?.Sub_Surface || '—',
+    },
+  };
+  const bgsInfo = diagnostics?.grades?.bgs || {
+    overall: card?.Est_BGS || '—',
+    tier: '',
+    subgrades: {
+      centering: card?.Sub_Centering || '—',
+      corners: card?.Sub_Corners || '—',
+      edges: card?.Sub_Edges || '—',
+      surface: card?.Sub_Surface || '—',
+    },
+  };
+
+  const sideCent = activeSide === 'Back' ? diagnostics?.centering?.back : diagnostics?.centering?.front;
+  const confirmedAll = Array.isArray(diagnostics?.confirmed_defects) ? diagnostics.confirmed_defects : [];
+  const artifactsAll = Array.isArray(diagnostics?.superficial_artifacts) ? diagnostics.superficial_artifacts : [];
+  const sideDefects = confirmedAll.filter((d) => String(d.side || 'Front') === activeSide && activeLayers[String(d.category || 'surface')]);
+  const sideArtifacts = showArtifacts ? artifactsAll.filter((a) => String(a.side || 'Front') === activeSide && Array.isArray(a.bbox_norm)) : [];
+
+  const notesByCat = diagnostics?.notes_by_category || {
+    centering: `${card?.Centering_LR || '—'} L/R | ${card?.Centering_TB || '—'} T/B`,
+    corners: 'Pending deep-dive inspection...',
+    edges: 'Pending deep-dive inspection...',
+    surface: card?.Grading_Notes || 'Pending deep-dive inspection...',
+    advisories: [],
+  };
+
+  // Build 4 corner crop boxes around outer_card_rect (or default [0.04, 0.03, 0.92, 0.94])
+  const oc = Array.isArray(sideCent?.outer_card_rect) ? sideCent.outer_card_rect : [0.04, 0.03, 0.92, 0.94];
+  const cornerLoupes = [
+    { key: 'Top-Left', label: 'TL', x: oc[0], y: oc[1], w: 0.14, h: 0.14 },
+    { key: 'Top-Right', label: 'TR', x: Math.max(0, oc[0] + oc[2] - 0.14), y: oc[1], w: 0.14, h: 0.14 },
+    { key: 'Bot-Left', label: 'BL', x: oc[0], y: Math.max(0, oc[1] + oc[3] - 0.14), w: 0.14, h: 0.14 },
+    { key: 'Bot-Right', label: 'BR', x: Math.max(0, oc[0] + oc[2] - 0.14), y: Math.max(0, oc[1] + oc[3] - 0.14), w: 0.14, h: 0.14 },
+  ];
+
+  const buildCropUrl = (sideLbl, bbox, pad = 0.025, size = 180) => {
+    if (!sku || !Array.isArray(bbox)) return '';
+    const qs = new URLSearchParams({
+      targetType,
+      sku,
+      batchName: effectiveBatch,
+      side: String(sideLbl || 'Front').toLowerCase(),
+      x: String(bbox[0] ?? 0),
+      y: String(bbox[1] ?? 0),
+      w: String(bbox[2] ?? 0.15),
+      h: String(bbox[3] ?? 0.15),
+      pad: String(pad),
+      size: String(size),
+    });
+    return `${NODE_API_BASE}/grading/crop?${qs.toString()}`;
+  };
+
+  const renderSvgMarker = (d, idx) => {
+    if (!Array.isArray(d.bbox_norm)) return null;
+    const [bx, by, bw, bh] = d.bbox_norm;
+    const x = bx * 1000;
+    const y = by * 1000;
+    const w = Math.max(14, bw * 1000);
+    const h = Math.max(14, bh * 1000);
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const isSel = selectedItemId === d.id;
+    const strokeCol = isSel ? '#facc15' : '#ef4444';
+    const sw = isSel ? 5 : 3;
+    const style = d.marker_style || 'circle';
+
+    return (
+      <g
+        key={d.id || idx}
+        onClick={() => setSelectedItemId(isSel ? '' : d.id)}
+        style={{ cursor: 'pointer' }}
+      >
+        {style === 'box' ? (
+          <rect
+            x={x}
+            y={y}
+            width={w}
+            height={h}
+            rx={6}
+            fill={isSel ? 'rgba(250,204,21,0.16)' : 'rgba(239,68,68,0.12)'}
+            stroke={strokeCol}
+            strokeWidth={sw}
+          />
+        ) : style === 'arrow' ? (
+          <g>
+            <circle cx={cx} cy={cy} r={Math.max(18, Math.max(w, h) * 0.65)} fill="rgba(239,68,68,0.14)" stroke={strokeCol} strokeWidth={sw} />
+            <line x1={cx < 500 ? cx + 38 : cx - 38} y1={cy < 500 ? cy + 38 : cy - 38} x2={cx} y2={cy} stroke={strokeCol} strokeWidth={sw + 1} />
+            <circle cx={cx} cy={cy} r={5} fill={strokeCol} />
+          </g>
+        ) : (
+          <circle
+            cx={cx}
+            cy={cy}
+            r={Math.max(20, Math.max(w, h) * 0.65)}
+            fill={isSel ? 'rgba(250,204,21,0.16)' : 'rgba(239,68,68,0.14)'}
+            stroke={strokeCol}
+            strokeWidth={sw}
+          />
+        )}
+        <title>{`${d.label || d.type} (-${Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)})`}</title>
+      </g>
+    );
+  };
+
+  const cnumDisp = String(card?.['Card Number'] || card?.Card_Number || '').replace(/^#/, '');
+  const subDisp = card?.Subset || card?.Subset_Parallel || 'Base';
+
+  const renderGradeSummaryCard = (title, info, accentCls) => {
+    const subs = info?.subgrades || {};
+    const pills = [
+      { key: 'centering', label: 'Centering', val: subs.centering },
+      { key: 'corners', label: 'Corners', val: subs.corners },
+      { key: 'edges', label: 'Edges', val: subs.edges },
+      { key: 'surface', label: 'Surface', val: subs.surface },
+    ];
+    return (
+      <div className="bg-slate-950/90 border border-slate-800 rounded-2xl p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{title}</div>
+            <div className="flex items-baseline gap-2">
+              <span className={`text-2xl font-black font-mono ${accentCls}`}>{info?.overall ?? '—'}</span>
+              {info?.tier && <span className="text-[10.5px] font-semibold text-slate-300">{info.tier}</span>}
+            </div>
+          </div>
+          <span className="text-[9.5px] text-slate-500 font-mono">Click pills to toggle overlays</span>
+        </div>
+        <div className="grid grid-cols-4 gap-1.5">
+          {pills.map((pl) => {
+            const on = Boolean(activeLayers[pl.key]);
+            return (
+              <button
+                key={pl.key}
+                type="button"
+                onClick={() => toggleLayer(pl.key)}
+                title={`Toggle ${pl.label} overlay on card image`}
+                className={`px-1.5 py-1.5 rounded-xl border text-center transition ${
+                  on
+                    ? 'bg-sky-950/90 border-sky-500/80 text-white shadow-sm'
+                    : 'bg-slate-900/70 border-slate-800 text-slate-500 opacity-65 hover:opacity-100'
+                }`}
+              >
+                <div className="text-[9px] uppercase font-bold truncate">{pl.label}</div>
+                <div className="text-xs font-black font-mono">{pl.val ?? '—'}</div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col gap-3 h-[calc(100vh-5.5rem)] min-h-[680px]">
+      {/* TOP BAR */}
+      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0`}>
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          {onBack && (
+            <button type="button" onClick={onBack} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">
+              ⬅ {backLabel}
+            </button>
+          )}
+          {onSwitchIndividual && (
+            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
+              <button type="button" onClick={onSwitchIndividual} className="px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white">🪟 Individual</button>
+              <button type="button" className={`px-2.5 py-1 rounded-lg font-bold ${skin.accentActive}`}>🔬 Deep-Dive</button>
+            </div>
+          )}
+          <div className="min-w-0">
+            <span className="text-xs font-mono text-sky-400 font-bold mr-2">SKU {sku}</span>
+            <span className="text-sm font-extrabold text-white truncate">
+              {card?.Set} #{cnumDisp} {card?.Player} <span className="text-slate-400 font-normal">({subDisp})</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowFlagModal(true)}
+            className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs shadow"
+          >
+            🚩 Flag Error
+          </button>
+          <button
+            type="button"
+            disabled={loadingDiag}
+            onClick={() => fetchDiagnostics(true)}
+            className="px-2.5 py-1.5 rounded-xl bg-cyan-950/90 hover:bg-cyan-800 border border-cyan-600/70 text-cyan-200 font-bold text-xs disabled:opacity-45"
+          >
+            {loadingDiag ? '⏳ Scanning...' : '🔄 Re-Scan'}
+          </button>
+          <div className="flex items-center gap-1.5 text-xs">
+            <button type="button" onClick={onPrev} disabled={cardIndex <= 0} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-35 font-bold">◀ Prev</button>
+            <span className="font-mono text-slate-300 px-1">{cardIndex + 1} / {Math.max(1, totalCards)}</span>
+            <button type="button" onClick={onNext} disabled={cardIndex >= totalCards - 1} className={`px-2.5 py-1.5 rounded-xl disabled:opacity-35 font-bold ${skin.accentBtn}`}>Next ▶</button>
+          </div>
+        </div>
+      </div>
+
+      {/* MAIN SPLIT PANE */}
+      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-3">
+        {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + EXACT ASPECT-LOCKED SVG OVERLAY */}
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0`}>
+          <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setActiveSide('Front')}
+                className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Front' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+              >
+                Front
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSide('Back')}
+                className={`px-3 py-1 rounded-lg font-bold transition ${activeSide === 'Back' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+              >
+                Back
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              {sideCent?.sleeve_detected && (
+                <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 font-semibold">
+                  🛡️ Sleeve Detected
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowArtifacts((s) => !s)}
+                className={`px-2 py-0.5 rounded-lg border font-semibold ${
+                  showArtifacts ? 'bg-amber-950/80 border-amber-500 text-amber-200' : 'bg-slate-900 border-slate-700 text-slate-400'
+                }`}
+              >
+                {showArtifacts ? '👁️ Holder Artifacts On' : `Holder Artifacts (${artifactsAll.length})`}
+              </button>
+              {selectedItemId && (
+                <button type="button" onClick={() => setSelectedItemId('')} className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300">
+                  Clear Focus
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div ref={canvasWrapRef} className="flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative">
+            {!activeImgUrl ? (
+              <div className="text-xs text-slate-500">No {activeSide} scan image available.</div>
+            ) : (
+              <div className="relative shrink-0" style={{ width: `${fittedBox.w}px`, height: `${fittedBox.h}px` }}>
+                <img
+                  src={activeImgUrl}
+                  alt={`${activeSide} card`}
+                  onLoad={(e) => {
+                    const nw = e.currentTarget.naturalWidth;
+                    const nh = e.currentTarget.naturalHeight;
+                    if (nw > 0 && nh > 0) setNaturalSize({ w: nw, h: nh });
+                  }}
+                  className="w-full h-full block select-none rounded-lg"
+                />
+                <svg viewBox="0 0 1000 1000" preserveAspectRatio="none" className="absolute inset-0 w-full h-full">
+                  {/* CENTERING GUIDES */}
+                  {activeLayers.centering && sideCent && Array.isArray(sideCent.outer_card_rect) && Array.isArray(sideCent.inner_frame_rect) && (() => {
+                    const [ox, oy, ow, oh] = sideCent.outer_card_rect.map((v) => v * 1000);
+                    const [ix, iy, iw, ih] = sideCent.inner_frame_rect.map((v) => v * 1000);
+                    return (
+                      <g>
+                        <rect x={ox} y={oy} width={ow} height={oh} fill="none" stroke="#22d3ee" strokeWidth="3" strokeDasharray="10 6" />
+                        <rect x={ix} y={iy} width={iw} height={ih} fill="none" stroke="#38bdf8" strokeWidth="2.5" />
+                        <line x1={ox} y1={oy + oh * 0.5} x2={ix} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="3" />
+                        <line x1={ix + iw} y1={oy + oh * 0.5} x2={ox + ow} y2={oy + oh * 0.5} stroke="#22d3ee" strokeWidth="3" />
+                        <line x1={ox + ow * 0.5} y1={oy} x2={ox + ow * 0.5} y2={iy} stroke="#22d3ee" strokeWidth="3" />
+                        <line x1={ox + ow * 0.5} y1={iy + ih} x2={ox + ow * 0.5} y2={oy + oh} stroke="#22d3ee" strokeWidth="3" />
+                        <rect x={ox + ow * 0.5 - 78} y={Math.max(4, oy + 6)} width="156" height="26" rx="6" fill="rgba(2,6,23,0.85)" stroke="#22d3ee" strokeWidth="1.5" />
+                        <text x={ox + ow * 0.5} y={Math.max(22, oy + 24)} textAnchor="middle" fill="#67e8f9" fontSize="15" fontWeight="bold" fontFamily="monospace">
+                          {`L/R ${sideCent.lr} • T/B ${sideCent.tb}`}
+                        </text>
+                      </g>
+                    );
+                  })()}
+
+                  {/* CONFIRMED DEFECT INDICATORS */}
+                  {sideDefects.map(renderSvgMarker)}
+
+                  {/* SUPERFICIAL HOLDER ARTIFACTS (OPTIONAL AMBER DASHED) */}
+                  {sideArtifacts.map((a, ai) => {
+                    const [ax, ay, aw, ah] = a.bbox_norm.map((v) => v * 1000);
+                    return (
+                      <rect
+                        key={a.id || ai}
+                        x={ax}
+                        y={ay}
+                        width={Math.max(14, aw)}
+                        height={Math.max(14, ah)}
+                        rx={5}
+                        fill="rgba(245,158,11,0.10)"
+                        stroke="#f59e0b"
+                        strokeWidth="2.5"
+                        strokeDasharray="6 4"
+                      >
+                        <title>{a.label || a.type}</title>
+                      </rect>
+                    );
+                  })}
+                </svg>
+              </div>
+            )}
+            {loadingDiag && (
+              <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl bg-slate-950/90 border border-sky-700 text-sky-300 text-xs font-bold">
+                ⏳ Analyzing surface &amp; centering geometry...
+              </div>
+            )}
+            {diagError && (
+              <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl bg-rose-950/90 border border-rose-600 text-rose-200 text-xs font-bold">
+                ❌ {diagError}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* RIGHT PANE: PSA/BGS CARDS + 4-BOX NOTES + 10x LOUPE STRIP */}
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2.5 min-h-0 overflow-y-auto`}>
+          {/* TOP: SIDE-BY-SIDE PSA & BECKETT SUMMARY CARDS WITH CLICKABLE SUBGRADE PILLS */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 shrink-0">
+            {renderGradeSummaryCard('Estimated PSA Grade', psaInfo, 'text-emerald-400')}
+            {renderGradeSummaryCard('Estimated Beckett (BGS) Grade', bgsInfo, 'text-sky-400')}
+          </div>
+
+          {/* MIDDLE: STRUCTURED 4-BOX GRADING NOTES + HOLDER ADVISORIES */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 shrink-0 text-[11px]">
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
+              <div className="font-bold text-cyan-300 uppercase text-[10px] mb-0.5">📐 Centering</div>
+              <div className="text-slate-200">{notesByCat.centering}</div>
+            </div>
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
+              <div className="font-bold text-rose-300 uppercase text-[10px] mb-0.5">Corners</div>
+              <div className="text-slate-200">{notesByCat.corners}</div>
+            </div>
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
+              <div className="font-bold text-amber-300 uppercase text-[10px] mb-0.5">Edges</div>
+              <div className="text-slate-200">{notesByCat.edges}</div>
+            </div>
+            <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5">
+              <div className="font-bold text-purple-300 uppercase text-[10px] mb-0.5">Surface</div>
+              <div className="text-slate-200">{notesByCat.surface}</div>
+            </div>
+          </div>
+
+          {Array.isArray(notesByCat.advisories) && notesByCat.advisories.length > 0 && (
+            <div className="bg-amber-950/40 border border-amber-700/60 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-200 shrink-0">
+              <span>⚠️ {notesByCat.advisories.join(' • ')}</span>
+              <button type="button" onClick={() => setShowArtifacts((s) => !s)} className="px-2 py-0.5 rounded-lg bg-amber-900/70 hover:bg-amber-800 text-[10px] font-bold">
+                {showArtifacts ? 'Hide Artifacts' : 'Show Ignored Artifacts'}
+              </button>
+            </div>
+          )}
+
+          {/* BOTTOM: 10x ZOOM LOUPE STRIP (2x2 CORNER QUAD + DETECTED DEFECT LOUPES) */}
+          <div className="flex-1 min-h-[190px] bg-slate-950/85 border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2">
+            <div className="flex items-center justify-between text-[11px] shrink-0">
+              <span className="font-bold text-white uppercase tracking-wider">🔍 10x Zoom Loupes ({activeSide} Corners &amp; Detected Defects)</span>
+              <span className="text-slate-400">Click any crop to pinpoint on card</span>
+            </div>
+
+            <div className="flex-1 min-h-0 flex flex-col sm:flex-row gap-2.5 overflow-x-auto">
+              {/* 2x2 CORNER LOUPE QUAD */}
+              <div className="grid grid-cols-2 gap-1.5 shrink-0 w-[196px]">
+                {cornerLoupes.map((cl) => {
+                  const cornerDef = confirmedAll.find((d) => d.side === activeSide && d.category === 'corners' && String(d.zone || '').toLowerCase() === cl.key.toLowerCase());
+                  const cropUrl = buildCropUrl(activeSide, [cl.x, cl.y, cl.w, cl.h], 0.015, 160);
+                  return (
+                    <button
+                      key={cl.key}
+                      type="button"
+                      onClick={() => {
+                        setActiveLayers((p) => ({ ...p, corners: true }));
+                        if (cornerDef) setSelectedItemId(cornerDef.id);
+                      }}
+                      className={`relative rounded-xl overflow-hidden border ${cornerDef ? 'border-rose-500' : 'border-slate-700'} bg-slate-900 aspect-square group`}
+                      title={`${activeSide} ${cl.key} Corner`}
+                    >
+                      {cropUrl && <img src={cropUrl} alt={cl.key} className="w-full h-full object-cover" />}
+                      {cornerDef && (
+                        <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
+                          <circle cx="50" cy="50" r="34" fill="none" stroke="#ef4444" strokeWidth="4" />
+                        </svg>
+                      )}
+                      <span className="absolute bottom-0.5 left-0.5 px-1 py-0.2 rounded bg-slate-950/85 text-[9px] font-mono font-bold text-slate-200">{cl.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* DETECTED DEFECT 10x LOUPES */}
+              <div className="flex-1 min-w-0 flex items-stretch gap-2 overflow-x-auto pb-1">
+                {confirmedAll.length === 0 ? (
+                  <div className="flex-1 flex items-center justify-center rounded-xl border border-dashed border-slate-800 text-xs text-slate-400 px-4">
+                    ✨ No permanent defects detected on Front or Back.
+                  </div>
+                ) : (
+                  confirmedAll.map((d, di) => {
+                    const cropUrl = buildCropUrl(d.side || 'Front', d.bbox_norm || [0.35, 0.35, 0.2, 0.2], 0.04, 180);
+                    const isSel = selectedItemId === d.id;
+                    return (
+                      <button
+                        key={d.id || di}
+                        type="button"
+                        onClick={() => {
+                          setActiveSide(d.side === 'Back' ? 'Back' : 'Front');
+                          setActiveLayers((p) => ({ ...p, [d.category || 'surface']: true }));
+                          setSelectedItemId(d.id);
+                        }}
+                        className={`w-[132px] shrink-0 rounded-xl border ${isSel ? 'border-amber-400 ring-2 ring-amber-400/50' : 'border-rose-600/70'} bg-slate-900 overflow-hidden flex flex-col text-left`}
+                      >
+                        <div className="relative w-full h-[104px] bg-slate-950">
+                          {cropUrl && <img src={cropUrl} alt={d.label || d.type} className="w-full h-full object-cover" />}
+                          <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
+                            {d.marker_style === 'box' ? (
+                              <rect x="22" y="22" width="56" height="56" rx="6" fill="none" stroke="#ef4444" strokeWidth="4" />
+                            ) : d.marker_style === 'arrow' ? (
+                              <g>
+                                <circle cx="50" cy="50" r="24" fill="none" stroke="#ef4444" strokeWidth="4" />
+                                <line x1="80" y1="80" x2="52" y2="52" stroke="#ef4444" strokeWidth="4" />
+                              </g>
+                            ) : (
+                              <circle cx="50" cy="50" r="28" fill="none" stroke="#ef4444" strokeWidth="4" />
+                            )}
+                          </svg>
+                          <span className="absolute top-1 left-1 px-1.5 py-0.5 rounded bg-slate-950/85 text-[9px] font-bold text-rose-200">{d.side}</span>
+                          <span className="absolute top-1 right-1 px-1.5 py-0.5 rounded bg-rose-950/90 text-[9px] font-mono font-bold text-rose-200">-{Number(d.penalty ?? d.severity ?? 0.5).toFixed(1)}</span>
+                        </div>
+                        <div className="p-1.5 text-[10px] font-semibold text-slate-200 truncate" title={d.label || d.type}>
+                          {d.label || d.type}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {showFlagModal && (
+        <FlagGradingErrorModal
+          card={card}
+          targetType={targetType}
+          batchName={effectiveBatch}
+          diagnostics={diagnostics}
+          initialSide={activeSide}
+          initialTargetItemId={selectedItemId}
+          skin={skin}
+          onClose={() => setShowFlagModal(false)}
+          onSubmitted={(res) => {
+            if (res.diagnostics) setDiagnostics(res.diagnostics);
+            if (onCardUpdated) onCardUpdated(res);
+            const gb = res.gradesBefore || {};
+            const ga = res.gradesAfter || {};
+            if (pushNotification) {
+              pushNotification(
+                res.resetOverrides ? `Overrides Reset — SKU ${sku}` : `Grade Re-Evaluated — SKU ${sku}`,
+                `PSA ${gb.Est_PSA || '?'} → ${ga.Est_PSA || '?'} | BGS ${gb.Est_BGS || '?'} → ${ga.Est_BGS || '?'}`,
+                'Grading',
+                'success'
+              );
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [skinKey, setSkinKey] = useState(() => resolveChromePulseSkinKey(localStorage.getItem('tabulas_skin')));
   const skin = CHROME_PULSE_SKINS[skinKey] || CHROME_PULSE_SKINS.screenshot_signature_3d;
@@ -2138,6 +2959,7 @@ export default function App() {
   const [availabilityExpanded, setAvailabilityExpanded] = useState(false);
   const [gradeRecSetFilter, setGradeRecSetFilter] = useState('All Sets');
   const [inspectorIdx, setInspectorIdx] = useState(0);
+  const [inspectorMode, setInspectorMode] = useState('deep_dive');
   const [recalculatingStrategy, setRecalculatingStrategy] = useState(false);
 
   const [lotCatF, setLotCatF] = useState('All Categories');
@@ -5500,41 +6322,28 @@ export default function App() {
                       No cards match the selected Deep-Dive filter. Switch scope above to inspect other cards in this batch.
                     </div>
                   ) : (
-                    <>
-                      <GuidedReviewCardItem
-                        key={`dd-${ddCardBatch}-${ddCard.SKU}`}
-                        card={ddCard}
-                        draft={batchDraftEdits[ddCard.SKU] || ddCard}
-                        isDirty={!!batchDraftEdits[ddCard.SKU]}
-                        batchName={ddCardBatch}
-                        skin={skin}
-                        dynamicSets={dynamicSetsNewestFirst}
-                        imageHeightClass="h-72"
-                        isDeepDive={true}
-                        externalImgBust={batchImgBust}
-                        isReprocessingExternal={Boolean(reprocessingBatchSkus[ddCard.SKU])}
-                        onDraftChange={(nextCard) => setBatchDraftEdits((p) => ({ ...p, [ddCard.SKU]: nextCard }))}
-                        onRotateSide={handleDdRotate}
-                        onReprocessOne={handleDdReprocess}
-                        onDeleteOne={handleDdDelete}
-                        onReplaceImages={(cObj) => setReplaceImgTarget({
-                          type: 'batch',
-                          batchName: cObj._BatchName || ddCardBatch,
-                          sku: cObj.SKU,
-                          set: cObj.Set,
-                          subset: cObj.Subset_Parallel,
-                          cardNumber: cObj.Card_Number,
-                          player: cObj.Player,
-                        })}
-                        onSaveOne={handleDdSaveAdvance}
-                      />
-                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 grid grid-cols-2 md:grid-cols-6 gap-2.5 text-xs`}>
-                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Centering L/R | T/B</div><div className="font-mono font-bold text-sky-300">{ddCard.Centering_LR || '—'} | {ddCard.Centering_TB || '—'}</div></div>
-                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Subgrades (C/Co/E/S)</div><div className="font-mono font-bold text-white">{ddCard.Sub_Centering || '—'} / {ddCard.Sub_Corners || '—'} / {ddCard.Sub_Edges || '—'} / {ddCard.Sub_Surface || '—'}</div></div>
-                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5"><div className="text-[10px] text-slate-400">Est. PSA / BGS</div><div className="font-mono font-bold text-emerald-300">PSA {ddCard.Est_PSA || '—'} / BGS {ddCard.Est_BGS || '—'}</div></div>
-                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-2.5 md:col-span-3"><div className="text-[10px] text-slate-400">10x Loupe Pre-Grade Notes</div><div className="text-slate-200 leading-snug">{renderGradingNotesWithBadges(ddCard.Grading_Notes)}</div></div>
-                      </div>
-                    </>
+                    <GradingDeepDiveStudio
+                      key={`batch-gdd-${ddCardBatch}-${ddCard.SKU}`}
+                      card={ddCard}
+                      targetType="batch"
+                      batchName={ddCardBatch}
+                      cardIndex={safeDdIdx}
+                      totalCards={ddSearched.length}
+                      onPrev={() => setDeepDiveIdx((i) => Math.max(0, i - 1))}
+                      onNext={() => setDeepDiveIdx((i) => Math.min(Math.max(0, ddSearched.length - 1), i + 1))}
+                      onBack={() => setActivePage('guided_batch_review')}
+                      backLabel="Guided Review"
+                      onSwitchIndividual={() => setActivePage('guided_batch_review')}
+                      onCardUpdated={(res) => {
+                        if (Array.isArray(res?.cards)) {
+                          setBatches((prev) => prev.map((b) => (b.batchName === ddCardBatch ? { ...b, cards: res.cards.map((x) => ({ ...x, _BatchName: ddCardBatch })) } : b)));
+                        } else if (res?.card) {
+                          setBatches((prev) => prev.map((b) => (b.batchName === ddCardBatch ? { ...b, cards: (b.cards || []).map((x) => (x.SKU === res.card.SKU ? { ...x, ...res.card, _BatchName: ddCardBatch } : x)) } : b)));
+                        }
+                      }}
+                      skin={skin}
+                      pushNotification={pushNotification}
+                    />
                   )}
                 </div>
               );
@@ -6260,29 +7069,26 @@ export default function App() {
                     !ddEdCard ? (
                       <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 text-center text-xs text-slate-400`}>No cards match the filter.</div>
                     ) : (
-                      <InventoryGuidedCardItem
-                        key={`inv-dd-${ddEdCard.SKU}`}
+                      <GradingDeepDiveStudio
+                        key={`inv-gdd-${ddEdCard.SKU}`}
                         card={ddEdCard}
-                        draft={invEditorDrafts[ddEdCard.SKU] || ddEdCard}
+                        targetType="inventory"
+                        cardIndex={safeDdEdIdx}
+                        totalCards={searchedEdCards.length}
+                        onPrev={() => setInvEditorIdx((i) => Math.max(0, i - 1))}
+                        onNext={() => setInvEditorIdx((i) => Math.min(Math.max(0, searchedEdCards.length - 1), i + 1))}
+                        onBack={() => setActivePage('inventory')}
+                        backLabel="Inventory"
+                        onSwitchIndividual={() => setInvEditorMode('individual')}
+                        onCardUpdated={(res) => {
+                          if (Array.isArray(res?.rows)) {
+                            setInventory(res.rows);
+                          } else if (res?.card) {
+                            setInventory((prev) => prev.map((row) => (row.SKU === res.card.SKU ? { ...row, ...res.card } : row)));
+                          }
+                        }}
                         skin={skin}
-                        dynamicSets={dynamicSetsNewestFirst}
-                        externalImgBust={invEditorImgBust}
-                        isReprocessingExternal={Boolean(reprocessingInvSkus[ddEdCard.SKU])}
-                        imageHeightClass="h-72"
-                        isDeepDive={true}
-                        onDraftChange={(nextCard) => setInvEditorDrafts((p) => ({ ...p, [ddEdCard.SKU]: nextCard }))}
-                        onSaveOne={(upd) => saveSingleInvCard(upd, true)}
-                        onRotateSide={(sName, fName) => rotateInventoryCardImage(sName, fName)}
-                        onReprocessOne={(skuVal, sName) => triggerInventoryReprocess([skuVal], sName)}
-                        onReplaceImages={(cObj) => setReplaceImgTarget({
-                          type: 'inventory',
-                          sku: cObj.SKU,
-                          set: cObj.Set,
-                          subset: cObj.Subset,
-                          cardNumber: cObj['Card Number'],
-                          player: cObj.Player,
-                        })}
-                        onAutoAssignPrice={(rowObj) => computeRecommendedPriceForRow(rowObj)}
+                        pushNotification={pushNotification}
                       />
                     )
                   ) : (
@@ -8049,12 +8855,44 @@ export default function App() {
                   const safeIdx = Math.max(0, Math.min(inspectorIdx, gradingCandidates.length - 1));
                   const card = gradingCandidates[safeIdx];
                   const sFold = encodeURIComponent(sanitizeFolderName(card.Set));
+                  if (inspectorMode === 'deep_dive') {
+                    return (
+                      <GradingDeepDiveStudio
+                        key={`grad-gdd-${card.SKU}`}
+                        card={card}
+                        targetType="inventory"
+                        cardIndex={safeIdx}
+                        totalCards={gradingCandidates.length}
+                        onPrev={() => setInspectorIdx((i) => Math.max(0, i - 1))}
+                        onNext={() => setInspectorIdx((i) => Math.min(gradingCandidates.length - 1, i + 1))}
+                        onBack={() => setActivePage('grading_engine')}
+                        backLabel="Grading Hub"
+                        onSwitchIndividual={() => setInspectorMode('individual')}
+                        onCardUpdated={(res) => {
+                          if (Array.isArray(res?.rows)) {
+                            setInventory(res.rows);
+                          } else if (res?.card) {
+                            setInventory((prev) => prev.map((row) => (row.SKU === res.card.SKU ? { ...row, ...res.card } : row)));
+                          }
+                        }}
+                        skin={skin}
+                        pushNotification={pushNotification}
+                      />
+                    );
+                  }
                   return (
                     <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-5 space-y-4`}>
                       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
-                        <div>
-                          <div className="text-[11px] font-mono text-sky-400 uppercase">🔬 Grading Candidate Inspector — Card {safeIdx + 1} of {gradingCandidates.length}</div>
-                          <h2 className="text-lg font-bold text-white">SKU {card.SKU} — {card.Set} #{card['Card Number']} {card.Player} ({card.Subset})</h2>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button type="button" onClick={() => setActivePage('grading_engine')} className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold">⬅ Grading Hub</button>
+                          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl p-0.5 text-xs">
+                            <button type="button" className={`px-2.5 py-1 rounded-lg font-bold ${skin.accentActive}`}>🪟 Individual</button>
+                            <button type="button" onClick={() => setInspectorMode('deep_dive')} className="px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white">🔬 Deep-Dive</button>
+                          </div>
+                          <div>
+                            <div className="text-[11px] font-mono text-sky-400 uppercase">🔬 Grading Candidate Inspector — Card {safeIdx + 1} of {gradingCandidates.length}</div>
+                            <h2 className="text-lg font-bold text-white">SKU {card.SKU} — {card.Set} #{card['Card Number']} {card.Player} ({card.Subset})</h2>
+                          </div>
                         </div>
                         <div className="flex items-center gap-2">
                           <button onClick={() => setInspectorIdx((i) => Math.max(0, i - 1))} disabled={safeIdx === 0} className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-xs font-bold">◀ Previous Card</button>

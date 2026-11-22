@@ -31,6 +31,31 @@ _MARGIN_MIN_PX = 8
 _MARGIN_PAD_PX = 28
 
 
+_DEFECT_LABEL_MAP = {
+    "surface_scratch": "surface scratch",
+    "print_line": "print line",
+    "dimple_dent": "dimple/dent",
+    "print_spot_fisheye": "print spot/fisheye",
+    "corner_whitening": "corner whitening",
+    "edge_chipping": "edge chipping",
+    "specular_glare": "specular glare",
+    "loose_dust_speck": "loose dust speck",
+    "hair_fiber": "hair/fiber",
+    "sleeve_scratch_or_static_streak": "sleeve scratch/streak",
+    "sleeve_smudge": "sleeve smudge/haze",
+    "scanner_streak": "scanner glass/sensor streak",
+}
+
+_MARKER_STYLE_MAP = {
+    "surface_scratch": "box",
+    "print_line": "box",
+    "print_spot_fisheye": "circle",
+    "dimple_dent": "circle",
+    "corner_whitening": "circle",
+    "edge_chipping": "arrow",
+}
+
+
 def _round_half_grade(val: float, lo: float = 5.0, hi: float = 10.0) -> float:
     clamped = float(np.clip(val, lo, hi))
     return round(round(clamped * 2.0) / 2.0, 1)
@@ -42,11 +67,44 @@ def _zone_label(cx: float, cy: float, cw: int, ch: int) -> str:
     return f"{v}-{h}"
 
 
+def _roi_bbox_to_norm(
+    bbox_roi: tuple[int, int, int, int],
+    roi_origin: tuple[int, int],
+    img_size: tuple[int, int],
+) -> list[float]:
+    """Converts ROI-local `(x, y, w, h)` to full-image normalized `[x, y, w, h]` in `[0.0, 1.0]`."""
+    iw = max(1.0, float(img_size[0]))
+    ih = max(1.0, float(img_size[1]))
+    ox, oy = roi_origin
+    bx, by, bw, bh = bbox_roi
+    nx1 = float(np.clip((ox + bx) / iw, 0.0, 0.998))
+    ny1 = float(np.clip((oy + by) / ih, 0.0, 0.998))
+    nx2 = float(np.clip((ox + bx + max(1, bw)) / iw, nx1 + 0.002, 1.0))
+    ny2 = float(np.clip((oy + by + max(1, bh)) / ih, ny1 + 0.002, 1.0))
+    return [round(nx1, 4), round(ny1, 4), round(nx2 - nx1, 4), round(ny2 - ny1, 4)]
+
+
+def _stable_defect_id(side_label: str, dtype: str, bbox_norm: list[float], used_ids: set[str]) -> str:
+    """Deterministic ID from side + type + quantized center so overrides survive re-runs."""
+    cx = bbox_norm[0] + bbox_norm[2] * 0.5
+    cy = bbox_norm[1] + bbox_norm[3] * 0.5
+    base = f"{side_label.lower()}-{dtype}-{int(round(cx * 50)):02d}-{int(round(cy * 50)):02d}"
+    if base not in used_ids:
+        used_ids.add(base)
+        return base
+    idx = 2
+    while f"{base}-{idx}" in used_ids:
+        idx += 1
+    cand = f"{base}-{idx}"
+    used_ids.add(cand)
+    return cand
+
+
 def _extract_roi_with_margin(
     img: Image.Image,
     card_box: tuple[int, int, int, int],
     pad_px: int = _MARGIN_PAD_PX,
-) -> tuple[np.ndarray, tuple[int, int, int, int], dict[str, bool]]:
+) -> tuple[np.ndarray, tuple[int, int, int, int], dict[str, bool], tuple[int, int]]:
     w, h = img.size
     x1, y1, x2, y2 = [int(v) for v in card_box]
     x1 = max(0, min(w - 20, x1))
@@ -69,7 +127,7 @@ def _extract_roi_with_margin(
 
     roi_rgb = np.array(img.crop((rx1, ry1, rx2, ry2)).convert("RGB"))
     local_box = (x1 - rx1, y1 - ry1, x2 - rx1, y2 - ry1)
-    return roi_rgb, local_box, margin_avail
+    return roi_rgb, local_box, margin_avail, (rx1, ry1)
 
 
 def _detect_specular_glare_mask(
@@ -188,6 +246,188 @@ def _check_line_crosses_margin(
     return _probe_side(1.0) or _probe_side(-1.0)
 
 
+def _detect_scanner_streaks(
+    roi_rgb: np.ndarray,
+    local_box: tuple[int, int, int, int],
+    margin_avail: dict[str, bool],
+    side_label: str,
+) -> tuple[list[tuple[dict, tuple[int, int, int, int]]], np.ndarray]:
+    """
+    Detects duplex ADF / CIS scanner glass & sensor streaks:
+      - Strictly vertical or horizontal (zero lateral wobble < 0.8 px, 1-4 px wide)
+      - Continuous edge-to-edge (>= 92% of full ROI) OR crosses past `card_box` into `margin_ring`
+      - Uniform intensity offset or single-channel RGB/CIS color cast independent of artwork.
+    Returns `(list_of_(artifact_dict, roi_bbox), boolean_mask_to_suppress)`.
+    """
+    h, w = roi_rgb.shape[:2]
+    cx1, cy1, cx2, cy2 = local_box
+    cw = max(40, cx2 - cx1)
+    ch = max(40, cy2 - cy1)
+    streak_mask = np.zeros((h, w), dtype=bool)
+    found: list[tuple[dict, tuple[int, int, int, int]]] = []
+
+    if h < 40 or w < 40:
+        return found, streak_mask
+
+    f_rgb = roi_rgb.astype(np.float32)
+
+    # Helper to scan 1 axis: vertical streaks (axis='v') or horizontal streaks (axis='h')
+    def _scan_axis(axis: str):
+        if axis == "v":
+            if w < 16:
+                return
+            ref = 0.5 * (f_rgb[:, :-8, :] + f_rgb[:, 8:, :])
+            diff = np.abs(f_rgb[:, 4:-4, :] - ref)
+            max_ch = np.max(diff, axis=2)
+            # 1D fraction along full ROI height & inside card height
+            hit_full = (max_ch > 15.0)
+            col_frac_full = np.mean(hit_full, axis=0)
+            col_frac_card = np.mean(hit_full[cy1:cy2, :], axis=0)
+            # Single-channel color cast (CIS RGB offset)
+            med_ch_diff = np.median(diff, axis=0)  # (W-8, 3)
+            cast_strength = np.max(med_ch_diff, axis=1) - np.min(med_ch_diff, axis=1)
+
+            cand_idx = np.where((col_frac_card >= 0.72) & ((col_frac_full >= 0.90) | (np.mean(hit_full, axis=0) >= 0.72)))[0]
+            if cand_idx.size == 0:
+                return
+            # Group contiguous columns (within 1 px)
+            groups: list[list[int]] = []
+            for idx in cand_idx.tolist():
+                if not groups or idx - groups[-1][-1] > 1:
+                    groups.append([idx])
+                else:
+                    groups[-1].append(idx)
+
+            for grp in groups:
+                width_px = len(grp)
+                if width_px < 1 or width_px > 5:
+                    continue
+                x0 = grp[0] + 4
+                x1 = grp[-1] + 4
+                # Check straightness / wobble: peak column inside [x0-1 .. x1+1] across 8 vertical slices
+                band_l = max(0, x0 - 1)
+                band_r = min(w, x1 + 2)
+                slice_peaks = []
+                for s_i in range(8):
+                    sy0 = int(s_i * h / 8)
+                    sy1 = int((s_i + 1) * h / 8)
+                    if sy1 <= sy0:
+                        continue
+                    prof = np.mean(np.abs(f_rgb[sy0:sy1, band_l:band_r, :] - np.median(f_rgb[sy0:sy1, max(0, x0 - 4):min(w, x1 + 5), :], axis=1, keepdims=True)), axis=(0, 2))
+                    if prof.size > 0:
+                        slice_peaks.append(band_l + float(np.argmax(prof)))
+                wobble = float(np.std(slice_peaks)) if len(slice_peaks) >= 4 else 0.0
+                if wobble >= 0.8:
+                    continue
+
+                # Check margin continuity OR >= 92% edge-to-edge continuity
+                full_span_frac = float(np.max(col_frac_full[grp]))
+                crosses_margin = False
+                if margin_avail.get("top") and cy1 >= 4:
+                    m_top = hit_full[:cy1, [g for g in grp]]
+                    if m_top.size > 0 and float(np.mean(np.max(m_top, axis=1))) >= 0.50:
+                        crosses_margin = True
+                if margin_avail.get("bottom") and cy2 <= h - 4:
+                    m_bot = hit_full[cy2:, [g for g in grp]]
+                    if m_bot.size > 0 and float(np.mean(np.max(m_bot, axis=1))) >= 0.50:
+                        crosses_margin = True
+
+                if not (crosses_margin or full_span_frac >= 0.92):
+                    continue
+
+                max_cast = float(np.max(cast_strength[grp]))
+                conf = round(min(0.97, 0.86 + (0.05 if crosses_margin else 0.0) + (0.04 if max_cast >= 12.0 else 0.0)), 3)
+                pad_l = max(0, x0 - 3)
+                pad_r = min(w, x1 + 4)
+                streak_mask[:, pad_l:pad_r] = True
+                z_lbl = _zone_label((x0 + x1) * 0.5 - cx1, ch * 0.5, cw, ch)
+                found.append(({
+                    "type": "scanner_streak",
+                    "is_true_defect": False,
+                    "confidence": conf,
+                    "side": side_label,
+                    "zone": z_lbl,
+                    "severity": 0.0,
+                    "detail": "Scanner glass/sensor streak — clean scanner glass & rescan",
+                }, (int(x0), 0, max(2, int(x1 - x0 + 1)), int(h))))
+        else:
+            if h < 16:
+                return
+            ref = 0.5 * (f_rgb[:-8, :, :] + f_rgb[8:, :, :])
+            diff = np.abs(f_rgb[4:-4, :, :] - ref)
+            max_ch = np.max(diff, axis=2)
+            hit_full = (max_ch > 15.0)
+            row_frac_full = np.mean(hit_full, axis=1)
+            row_frac_card = np.mean(hit_full[:, cx1:cx2], axis=1)
+            med_ch_diff = np.median(diff, axis=1)
+            cast_strength = np.max(med_ch_diff, axis=1) - np.min(med_ch_diff, axis=1)
+
+            cand_idx = np.where((row_frac_card >= 0.72) & ((row_frac_full >= 0.90) | (np.mean(hit_full, axis=1) >= 0.72)))[0]
+            if cand_idx.size == 0:
+                return
+            groups = []
+            for idx in cand_idx.tolist():
+                if not groups or idx - groups[-1][-1] > 1:
+                    groups.append([idx])
+                else:
+                    groups[-1].append(idx)
+
+            for grp in groups:
+                height_px = len(grp)
+                if height_px < 1 or height_px > 5:
+                    continue
+                y0 = grp[0] + 4
+                y1 = grp[-1] + 4
+                band_t = max(0, y0 - 1)
+                band_b = min(h, y1 + 2)
+                slice_peaks = []
+                for s_i in range(8):
+                    sx0 = int(s_i * w / 8)
+                    sx1 = int((s_i + 1) * w / 8)
+                    if sx1 <= sx0:
+                        continue
+                    prof = np.mean(np.abs(f_rgb[band_t:band_b, sx0:sx1, :] - np.median(f_rgb[max(0, y0 - 4):min(h, y1 + 5), sx0:sx1, :], axis=0, keepdims=True)), axis=(1, 2))
+                    if prof.size > 0:
+                        slice_peaks.append(band_t + float(np.argmax(prof)))
+                wobble = float(np.std(slice_peaks)) if len(slice_peaks) >= 4 else 0.0
+                if wobble >= 0.8:
+                    continue
+
+                full_span_frac = float(np.max(row_frac_full[grp]))
+                crosses_margin = False
+                if margin_avail.get("left") and cx1 >= 4:
+                    m_left = hit_full[[g for g in grp], :cx1]
+                    if m_left.size > 0 and float(np.mean(np.max(m_left, axis=0))) >= 0.50:
+                        crosses_margin = True
+                if margin_avail.get("right") and cx2 <= w - 4:
+                    m_right = hit_full[[g for g in grp], cx2:]
+                    if m_right.size > 0 and float(np.mean(np.max(m_right, axis=0))) >= 0.50:
+                        crosses_margin = True
+
+                if not (crosses_margin or full_span_frac >= 0.92):
+                    continue
+
+                max_cast = float(np.max(cast_strength[grp]))
+                conf = round(min(0.97, 0.86 + (0.05 if crosses_margin else 0.0) + (0.04 if max_cast >= 12.0 else 0.0)), 3)
+                pad_t = max(0, y0 - 3)
+                pad_b = min(h, y1 + 4)
+                streak_mask[pad_t:pad_b, :] = True
+                z_lbl = _zone_label(cw * 0.5, (y0 + y1) * 0.5 - cy1, cw, ch)
+                found.append(({
+                    "type": "scanner_streak",
+                    "is_true_defect": False,
+                    "confidence": conf,
+                    "side": side_label,
+                    "zone": z_lbl,
+                    "severity": 0.0,
+                    "detail": "Scanner glass/sensor streak — clean scanner glass & rescan",
+                }, (0, int(y0), int(w), max(2, int(y1 - y0 + 1)))))
+
+    _scan_axis("v")
+    _scan_axis("h")
+    return found, streak_mask
+
+
 def _inspect_single_side(
     img: Image.Image,
     card_box: tuple[int, int, int, int],
@@ -195,8 +435,14 @@ def _inspect_single_side(
     patch_tokens: Optional[np.ndarray] = None,
     enable_onnx_anomaly: bool = True,
     force_cpu: bool = False,
+    overrides: Optional[dict] = None,
 ) -> dict:
-    roi_rgb, local_box, margin_avail = _extract_roi_with_margin(img, card_box)
+    ov = overrides if isinstance(overrides, dict) else {}
+    light_border_mode = bool(ov.get("light_border_mode", False))
+    dismissed_ids = {str(x).strip() for x in (ov.get("dismissed_defect_ids") or []) if str(x).strip()}
+    img_size = img.size
+
+    roi_rgb, local_box, margin_avail, roi_origin = _extract_roi_with_margin(img, card_box)
     fb = opencl_defect_filter_bank(roi_rgb, force_cpu=force_cpu)
     lab = fb["lab"]
     hsv = fb["hsv"]
@@ -213,6 +459,7 @@ def _inspect_single_side(
 
     glare_mask, glare_pct = _detect_specular_glare_mask(lab, hsv, lap_abs, local_box)
     margin_dust_density = _estimate_margin_dust_density(tophat, blackhat, local_box, margin_avail)
+    scanner_streaks, streak_mask = _detect_scanner_streaks(roi_rgb, local_box, margin_avail, side_label)
 
     # Optional DINOv2 patch-token spatial anomaly map (reuses Track 2A tokens when provided)
     anom_map = None
@@ -240,9 +487,39 @@ def _inspect_single_side(
 
     confirmed: list[dict] = []
     artifacts: list[dict] = []
+    used_ids: set[str] = set()
+
+    def _attach_meta(item: dict, bbox_roi: tuple[int, int, int, int]) -> dict:
+        b_norm = _roi_bbox_to_norm(bbox_roi, roi_origin, img_size)
+        dtype = str(item.get("type") or "defect")
+        is_true = bool(item.get("is_true_defect"))
+        item["bbox"] = tuple(int(v) for v in bbox_roi)
+        item["bbox_norm"] = b_norm
+        item["id"] = _stable_defect_id(side_label, dtype, b_norm, used_ids)
+        if is_true:
+            tgt = str(item.get("target") or "surface").lower()
+            item["category"] = tgt
+            item["penalty"] = round(float(item.get("severity", 0.5)), 2)
+            item["marker_style"] = _MARKER_STYLE_MAP.get(dtype, "circle")
+            pretty = _DEFECT_LABEL_MAP.get(dtype, dtype.replace("_", " "))
+            item["label"] = f"{side_label} {pretty} ({item.get('zone', 'surface')})"
+        else:
+            pretty = _DEFECT_LABEL_MAP.get(dtype, dtype.replace("_", " "))
+            item["label"] = f"{side_label} {pretty} (ignored)"
+        return item
 
     if glare_pct >= 3.5:
-        artifacts.append({
+        gl_in = glare_mask[cy1:cy2, cx1:cx2]
+        ys_g, xs_g = np.where(gl_in)
+        if xs_g.size > 0 and ys_g.size > 0:
+            gx1 = int(cx1 + np.min(xs_g))
+            gy1 = int(cy1 + np.min(ys_g))
+            gw_g = max(8, int(np.max(xs_g) - np.min(xs_g) + 1))
+            gh_g = max(8, int(np.max(ys_g) - np.min(ys_g) + 1))
+            glare_bbox = (gx1, gy1, gw_g, gh_g)
+        else:
+            glare_bbox = (cx1, cy1, cw, ch)
+        artifacts.append(_attach_meta({
             "type": "specular_glare",
             "is_true_defect": False,
             "confidence": round(min(0.98, 0.65 + glare_pct / 40.0), 3),
@@ -250,7 +527,10 @@ def _inspect_single_side(
             "zone": "surface",
             "severity": 0.0,
             "detail": f"{glare_pct:.0f}% glare",
-        })
+        }, glare_bbox))
+
+    for st_item, st_bbox in scanner_streaks:
+        artifacts.append(_attach_meta(st_item, st_bbox))
 
     # Interior region inset from card border to avoid printed border edge lines
     inset = max(6, int(min(cw, ch) * 0.02))
@@ -259,7 +539,7 @@ def _inspect_single_side(
 
     surf_resp = np.maximum(tophat, blackhat)
     int_resp = surf_resp[iy1:iy2, ix1:ix2].copy()
-    int_glare = glare_mask[iy1:iy2, ix1:ix2]
+    int_glare = glare_mask[iy1:iy2, ix1:ix2] | streak_mask[iy1:iy2, ix1:ix2]
     int_resp[int_glare] = 0
 
     thr_surf = max(32, int(np.percentile(int_resp, 99.3)))
@@ -298,30 +578,28 @@ def _inspect_single_side(
             fill_ratio = area / max(1.0, float(bw * bh))
 
             if tortuosity > 1.18 or (minor / max(1.0, major) > 0.24 and fill_ratio < 0.35):
-                artifacts.append({
+                artifacts.append(_attach_meta({
                     "type": "hair_fiber",
                     "is_true_defect": False,
                     "confidence": 0.82,
                     "side": side_label,
                     "zone": z_lbl,
                     "severity": 0.0,
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
                 continue
 
             crosses_margin = _check_line_crosses_margin(
                 surf_resp, cnt, local_box, margin_avail, (ix1, iy1)
             )
             if crosses_margin:
-                artifacts.append({
+                artifacts.append(_attach_meta({
                     "type": "sleeve_scratch_or_static_streak",
                     "is_true_defect": False,
                     "confidence": 0.86,
                     "side": side_label,
                     "zone": z_lbl,
                     "severity": 0.0,
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
                 continue
 
             # Check axis alignment for factory print lines (horizontal or vertical)
@@ -333,7 +611,7 @@ def _inspect_single_side(
             )
             if is_axis_aligned and is_long_span and minor <= 8.5:
                 conf = min(0.96, 0.78 + _anom_boost(cx_c, cy_c))
-                confirmed.append({
+                confirmed.append(_attach_meta({
                     "type": "print_line",
                     "is_true_defect": True,
                     "confidence": round(conf, 3),
@@ -341,12 +619,11 @@ def _inspect_single_side(
                     "zone": z_lbl,
                     "severity": 0.5,
                     "target": "surface",
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
             elif minor <= 9.0 and major >= 22.0:
                 conf = min(0.95, 0.72 + min(0.18, major / 250.0) + _anom_boost(cx_c, cy_c))
                 sev = 1.0 if major >= 75.0 else 0.5
-                confirmed.append({
+                confirmed.append(_attach_meta({
                     "type": "surface_scratch",
                     "is_true_defect": True,
                     "confidence": round(conf, 3),
@@ -354,8 +631,7 @@ def _inspect_single_side(
                     "zone": z_lbl,
                     "severity": sev,
                     "target": "surface",
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
             continue
 
         # B. Compact blobs: Fisheye Print Spot vs. Loose Dust Speck
@@ -381,7 +657,7 @@ def _inspect_single_side(
 
             if area >= 18.0 and halo_diff >= 9.5 and circularity >= 0.48:
                 conf = min(0.94, 0.68 + min(0.18, halo_diff / 60.0) + _anom_boost(cx_c, cy_c))
-                confirmed.append({
+                confirmed.append(_attach_meta({
                     "type": "print_spot_fisheye",
                     "is_true_defect": True,
                     "confidence": round(conf, 3),
@@ -389,18 +665,16 @@ def _inspect_single_side(
                     "zone": z_lbl,
                     "severity": 0.5,
                     "target": "surface",
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
             elif area <= 32.0 or margin_dust_density >= 0.25 or halo_diff < 9.5:
-                artifacts.append({
+                artifacts.append(_attach_meta({
                     "type": "loose_dust_speck",
                     "is_true_defect": False,
                     "confidence": 0.78,
                     "side": side_label,
                     "zone": z_lbl,
                     "severity": 0.0,
-                    "bbox": (int(bx + ix1), int(by + iy1), int(bw), int(bh)),
-                })
+                }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
 
     # C. Dimple / Dent (paired positive/negative DoG shading dipole with continuous ink hue)
     int_dog = dog_signed[iy1:iy2, ix1:ix2].copy()
@@ -426,7 +700,7 @@ def _inspect_single_side(
                     used_neg.add(j)
                     z_lbl = _zone_label(mx - cx1, my - cy1, cw, ch)
                     conf = min(0.92, 0.68 + _anom_boost(mx - cx1, my - cy1))
-                    confirmed.append({
+                    confirmed.append(_attach_meta({
                         "type": "dimple_dent",
                         "is_true_defect": True,
                         "confidence": round(conf, 3),
@@ -434,8 +708,7 @@ def _inspect_single_side(
                         "zone": z_lbl,
                         "severity": 0.5,
                         "target": "surface",
-                        "bbox": (max(ix1, mx - 12), max(iy1, my - 12), 24, 24),
-                    })
+                    }, (max(ix1, mx - 12), max(iy1, my - 12), 24, 24)))
                     break
 
     # D. Sleeve Smudge / Haze (low-frequency saturation drop + lifted black floor without sharp edges)
@@ -461,14 +734,14 @@ def _inspect_single_side(
                 cs = float(np.mean(int_s[ry0:ry1, rx0:rx1][c_mask]))
                 clap = float(np.mean(int_lap[ry0:ry1, rx0:rx1][c_mask]))
                 if (med_s - cs) >= 20.0 and (cl - med_l) >= 12.0 and clap < med_lap * 0.65:
-                    artifacts.append({
+                    artifacts.append(_attach_meta({
                         "type": "sleeve_smudge",
                         "is_true_defect": False,
                         "confidence": 0.75,
                         "side": side_label,
                         "zone": _zone_label(rx0 + cell_w * 0.5, ry0 + cell_h * 0.5, cw, ch),
                         "severity": 0.0,
-                    })
+                    }, (int(ix1 + rx0), int(iy1 + ry0), max(8, int(rx1 - rx0)), max(8, int(ry1 - ry0)))))
                     break
 
     # E. Edge Chipping (4 edge strips) & Corner Whitening (4 corners)
@@ -482,6 +755,9 @@ def _inspect_single_side(
     ])
     border_l_med = float(np.median(border_band_l)) if border_band_l.size else 180.0
 
+    white_thr_edge = max(188.0, border_l_med + (59.0 if light_border_mode else 34.0))
+    skip_light_border = light_border_mode and border_l_med >= 175.0
+
     edge_zones = [
         ("Top edge", (cx1 + c_span, cy1, cx2 - c_span, cy1 + edge_strip)),
         ("Bottom edge", (cx1 + c_span, cy2 - edge_strip, cx2 - c_span, cy2)),
@@ -489,16 +765,16 @@ def _inspect_single_side(
         ("Right edge", (cx2 - edge_strip, cy1 + c_span, cx2, cy2 - c_span)),
     ]
     for e_name, (ex1, ey1, ex2, ey2) in edge_zones:
-        if ex2 <= ex1 + 4 or ey2 <= ey1 + 4:
+        if skip_light_border or ex2 <= ex1 + 4 or ey2 <= ey1 + 4:
             continue
         e_l = lab[ey1:ey2, ex1:ex2, 0]
         e_s = hsv[ey1:ey2, ex1:ex2, 1]
-        e_gl = glare_mask[ey1:ey2, ex1:ex2]
-        white_thr = max(188.0, border_l_med + 34.0)
-        chip_m = ((e_l > white_thr) & (e_s < 36) & (~e_gl)).astype(np.uint8)
+        e_gl = glare_mask[ey1:ey2, ex1:ex2] | streak_mask[ey1:ey2, ex1:ex2]
+        chip_m = ((e_l > white_thr_edge) & (e_s < 36) & (~e_gl)).astype(np.uint8)
         chip_frac = float(np.count_nonzero(chip_m)) / float(max(1, e_l.size))
         n_ch, lbl_ch, st_ch, cen_ch = cv2.connectedComponentsWithStats(chip_m, connectivity=8)
         max_chip_a = 0
+        best_chip_box = (ex1, ey1, max(8, ex2 - ex1), max(8, ey2 - ey1))
         for i_c in range(1, n_ch):
             a_c = int(st_ch[i_c, cv2.CC_STAT_AREA])
             if a_c < 14:
@@ -521,9 +797,15 @@ def _inspect_single_side(
                 crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
             if not crosses_out and a_c > max_chip_a:
                 max_chip_a = a_c
+                best_chip_box = (
+                    int(ex1 + st_ch[i_c, cv2.CC_STAT_LEFT]),
+                    int(ey1 + st_ch[i_c, cv2.CC_STAT_TOP]),
+                    max(6, int(st_ch[i_c, cv2.CC_STAT_WIDTH])),
+                    max(6, int(st_ch[i_c, cv2.CC_STAT_HEIGHT])),
+                )
         if max_chip_a >= 14 and chip_frac < 0.35:
             sev = 1.0 if max_chip_a >= 65 else 0.5
-            confirmed.append({
+            confirmed.append(_attach_meta({
                 "type": "edge_chipping",
                 "is_true_defect": True,
                 "confidence": 0.78,
@@ -531,8 +813,9 @@ def _inspect_single_side(
                 "zone": e_name,
                 "severity": sev,
                 "target": "edges",
-            })
+            }, best_chip_box))
 
+    white_thr_corner = max(188.0, border_l_med + (55.0 if light_border_mode else 30.0))
     corner_zones = [
         ("Top-Left", (cx1, cy1, cx1 + c_span, cy1 + c_span)),
         ("Top-Right", (cx2 - c_span, cy1, cx2, cy1 + c_span)),
@@ -545,16 +828,31 @@ def _inspect_single_side(
         k_l = lab[ky1:ky2, kx1:kx2, 0]
         k_s = hsv[ky1:ky2, kx1:kx2, 1]
         k_g = gray[ky1:ky2, kx1:kx2]
-        k_gl = glare_mask[ky1:ky2, kx1:kx2]
-        white_thr = max(188.0, border_l_med + 30.0)
-        wh_m = ((k_l > white_thr) & (k_s < 38) & (~k_gl)).astype(np.uint8)
-        wh_frac = float(np.count_nonzero(wh_m)) / float(max(1, k_l.size))
-        n_wh, _, st_wh, _ = cv2.connectedComponentsWithStats(wh_m, connectivity=8)
-        max_wh_a = max((int(st_wh[i, cv2.CC_STAT_AREA]) for i in range(1, n_wh)), default=0)
+        k_gl = glare_mask[ky1:ky2, kx1:kx2] | streak_mask[ky1:ky2, kx1:kx2]
+        if skip_light_border:
+            max_wh_a = 0
+            wh_frac = 0.0
+            best_wh_box = (kx1, ky1, max(8, kx2 - kx1), max(8, ky2 - ky1))
+        else:
+            wh_m = ((k_l > white_thr_corner) & (k_s < 38) & (~k_gl)).astype(np.uint8)
+            wh_frac = float(np.count_nonzero(wh_m)) / float(max(1, k_l.size))
+            n_wh, _, st_wh, _ = cv2.connectedComponentsWithStats(wh_m, connectivity=8)
+            max_wh_a = 0
+            best_wh_box = (kx1, ky1, max(8, kx2 - kx1), max(8, ky2 - ky1))
+            for i_w in range(1, n_wh):
+                a_w = int(st_wh[i_w, cv2.CC_STAT_AREA])
+                if a_w > max_wh_a:
+                    max_wh_a = a_w
+                    best_wh_box = (
+                        int(kx1 + st_wh[i_w, cv2.CC_STAT_LEFT]),
+                        int(ky1 + st_wh[i_w, cv2.CC_STAT_TOP]),
+                        max(6, int(st_wh[i_w, cv2.CC_STAT_WIDTH])),
+                        max(6, int(st_wh[i_w, cv2.CC_STAT_HEIGHT])),
+                    )
         lap_v = float(cv2.Laplacian(k_g, cv2.CV_64F).var())
         if (max_wh_a >= 14 and wh_frac < 0.45) or lap_v < 42.0:
             sev = 1.0 if (max_wh_a >= 75 or lap_v < 28.0) else 0.5
-            confirmed.append({
+            confirmed.append(_attach_meta({
                 "type": "corner_whitening",
                 "is_true_defect": True,
                 "confidence": 0.80,
@@ -562,7 +860,7 @@ def _inspect_single_side(
                 "zone": c_name,
                 "severity": sev,
                 "target": "corners",
-            })
+            }, best_wh_box))
 
     # Optional dedicated card_defect_v1.onnx patch refinement when installed
     defect_model = get_local_defect_model(load_now=False, claim_slot=False)
@@ -593,10 +891,12 @@ def _inspect_single_side(
                     else:
                         confirmed[idx_c]["confidence"] = round(max(confirmed[idx_c]["confidence"], pred["confidence"]), 3)
 
-    confirmed = [c for c in confirmed if c.get("is_true_defect") and c.get("confidence", 0.0) >= _CONFIRMED_DEFECT_CONF_MIN]
+    raw_confirmed = [c for c in confirmed if c.get("is_true_defect") and c.get("confidence", 0.0) >= _CONFIRMED_DEFECT_CONF_MIN]
+    confirmed = [c for c in raw_confirmed if c.get("id") not in dismissed_ids]
 
     return {
         "confirmed": confirmed,
+        "raw_confirmed": raw_confirmed,
         "artifacts": artifacts,
         "glare_pct": glare_pct,
         "margin_dust_density": margin_dust_density,
@@ -615,6 +915,7 @@ def inspect_card_surface_through_sleeve(
     enable_onnx_anomaly: bool = True,
     claim_slot: bool = True,
     force_cpu: bool = False,
+    overrides: Optional[dict] = None,
 ) -> dict:
     """
     Inspects Front & Back card images through penny sleeves, toploaders, and Card Saver 1 holders,
@@ -635,6 +936,7 @@ def inspect_card_surface_through_sleeve(
         patch_tokens=front_patch_tokens,
         enable_onnx_anomaly=enable_onnx_anomaly,
         force_cpu=force_cpu,
+        overrides=overrides,
     )
 
     if back_img is not None:
@@ -648,11 +950,13 @@ def inspect_card_surface_through_sleeve(
             patch_tokens=back_patch_tokens,
             enable_onnx_anomaly=enable_onnx_anomaly,
             force_cpu=force_cpu,
+            overrides=overrides,
         )
     else:
-        b_res = {"confirmed": [], "artifacts": [], "glare_pct": 0.0, "has_holder_margin": False, "backend": f_res["backend"]}
+        b_res = {"confirmed": [], "raw_confirmed": [], "artifacts": [], "glare_pct": 0.0, "has_holder_margin": False, "backend": f_res["backend"]}
 
     confirmed_all = f_res["confirmed"] + b_res["confirmed"]
+    raw_confirmed_all = f_res["raw_confirmed"] + b_res["raw_confirmed"]
     artifacts_all = f_res["artifacts"] + b_res["artifacts"]
 
     surf_pen = sum(float(d.get("severity", 0.5)) for d in confirmed_all if d.get("target") == "surface")
@@ -695,14 +999,20 @@ def inspect_card_surface_through_sleeve(
             bits.append(f"{counts['sleeve_scratch_or_static_streak']} sleeve scratch/streak")
         if counts.get("sleeve_smudge"):
             bits.append("sleeve smudge/haze")
+        if counts.get("scanner_streak"):
+            bits.append(f"{counts['scanner_streak']} scanner glass/sensor streak(s)")
         if bits:
-            artifact_warning = f"[Sleeve/Dust Check] {', '.join(bits)} — wipe holder & rescan to verify"
+            if counts.get("scanner_streak"):
+                artifact_warning = f"[Sleeve/Dust Check] {', '.join(bits)} — clean scanner glass & rescan to verify"
+            else:
+                artifact_warning = f"[Sleeve/Dust Check] {', '.join(bits)} — wipe holder & rescan to verify"
 
     return {
         "sub_surface": sub_surface,
         "sub_corners": sub_corners,
         "sub_edges": sub_edges,
         "confirmed_defects": confirmed_all,
+        "raw_confirmed_defects": raw_confirmed_all,
         "superficial_artifacts": artifacts_all,
         "defect_notes": defect_notes,
         "artifact_warning": artifact_warning,

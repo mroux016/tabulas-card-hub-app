@@ -103,22 +103,27 @@ from Core.config import (
     ARCHIVE_DIR,
     BATCH_MANIFEST_COLUMNS,
     BATCHES_DIR,
+    CACHE_GRADING_DIAGNOSTICS_DIR,
+    CACHE_GRADING_FEEDBACK_DIR,
     CARDSIGHT_API_KEY,
     CARDSIGHT_IDENTIFY_URL,
     CARDSIGHT_SPORT_ENDPOINTS,
     CHECKLIST_PATH,
     CMP_SUBSET_HINTS,
     FEATURE_CACHE_FILE,
+    GRADING_FEEDBACK_LOG_FILE,
     REFERENCE_TEMPLATES_DIR,
     REVIEWED_CARDS_DIR,
     RUNTIME_CONFIG,
     atomic_write_bytes,
+    atomic_write_text,
     build_card_image_filenames,
     build_card_image_stem,
     canonical_set_key,
     canonical_subset_key,
     ensure_directories,
     format_print_run,
+    interprocess_file_lock,
     norm,
     parse_unified_card_filename,
     sanitize_filename_part,
@@ -4375,23 +4380,47 @@ def identify_card_with_cardsight_fallback(
 
 
 # ==============================================================================
-# 5. FULL 1.0 - 10.0 PHYSICAL PSA & BGS PRE-GRADE ESTIMATOR
+# 5. FULL 1.0 - 10.0 PHYSICAL PSA & BGS PRE-GRADE ESTIMATOR & DIAGNOSTIC SIDECAR
 # ==============================================================================
-def estimate_card_pregrade(
-    front_img: Image.Image,
-    back_img: Image.Image,
-    front_box: Optional[tuple[int, int, int, int]] = None,
-    back_box: Optional[tuple[int, int, int, int]] = None,
-    front_patch_tokens: Optional[np.ndarray] = None,
-    back_patch_tokens: Optional[np.ndarray] = None,
-) -> dict:
-    if front_box is None:
-        front_box = detect_physical_card_box(front_img)
-    if back_box is None:
-        back_box = detect_physical_card_box(back_img)
+_GRADING_DIAG_SCHEMA_VERSION = 1
 
-    fx1, fy1, fx2, fy2 = front_box
-    card_crop = front_img.crop((fx1, fy1, max(fx1 + 40, fx2), max(fy1 + 40, fy2)))
+
+def _round_half_grade(val: float, lo: float = 1.0, hi: float = 10.0) -> float:
+    return round(float(np.clip(round(float(val) * 2.0) / 2.0, lo, hi)), 1)
+
+
+def _measure_side_centering(
+    img: Image.Image,
+    card_box: tuple[int, int, int, int],
+    sleeve_inset_pct: float = 0.0,
+    has_holder_margin: bool = False,
+) -> dict:
+    """
+    Measures outer card boundary & inner design frame centering on a single side,
+    returning normalized `[0..1]` geometry and L/R + T/B percentages.
+    """
+    iw, ih = img.size
+    iw = max(40, int(iw))
+    ih = max(40, int(ih))
+    x1, y1, x2, y2 = [int(v) for v in card_box]
+    x1 = max(0, min(iw - 40, x1))
+    y1 = max(0, min(ih - 40, y1))
+    x2 = max(x1 + 40, min(iw, x2))
+    y2 = max(y1 + 40, min(ih, y2))
+
+    inset_f = max(0.0, min(0.12, float(sleeve_inset_pct or 0.0)))
+    if inset_f > 0.0:
+        cw_raw = x2 - x1
+        ch_raw = y2 - y1
+        dx = int(round(cw_raw * inset_f))
+        dy = int(round(ch_raw * inset_f))
+        if cw_raw - 2 * dx >= 40 and ch_raw - 2 * dy >= 40:
+            x1 += dx
+            x2 -= dx
+            y1 += dy
+            y2 -= dy
+
+    card_crop = img.crop((x1, y1, x2, y2))
     cw, ch = card_crop.size
     arr = np.array(card_crop)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
@@ -4432,6 +4461,277 @@ def estimate_card_pregrade(
     else:
         sub_centering = 6.0
 
+    outer_rect = [
+        round(x1 / float(iw), 4),
+        round(y1 / float(ih), 4),
+        round((x2 - x1) / float(iw), 4),
+        round((y2 - y1) / float(ih), 4),
+    ]
+    in_x1 = x1 + l_idx
+    in_y1 = y1 + t_idx
+    in_x2 = max(in_x1 + 10, x2 - r_idx)
+    in_y2 = max(in_y1 + 10, y2 - b_idx)
+    inner_rect = [
+        round(in_x1 / float(iw), 4),
+        round(in_y1 / float(ih), 4),
+        round((in_x2 - in_x1) / float(iw), 4),
+        round((in_y2 - in_y1) / float(ih), 4),
+    ]
+    sleeve_det = bool(has_holder_margin or x1 >= 8 or y1 >= 8 or (iw - x2) >= 8 or (ih - y2) >= 8)
+
+    return {
+        "outer_card_rect": outer_rect,
+        "inner_frame_rect": inner_rect,
+        "lr_left": lr_l,
+        "lr_right": lr_r,
+        "lr": f"{lr_l}/{lr_r}",
+        "tb_top": tb_t,
+        "tb_bottom": tb_b,
+        "tb": f"{tb_t}/{tb_b}",
+        "sleeve_detected": sleeve_det,
+        "sub_centering": sub_centering,
+    }
+
+
+def get_grading_diagnostics_path(
+    sku: str = "",
+    target_type: str = "inventory",
+    batch_name: str = "",
+    front_file: str = "",
+) -> Path:
+    """
+    Returns the canonical JSON sidecar path under `Cache/Grading_Diagnostics/`.
+    For uncommitted batches (`target_type == 'batch'`), namespaces by batch + front stem
+    when SKU is blank or when batch context is provided to prevent cross-batch collisions.
+    """
+    CACHE_GRADING_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    sku_clean = sanitize_filename_part(str(sku or "").strip())
+    if str(target_type).lower() == "batch":
+        b_clean = sanitize_filename_part(str(batch_name or "batch").strip())
+        stem_clean = sanitize_filename_part(Path(str(front_file or "")).stem) if front_file else ""
+        key_part = sku_clean or stem_clean or "card"
+        if not sku_clean or stem_clean:
+            fname = f"batch_{b_clean}_{stem_clean or key_part}.json"
+        else:
+            fname = f"batch_{b_clean}_{key_part}.json"
+        return CACHE_GRADING_DIAGNOSTICS_DIR / fname
+    return CACHE_GRADING_DIAGNOSTICS_DIR / f"{sku_clean or 'unknown_sku'}.json"
+
+
+def load_grading_diagnostics(diag_path: Path) -> Optional[dict]:
+    if not diag_path or not diag_path.exists():
+        return None
+    try:
+        data = json.loads(diag_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def save_grading_diagnostics(diag_path: Path, data: dict) -> Path:
+    CACHE_GRADING_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(diag_path, json.dumps(data, indent=2, ensure_ascii=False))
+    return diag_path
+
+
+def _default_grading_overrides() -> dict:
+    return {
+        "dismissed_defect_ids": [],
+        "manual_defects": [],
+        "sleeve_inset_pct": 0.0,
+        "light_border_mode": False,
+        "subgrade_overrides": {},
+    }
+
+
+def recompute_grades_from_diagnostics(
+    diag: dict,
+    overrides: Optional[dict] = None,
+) -> tuple[dict, dict]:
+    """
+    Deterministically recomputes all 4 subgrades, PSA/BGS estimates, structured
+    `notes_by_category`, and CSV `Grading_Notes` from a diagnostic sidecar + overrides.
+    """
+    out_diag = json.loads(json.dumps(diag))
+    ov = _default_grading_overrides()
+    if isinstance(diag.get("overrides"), dict):
+        ov.update(diag["overrides"])
+    if isinstance(overrides, dict):
+        ov.update(overrides)
+    ov["dismissed_defect_ids"] = [str(x).strip() for x in (ov.get("dismissed_defect_ids") or []) if str(x).strip()]
+    ov["manual_defects"] = [m for m in (ov.get("manual_defects") or []) if isinstance(m, dict)]
+    ov["sleeve_inset_pct"] = round(float(ov.get("sleeve_inset_pct") or 0.0), 4)
+    ov["light_border_mode"] = bool(ov.get("light_border_mode", False))
+    ov["subgrade_overrides"] = dict(ov.get("subgrade_overrides") or {})
+    out_diag["overrides"] = ov
+
+    dismissed_set = set(ov["dismissed_defect_ids"])
+    raw_defects = list(out_diag.get("raw_confirmed_defects") or out_diag.get("confirmed_defects") or [])
+    active_defects = [d for d in raw_defects if str(d.get("id") or "") not in dismissed_set]
+    for md in ov["manual_defects"]:
+        if str(md.get("id") or "") not in dismissed_set:
+            active_defects.append(md)
+    out_diag["confirmed_defects"] = active_defects
+
+    centering = out_diag.get("centering") or {}
+    f_cent = centering.get("front") or {}
+    b_cent = centering.get("back") or {}
+
+    lr_l = int(f_cent.get("lr_left", 50))
+    lr_r = int(f_cent.get("lr_right", 50))
+    tb_t = int(f_cent.get("tb_top", 50))
+    tb_b = int(f_cent.get("tb_bottom", 50))
+    sub_centering = float(f_cent.get("sub_centering", 10.0))
+    # Back centering guardrail: PSA/BGS allow ~75/25 on the back for Gem Mint/Mint
+    b_worst = max(int(b_cent.get("lr_left", 50)), int(b_cent.get("lr_right", 50)), int(b_cent.get("tb_top", 50)), int(b_cent.get("tb_bottom", 50)))
+    if b_worst > 80 and sub_centering > 8.5:
+        sub_centering = 8.5
+    elif b_worst > 75 and sub_centering > 9.0:
+        sub_centering = 9.0
+
+    surf_pen = sum(float(d.get("penalty", d.get("severity", 0.5))) for d in active_defects if str(d.get("category") or d.get("target") or "surface") == "surface")
+    corn_pen = sum(float(d.get("penalty", d.get("severity", 0.5))) for d in active_defects if str(d.get("category") or d.get("target") or "") == "corners")
+    edge_pen = sum(float(d.get("penalty", d.get("severity", 0.5))) for d in active_defects if str(d.get("category") or d.get("target") or "") == "edges")
+
+    fallback_subs = out_diag.get("_fallback_subgrades") or {}
+    if out_diag.get("_used_fallback_heuristics"):
+        sub_corners = float(fallback_subs.get("corners", 9.5))
+        sub_edges = float(fallback_subs.get("edges", 9.5))
+        sub_surface = float(fallback_subs.get("surface", 9.5))
+        if active_defects:
+            sub_corners = min(sub_corners, _round_half_grade(9.5 - min(4.0, corn_pen), 5.0, 10.0))
+            sub_edges = min(sub_edges, _round_half_grade(9.5 - min(4.0, edge_pen), 5.0, 10.0))
+            sub_surface = min(sub_surface, _round_half_grade(9.5 - min(4.0, surf_pen), 5.0, 10.0))
+    else:
+        sub_corners = _round_half_grade(9.5 - min(4.0, corn_pen), 5.0, 10.0)
+        sub_edges = _round_half_grade(9.5 - min(4.0, edge_pen), 5.0, 10.0)
+        sub_surface = _round_half_grade(9.5 - min(4.0, surf_pen), 5.0, 10.0)
+
+    sub_ov = ov["subgrade_overrides"]
+    if "centering" in sub_ov and sub_ov["centering"] is not None:
+        sub_centering = _round_half_grade(float(sub_ov["centering"]), 1.0, 10.0)
+    if "corners" in sub_ov and sub_ov["corners"] is not None:
+        sub_corners = _round_half_grade(float(sub_ov["corners"]), 1.0, 10.0)
+    if "edges" in sub_ov and sub_ov["edges"] is not None:
+        sub_edges = _round_half_grade(float(sub_ov["edges"]), 1.0, 10.0)
+    if "surface" in sub_ov and sub_ov["surface"] is not None:
+        sub_surface = _round_half_grade(float(sub_ov["surface"]), 1.0, 10.0)
+
+    subs = sorted([sub_centering, sub_corners, sub_edges, sub_surface])
+    min_sub = subs[0]
+    avg_sub = float(np.mean(subs))
+    raw_bgs = min(avg_sub, min_sub + 1.0)
+    est_bgs = _round_half_grade(raw_bgs, 1.0, 10.0)
+
+    if est_bgs >= 9.5 and sub_centering >= 9.5 and min_sub >= 9.0:
+        est_psa = 10.0
+    elif est_bgs >= 9.0:
+        est_psa = 9.0
+    else:
+        est_psa = est_bgs
+
+    tier_lbl = "Gem Mint" if est_psa >= 10.0 else ("Mint" if est_psa >= 9.0 else ("NM-MT" if est_psa >= 8.0 else "NM"))
+    sub_map = {
+        "centering": sub_centering,
+        "corners": sub_corners,
+        "edges": sub_edges,
+        "surface": sub_surface,
+    }
+    out_diag["grades"] = {
+        "psa": {"overall": est_psa, "tier": tier_lbl, "subgrades": dict(sub_map)},
+        "bgs": {"overall": est_bgs, "tier": tier_lbl, "subgrades": dict(sub_map)},
+    }
+
+    # Build structured 4-box notes + concise CSV Grading_Notes
+    f_lr_str = f_cent.get("lr", f"{lr_l}/{lr_r}")
+    f_tb_str = f_cent.get("tb", f"{tb_t}/{tb_b}")
+    b_lr_str = b_cent.get("lr", "50/50")
+    b_tb_str = b_cent.get("tb", "50/50")
+    cent_note = f"Front {f_lr_str} L/R, {f_tb_str} T/B | Back {b_lr_str} L/R, {b_tb_str} T/B"
+    if f_cent.get("sleeve_detected"):
+        cent_note += " (sleeve/holder margin detected)"
+
+    def _cat_note(cat: str, empty_msg: str) -> str:
+        items = [d for d in active_defects if str(d.get("category") or d.get("target") or "") == cat]
+        if not items:
+            return empty_msg
+        return "; ".join(f"{d.get('label', d.get('type', 'defect'))} (-{float(d.get('penalty', d.get('severity', 0.5))):.1f})" for d in items[:4])
+
+    advisories: list[str] = []
+    art_warn = str(out_diag.get("_artifact_warning") or "").strip()
+    if art_warn:
+        advisories.append(art_warn)
+    if dismissed_set:
+        advisories.append(f"{len(dismissed_set)} false-positive item(s) dismissed by user")
+    if ov["sleeve_inset_pct"] > 0:
+        advisories.append(f"Centering inset +{ov['sleeve_inset_pct']*100:.1f}% past sleeve rim")
+    if ov["light_border_mode"]:
+        advisories.append("Light-border whitening guard active")
+
+    out_diag["notes_by_category"] = {
+        "centering": cent_note,
+        "corners": _cat_note("corners", "Sharp corners — no whitening or softness detected"),
+        "edges": _cat_note("edges", "Clean edges — no chipping or wear detected"),
+        "surface": _cat_note("surface", "Clean surface — no scratches, print lines, or dimples detected"),
+        "advisories": advisories,
+    }
+
+    notes_list = [f"{tier_lbl} tier"]
+    if abs(lr_l - 50) >= 6:
+        shift_dir = "left (wider right border)" if lr_l < 50 else "right (wider left border)"
+        notes_list.append(f"Centering: Front L/R shifted {shift_dir} ({lr_l}/{lr_r})")
+    if abs(tb_t - 50) >= 6:
+        shift_tb = "up (wider bottom border)" if tb_t < 50 else "down (wider top border)"
+        notes_list.append(f"Centering: Front T/B shifted {shift_tb} ({tb_t}/{tb_b})")
+    for d in active_defects[:6]:
+        tgt = str(d.get("category") or d.get("target") or "surface").capitalize()
+        notes_list.append(f"{tgt}: {d.get('label', d.get('type', 'defect'))} (-{float(d.get('penalty', d.get('severity', 0.5))):.1f})")
+    if art_warn:
+        notes_list.append(art_warn)
+    if len(notes_list) == 1:
+        notes_list.append(f"Sharp corners & clean surface ({lr_l}/{lr_r} L/R, {tb_t}/{tb_b} T/B)")
+
+    csv_grade = {
+        "Centering_LR": f"{lr_l}/{lr_r}",
+        "Centering_TB": f"{tb_t}/{tb_b}",
+        "Sub_Centering": f"{sub_centering:.1f}",
+        "Sub_Corners": f"{sub_corners:.1f}",
+        "Sub_Edges": f"{sub_edges:.1f}",
+        "Sub_Surface": f"{sub_surface:.1f}",
+        "Est_Grade": f"{est_bgs:.1f}",
+        "Est_PSA": f"{est_psa:.1f}",
+        "Est_BGS": f"{est_bgs:.1f}",
+        "Grading_Notes": " | ".join(notes_list),
+    }
+    out_diag["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    return csv_grade, out_diag
+
+
+def estimate_card_pregrade(
+    front_img: Image.Image,
+    back_img: Image.Image,
+    front_box: Optional[tuple[int, int, int, int]] = None,
+    back_box: Optional[tuple[int, int, int, int]] = None,
+    front_patch_tokens: Optional[np.ndarray] = None,
+    back_patch_tokens: Optional[np.ndarray] = None,
+    overrides: Optional[dict] = None,
+    return_diagnostics: bool = False,
+    diagnostics_path: Optional[Path] = None,
+    sku: str = "",
+    front_file: str = "",
+    back_file: str = "",
+    source_images_meta: Optional[dict] = None,
+) -> dict | tuple[dict, dict]:
+    if front_box is None:
+        front_box = detect_physical_card_box(front_img)
+    if back_box is None:
+        back_box = detect_physical_card_box(back_img)
+
+    ov = _default_grading_overrides()
+    if isinstance(overrides, dict):
+        ov.update(overrides)
+    sleeve_inset = float(ov.get("sleeve_inset_pct") or 0.0)
+
     win4_res = None
     try:
         if bool(load_compute_settings().get("enable_defect_ai", True)):
@@ -4445,20 +4745,29 @@ def estimate_card_pregrade(
                 back_patch_tokens=back_patch_tokens,
                 enable_onnx_anomaly=True,
                 claim_slot=True,
+                overrides=ov,
             )
     except Exception:
         win4_res = None
 
+    has_margin_f = bool(win4_res.get("has_holder_margin_front")) if isinstance(win4_res, dict) else False
+    has_margin_b = bool(win4_res.get("has_holder_margin_back")) if isinstance(win4_res, dict) else False
+
+    f_cent = _measure_side_centering(front_img, front_box, sleeve_inset_pct=sleeve_inset, has_holder_margin=has_margin_f)
+    b_cent = _measure_side_centering(back_img, back_box, sleeve_inset_pct=sleeve_inset, has_holder_margin=has_margin_b)
+
+    used_fallback = False
+    fallback_subs: dict = {}
     if isinstance(win4_res, dict):
-        sub_corners = float(win4_res["sub_corners"])
-        sub_edges = float(win4_res["sub_edges"])
-        sub_surface = float(win4_res["sub_surface"])
-        edge_callout = ""
-        worst_corner_name = "Corner"
-        defect_notes_extra = list(win4_res.get("defect_notes") or [])
+        raw_confirmed = list(win4_res.get("raw_confirmed_defects") or win4_res.get("confirmed_defects") or [])
+        superficial_artifacts = list(win4_res.get("superficial_artifacts") or [])
         artifact_warning = str(win4_res.get("artifact_warning") or "").strip()
     else:
-        corner_names = ["Front Top-Left", "Front Top-Right", "Front Bot-Left", "Front Bot-Right"]
+        used_fallback = True
+        fx1, fy1, fx2, fy2 = front_box
+        card_crop = front_img.crop((fx1, fy1, max(fx1 + 40, fx2), max(fy1 + 40, fy2)))
+        cw, ch = card_crop.size
+        gray = cv2.cvtColor(np.array(card_crop), cv2.COLOR_RGB2GRAY)
         c_span = max(16, int(min(cw, ch) * 0.08))
         c_patches = [
             gray[:c_span, :c_span],
@@ -4467,87 +4776,501 @@ def estimate_card_pregrade(
             gray[ch - c_span:, cw - c_span:],
         ]
         corner_scores = []
-        worst_corner_name = "Front Top-Left"
-        worst_corner_val = 10.0
-        for c_lbl, patch in zip(corner_names, c_patches):
+        for patch in c_patches:
             lap_var = float(cv2.Laplacian(patch, cv2.CV_64F).var())
-            score_c = 9.5 if lap_var >= 110 else (9.0 if lap_var >= 55 else 8.5)
-            corner_scores.append(score_c)
-            if score_c < worst_corner_val:
-                worst_corner_val = score_c
-                worst_corner_name = c_lbl
-        sub_corners = round(float(min(corner_scores)), 1)
+            corner_scores.append(9.5 if lap_var >= 110 else (9.0 if lap_var >= 55 else 8.5))
+        sub_c_fb = round(float(min(corner_scores)), 1)
 
         edge_strip = max(8, int(min(cw, ch) * 0.025))
         edge_zones = [
-            ("Front Top edge", gray[:edge_strip, c_span:cw - c_span]),
-            ("Front Bottom edge", gray[ch - edge_strip:, c_span:cw - c_span]),
-            ("Front Left edge", gray[c_span:ch - c_span, :edge_strip]),
-            ("Front Right edge", gray[c_span:ch - c_span, cw - edge_strip:]),
+            gray[:edge_strip, c_span:cw - c_span],
+            gray[ch - edge_strip:, c_span:cw - c_span],
+            gray[c_span:ch - c_span, :edge_strip],
+            gray[c_span:ch - c_span, cw - edge_strip:],
         ]
-        sub_edges = 9.5
-        edge_callout = ""
-        for e_name, e_patch in edge_zones:
+        sub_e_fb = 9.5
+        for e_patch in edge_zones:
             if e_patch.size == 0:
                 continue
             std_e = float(np.std(e_patch))
-            if std_e > 48.0 and sub_edges > 8.5:
-                sub_edges = 8.5
-                edge_callout = f"edge nick/whitening on {e_name} (8.5)"
-            elif std_e > 34.0 and sub_edges > 9.0:
-                sub_edges = 9.0
-                edge_callout = f"minor edge wear on {e_name} (9.0)"
+            if std_e > 48.0 and sub_e_fb > 8.5:
+                sub_e_fb = 8.5
+            elif std_e > 34.0 and sub_e_fb > 9.0:
+                sub_e_fb = 9.0
 
         center_patch = gray[int(ch * 0.18):int(ch * 0.82), int(cw * 0.18):int(cw * 0.82)]
         lap_surf = float(cv2.Laplacian(center_patch, cv2.CV_64F).var()) if center_patch.size else 100.0
-        sub_surface = 9.5 if lap_surf >= 45.0 else 9.0
-        defect_notes_extra = []
+        sub_s_fb = 9.5 if lap_surf >= 45.0 else 9.0
+        fallback_subs = {"corners": sub_c_fb, "edges": sub_e_fb, "surface": sub_s_fb}
+        raw_confirmed = []
+        superficial_artifacts = []
         artifact_warning = ""
 
-    subs = sorted([sub_centering, sub_corners, sub_edges, sub_surface])
-    min_sub = subs[0]
-    avg_sub = float(np.mean(subs))
-    raw_bgs = min(avg_sub, min_sub + 1.0)
-    est_bgs = round(np.clip(round(raw_bgs * 2.0) / 2.0, 1.0, 10.0), 1)
+    diag = {
+        "schema_version": _GRADING_DIAG_SCHEMA_VERSION,
+        "sku": str(sku or "").strip(),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "source_images": source_images_meta or {
+            "front_file": front_file,
+            "front_size": [int(front_img.width), int(front_img.height)],
+            "back_file": back_file,
+            "back_size": [int(back_img.width), int(back_img.height)],
+        },
+        "centering": {
+            "front": f_cent,
+            "back": b_cent,
+        },
+        "raw_confirmed_defects": raw_confirmed,
+        "confirmed_defects": raw_confirmed,
+        "superficial_artifacts": superficial_artifacts,
+        "_artifact_warning": artifact_warning,
+        "_used_fallback_heuristics": used_fallback,
+        "_fallback_subgrades": fallback_subs,
+        "overrides": ov,
+    }
 
-    if est_bgs >= 9.5 and sub_centering >= 9.5 and min_sub >= 9.0:
-        est_psa = 10.0
-    elif est_bgs >= 9.0:
-        est_psa = 9.0
-    else:
-        est_psa = est_bgs
+    csv_grade, diag = recompute_grades_from_diagnostics(diag, overrides=ov)
 
-    tier_lbl = "Gem Mint" if est_psa >= 10.0 else ("Mint" if est_psa >= 9.0 else ("NM-MT" if est_psa >= 8.0 else "NM"))
-    notes_list = [f"{tier_lbl} tier"]
-    if abs(lr_l - 50) >= 6:
-        shift_dir = "left (wider right border)" if lr_l < 50 else "right (wider left border)"
-        notes_list.append(f"Centering: Front L/R shifted {shift_dir} ({lr_l}/{lr_r})")
-    if abs(tb_t - 50) >= 6:
-        shift_tb = "up (wider bottom border)" if tb_t < 50 else "down (wider top border)"
-        notes_list.append(f"Centering: Front T/B shifted {shift_tb} ({tb_t}/{tb_b})")
-    if defect_notes_extra:
-        notes_list.extend(defect_notes_extra)
-    else:
-        if sub_corners < 9.5:
-            notes_list.append(f"Corners: {worst_corner_name} corner softness ({sub_corners:.1f})")
-        if edge_callout:
-            notes_list.append(f"Edges: {edge_callout}")
-    if artifact_warning:
-        notes_list.append(artifact_warning)
-    if len(notes_list) == 1:
-        notes_list.append(f"Sharp corners & clean surface ({lr_l}/{lr_r} L/R, {tb_t}/{tb_b} T/B)")
+    if diagnostics_path is not None:
+        save_grading_diagnostics(diagnostics_path, diag)
+
+    if return_diagnostics:
+        return csv_grade, diag
+    return csv_grade
+
+
+def resolve_card_row_and_images(
+    target_type: str,
+    sku: str,
+    batch_name: str = "",
+) -> dict:
+    """
+    Resolves a card's DataFrame, row index, row dict, and Front/Back image paths
+    for either `inventory` or `batch` targets.
+    """
+    t_type = str(target_type or "inventory").strip().lower()
+    sku_s = str(sku or "").strip()
+    if t_type == "inventory":
+        df = load_inventory_df()
+        if df.empty or "SKU" not in df.columns:
+            return {"success": False, "error": "Inventory is empty."}
+        df["SKU"] = df["SKU"].astype(str).str.strip()
+        hits = df.index[df["SKU"] == sku_s].tolist()
+        if not hits:
+            return {"success": False, "error": f"SKU {sku_s} not found in Inventory."}
+        r_idx = hits[0]
+        row_d = df.loc[r_idx].to_dict()
+        f_p, b_p, c_p = _locate_inventory_card_images(row_d, sku_s)
+        return {
+            "success": True,
+            "target_type": "inventory",
+            "sku": sku_s,
+            "batch_name": "",
+            "df": df,
+            "r_idx": r_idx,
+            "row": row_d,
+            "front_path": f_p,
+            "back_path": b_p,
+            "corners_path": c_p,
+            "manifest_path": None,
+        }
+
+    b_name = str(batch_name or "").strip()
+    batch_dir = BATCHES_DIR / b_name
+    man_p = batch_dir / "Batch_Inventory_Manifest.csv"
+    if not b_name or not man_p.exists():
+        return {"success": False, "error": f"Batch manifest not found: {b_name}"}
+    df = pd.read_csv(man_p, dtype=str, keep_default_na=False)
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    hits = df.index[df["SKU"] == sku_s].tolist()
+    if not hits:
+        return {"success": False, "error": f"SKU {sku_s} not found in batch '{b_name}'."}
+    r_idx = hits[0]
+    row_d = df.loc[r_idx].to_dict()
+    f_name = str(row_d.get("Front_File") or "").strip()
+    b_name_file = str(row_d.get("Back_File") or "").strip()
+    c_name_file = str(row_d.get("Corners_File") or "").strip()
+    f_p = (batch_dir / f_name) if (f_name and (batch_dir / f_name).exists()) else None
+    b_p = (batch_dir / b_name_file) if (b_name_file and (batch_dir / b_name_file).exists()) else None
+    c_p = (batch_dir / c_name_file) if (c_name_file and (batch_dir / c_name_file).exists()) else None
+    return {
+        "success": True,
+        "target_type": "batch",
+        "sku": sku_s,
+        "batch_name": b_name,
+        "df": df,
+        "r_idx": r_idx,
+        "row": row_d,
+        "front_path": f_p,
+        "back_path": b_p,
+        "corners_path": c_p,
+        "manifest_path": man_p,
+    }
+
+
+def _apply_csv_grade_and_cache_roi(
+    df: pd.DataFrame,
+    r_idx: int,
+    csv_grade: dict,
+    is_inventory: bool,
+) -> pd.DataFrame:
+    """Updates grade fields on `df.loc[r_idx]` and runs cache-only ROI preserving `Valuation_Source` & blank `Raw_Price`."""
+    saved_val_src = str(df.at[r_idx, "Valuation_Source"]) if "Valuation_Source" in df.columns else ""
+    saved_raw = str(df.at[r_idx, "Raw_Price"]) if "Raw_Price" in df.columns else ""
+    saved_rec = str(df.at[r_idx, "Rec_Sale_Price"]) if "Rec_Sale_Price" in df.columns else ""
+
+    for gk, gv in csv_grade.items():
+        if gk in df.columns:
+            df.at[r_idx, gk] = gv
+
+    sub_roi = recalculate_dataframe_multi_grader_roi(df.loc[[r_idx]].copy())
+    for col_c in sub_roi.columns:
+        if col_c in df.columns:
+            df.at[r_idx, col_c] = sub_roi.iloc[0][col_c]
+
+    if saved_val_src:
+        if "Valuation_Source" in df.columns:
+            df.at[r_idx, "Valuation_Source"] = saved_val_src
+    if saved_raw == "":
+        if "Raw_Price" in df.columns:
+            df.at[r_idx, "Raw_Price"] = ""
+    elif is_inventory and saved_raw:
+        df.at[r_idx, "Raw_Price"] = saved_raw
+    if is_inventory and saved_rec:
+        df.at[r_idx, "Rec_Sale_Price"] = saved_rec
+    return df
+
+
+def inspect_card_grading_diagnostics(
+    target_type: str,
+    sku: str,
+    batch_name: str = "",
+    force_recompute: bool = False,
+    reset_overrides: bool = False,
+) -> dict:
+    """
+    Loads cached grading diagnostics for a card, or computes & atomically caches them on demand.
+    Preserves existing per-card `overrides` on `force_recompute=True` unless `reset_overrides=True`.
+    """
+    resolved = resolve_card_row_and_images(target_type, sku, batch_name=batch_name)
+    if not resolved.get("success"):
+        return resolved
+
+    f_p: Optional[Path] = resolved["front_path"]
+    b_p: Optional[Path] = resolved["back_path"]
+    if f_p is None and b_p is None:
+        return {"success": False, "error": f"No card scan images found for SKU {sku}."}
+    if f_p is None:
+        f_p = b_p
+    if b_p is None:
+        b_p = f_p
+
+    row_d = resolved["row"]
+    diag_path = get_grading_diagnostics_path(
+        sku=resolved["sku"],
+        target_type=resolved["target_type"],
+        batch_name=resolved["batch_name"],
+        front_file=str(row_d.get("Front_File") or f_p.name),
+    )
+
+    f_mtime = round(f_p.stat().st_mtime, 3) if f_p.exists() else 0.0
+    b_mtime = round(b_p.stat().st_mtime, 3) if b_p.exists() else 0.0
+
+    existing_diag = load_grading_diagnostics(diag_path)
+    if (
+        existing_diag is not None
+        and not force_recompute
+        and not reset_overrides
+        and int(existing_diag.get("schema_version") or 0) == _GRADING_DIAG_SCHEMA_VERSION
+    ):
+        src_m = existing_diag.get("source_images") or {}
+        if float(src_m.get("front_mtime", -1)) == f_mtime and float(src_m.get("back_mtime", -1)) == b_mtime:
+            return {
+                "success": True,
+                "sku": resolved["sku"],
+                "diagnostics": existing_diag,
+                "card": row_d,
+                "cached": True,
+            }
+
+    carried_overrides = _default_grading_overrides()
+    if not reset_overrides and isinstance(existing_diag, dict) and isinstance(existing_diag.get("overrides"), dict):
+        carried_overrides.update(existing_diag["overrides"])
+
+    with Image.open(f_p) as fim:
+        f_img = fim.convert("RGB")
+    with Image.open(b_p) as bim:
+        b_img = bim.convert("RGB")
+
+    src_meta = {
+        "front_file": f_p.name,
+        "front_mtime": f_mtime,
+        "front_size": [int(f_img.width), int(f_img.height)],
+        "back_file": b_p.name,
+        "back_mtime": b_mtime,
+        "back_size": [int(b_img.width), int(b_img.height)],
+    }
+    csv_grade, diag = estimate_card_pregrade(
+        f_img,
+        b_img,
+        overrides=carried_overrides,
+        return_diagnostics=True,
+        diagnostics_path=diag_path,
+        sku=resolved["sku"],
+        front_file=f_p.name,
+        back_file=b_p.name,
+        source_images_meta=src_meta,
+    )
+
+    if reset_overrides:
+        df = resolved["df"]
+        r_idx = resolved["r_idx"]
+        is_inv = resolved["target_type"] == "inventory"
+        df = _apply_csv_grade_and_cache_roi(df, r_idx, csv_grade, is_inventory=is_inv)
+        if is_inv:
+            saved_df = save_inventory_df(df)
+            row_d = saved_df[saved_df["SKU"].astype(str).str.strip() == resolved["sku"]].iloc[0].to_dict()
+        else:
+            man_p = resolved["manifest_path"]
+            atomic_write_text(man_p, df.to_csv(index=False), encoding="utf-8-sig")
+            row_d = df.loc[r_idx].to_dict()
 
     return {
-        "Centering_LR": f"{lr_l}/{lr_r}",
-        "Centering_TB": f"{tb_t}/{tb_b}",
-        "Sub_Centering": f"{sub_centering:.1f}",
-        "Sub_Corners": f"{sub_corners:.1f}",
-        "Sub_Edges": f"{sub_edges:.1f}",
-        "Sub_Surface": f"{sub_surface:.1f}",
-        "Est_Grade": f"{est_bgs:.1f}",
-        "Est_PSA": f"{est_psa:.1f}",
-        "Est_BGS": f"{est_bgs:.1f}",
-        "Grading_Notes": " | ".join(notes_list),
+        "success": True,
+        "sku": resolved["sku"],
+        "diagnostics": diag,
+        "card": row_d,
+        "cached": False,
+    }
+
+
+def flag_grading_error_and_reevaluate(
+    target_type: str,
+    sku: str,
+    batch_name: str = "",
+    payload: Optional[dict] = None,
+) -> dict:
+    """
+    Logs a user-flagged grading error to `Cache/Grading_Feedback/grading_feedback_log.jsonl`,
+    persists per-card overrides, immediately re-evaluates grades + cache-only ROI, and
+    returns the updated card & diagnostics to the UI.
+    """
+    p = payload if isinstance(payload, dict) else {}
+    err_type = str(p.get("errorType") or "false_positive_artifact").strip()
+    side_sel = str(p.get("side") or "Front").strip()
+    target_item_id = str(p.get("targetItemId") or "").strip()
+    notes_txt = str(p.get("notes") or "").strip()
+
+    if err_type == "reset_overrides" or bool(p.get("resetOverrides", False)):
+        res_reset = inspect_card_grading_diagnostics(
+            target_type=target_type,
+            sku=sku,
+            batch_name=batch_name,
+            force_recompute=True,
+            reset_overrides=True,
+        )
+        if not res_reset.get("success"):
+            return res_reset
+        return {
+            **res_reset,
+            "feedbackLogged": False,
+            "resetOverrides": True,
+        }
+
+    insp = inspect_card_grading_diagnostics(target_type=target_type, sku=sku, batch_name=batch_name)
+    if not insp.get("success"):
+        return insp
+
+    resolved = resolve_card_row_and_images(target_type, sku, batch_name=batch_name)
+    if not resolved.get("success"):
+        return resolved
+
+    df = resolved["df"]
+    r_idx = resolved["r_idx"]
+    row_d = resolved["row"]
+    is_inv = resolved["target_type"] == "inventory"
+    f_p = resolved["front_path"] or resolved["back_path"]
+    b_p = resolved["back_path"] or resolved["front_path"]
+    diag_path = get_grading_diagnostics_path(
+        sku=resolved["sku"],
+        target_type=resolved["target_type"],
+        batch_name=resolved["batch_name"],
+        front_file=str(row_d.get("Front_File") or (f_p.name if f_p else "")),
+    )
+
+    diag = insp["diagnostics"]
+    ov = _default_grading_overrides()
+    if isinstance(diag.get("overrides"), dict):
+        ov.update(diag["overrides"])
+
+    grades_before = {
+        "Est_PSA": str(row_d.get("Est_PSA") or (diag.get("grades") or {}).get("psa", {}).get("overall", "")),
+        "Est_BGS": str(row_d.get("Est_BGS") or (diag.get("grades") or {}).get("bgs", {}).get("overall", "")),
+        "Sub_Centering": str(row_d.get("Sub_Centering") or ""),
+        "Sub_Corners": str(row_d.get("Sub_Corners") or ""),
+        "Sub_Edges": str(row_d.get("Sub_Edges") or ""),
+        "Sub_Surface": str(row_d.get("Sub_Surface") or ""),
+    }
+
+    orig_detection = None
+    if target_item_id:
+        for cand in (diag.get("confirmed_defects") or []) + (diag.get("superficial_artifacts") or []):
+            if str(cand.get("id") or "") == target_item_id:
+                orig_detection = cand
+                break
+
+    needs_full_image_rescan = False
+    if err_type in ("false_positive_artifact", "scanner_streak"):
+        dismissed = list(ov.get("dismissed_defect_ids") or [])
+        if target_item_id and target_item_id not in dismissed:
+            dismissed.append(target_item_id)
+        elif not target_item_id:
+            for d in (diag.get("confirmed_defects") or []):
+                if side_sel in ("Both", str(d.get("side") or "")) and str(d.get("id") or "") not in dismissed:
+                    if err_type == "scanner_streak":
+                        if str(d.get("type") or "") in ("print_line", "surface_scratch") or str(d.get("category") or "") == "surface":
+                            dismissed.append(str(d.get("id")))
+                    elif str(d.get("category") or "") == "surface":
+                        dismissed.append(str(d.get("id")))
+        ov["dismissed_defect_ids"] = dismissed
+    elif err_type == "false_light_border":
+        ov["light_border_mode"] = True
+        dismissed = list(ov.get("dismissed_defect_ids") or [])
+        if target_item_id and target_item_id not in dismissed:
+            dismissed.append(target_item_id)
+        for d in (diag.get("confirmed_defects") or []):
+            if str(d.get("category") or "") in ("corners", "edges") and side_sel in ("Both", str(d.get("side") or "")):
+                if str(d.get("id") or "") not in dismissed:
+                    dismissed.append(str(d.get("id")))
+        ov["dismissed_defect_ids"] = dismissed
+        needs_full_image_rescan = True
+    elif err_type == "centering_sleeve_rim":
+        req_inset = p.get("sleeveInsetPct")
+        if req_inset is not None:
+            ov["sleeve_inset_pct"] = round(float(np.clip(float(req_inset), 0.0, 0.12)), 4)
+        else:
+            ov["sleeve_inset_pct"] = round(min(0.10, float(ov.get("sleeve_inset_pct") or 0.0) + 0.025), 4)
+        needs_full_image_rescan = True
+    elif err_type == "missed_real_defect":
+        md_in = p.get("manualDefect") if isinstance(p.get("manualDefect"), dict) else {}
+        cat = str(md_in.get("category") or "surface").lower()
+        if cat not in ("corners", "edges", "surface"):
+            cat = "surface"
+        dtype = str(md_in.get("type") or ("corner_whitening" if cat == "corners" else ("edge_chipping" if cat == "edges" else "surface_scratch")))
+        sev = float(md_in.get("severity") or 0.5)
+        zone = str(md_in.get("zone") or "mid-center")
+        m_side = "Front" if side_sel not in ("Front", "Back") else side_sel
+        bbox_n = p.get("bboxNorm") if isinstance(p.get("bboxNorm"), list) and len(p.get("bboxNorm")) == 4 else [0.35, 0.35, 0.30, 0.30]
+        m_id = f"{m_side.lower()}-manual-{dtype}-{int(time.time() * 1000) % 100000}"
+        style = "arrow" if cat == "edges" else ("circle" if (cat == "corners" or dtype in ("dimple_dent", "print_spot_fisheye")) else "box")
+        manual_list = list(ov.get("manual_defects") or [])
+        manual_list.append({
+            "id": m_id,
+            "side": m_side,
+            "category": cat,
+            "target": cat,
+            "type": dtype,
+            "severity": sev,
+            "penalty": sev,
+            "confidence": 1.0,
+            "bbox_norm": [round(float(v), 4) for v in bbox_n],
+            "marker_style": style,
+            "zone": zone,
+            "label": f"{m_side} {dtype.replace('_', ' ')} ({zone}, user flagged)",
+            "source": "user_flagged",
+        })
+        ov["manual_defects"] = manual_list
+    elif err_type == "subgrade_calibration":
+        sub_ov = dict(ov.get("subgrade_overrides") or {})
+        tgt_sub = str(p.get("targetSubgrade") or "").strip().lower()
+        corr_val = p.get("correctedScore")
+        if tgt_sub in ("centering", "corners", "edges", "surface") and corr_val is not None:
+            sub_ov[tgt_sub] = _round_half_grade(float(corr_val), 1.0, 10.0)
+        ov["subgrade_overrides"] = sub_ov
+
+    if needs_full_image_rescan and f_p is not None and b_p is not None:
+        with Image.open(f_p) as fim:
+            f_img = fim.convert("RGB")
+        with Image.open(b_p) as bim:
+            b_img = bim.convert("RGB")
+        csv_grade, updated_diag = estimate_card_pregrade(
+            f_img,
+            b_img,
+            overrides=ov,
+            return_diagnostics=True,
+            diagnostics_path=diag_path,
+            sku=resolved["sku"],
+            front_file=f_p.name,
+            back_file=b_p.name,
+            source_images_meta=diag.get("source_images"),
+        )
+    else:
+        csv_grade, updated_diag = recompute_grades_from_diagnostics(diag, overrides=ov)
+        save_grading_diagnostics(diag_path, updated_diag)
+
+    df = _apply_csv_grade_and_cache_roi(df, r_idx, csv_grade, is_inventory=is_inv)
+    if is_inv:
+        saved_df = save_inventory_df(df)
+        updated_card = saved_df[saved_df["SKU"].astype(str).str.strip() == resolved["sku"]].iloc[0].to_dict()
+        extra_rows = {"rows": saved_df.to_dict(orient="records")}
+    else:
+        man_p = resolved["manifest_path"]
+        atomic_write_text(man_p, df.to_csv(index=False), encoding="utf-8-sig")
+        updated_card = df.loc[r_idx].to_dict()
+        extra_rows = {"cards": df.to_dict(orient="records")}
+
+    grades_after = {
+        "Est_PSA": str(updated_card.get("Est_PSA") or ""),
+        "Est_BGS": str(updated_card.get("Est_BGS") or ""),
+        "Sub_Centering": str(updated_card.get("Sub_Centering") or ""),
+        "Sub_Corners": str(updated_card.get("Sub_Corners") or ""),
+        "Sub_Edges": str(updated_card.get("Sub_Edges") or ""),
+        "Sub_Surface": str(updated_card.get("Sub_Surface") or ""),
+    }
+
+    feedback_record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "target_type": resolved["target_type"],
+        "batch_name": resolved["batch_name"],
+        "sku": resolved["sku"],
+        "card_metadata": {
+            "Set": str(row_d.get("Set") or ""),
+            "Subset": str(row_d.get("Subset") or row_d.get("Subset_Parallel") or ""),
+            "Card_Number": str(row_d.get("Card Number") or row_d.get("Card_Number") or ""),
+            "Player": str(row_d.get("Player") or ""),
+        },
+        "front_image_path": str(f_p or ""),
+        "back_image_path": str(b_p or ""),
+        "error_type": err_type,
+        "side": side_sel,
+        "target_item_id": target_item_id,
+        "bbox_norm": p.get("bboxNorm") or (orig_detection.get("bbox_norm") if isinstance(orig_detection, dict) else None),
+        "original_detection": orig_detection,
+        "user_correction": {
+            "manual_defect": p.get("manualDefect"),
+            "target_subgrade": p.get("targetSubgrade"),
+            "corrected_score": p.get("correctedScore"),
+            "sleeve_inset_pct": ov.get("sleeve_inset_pct"),
+            "light_border_mode": ov.get("light_border_mode"),
+            "notes": notes_txt,
+        },
+        "grades_before": grades_before,
+        "grades_after": grades_after,
+    }
+    CACHE_GRADING_FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
+    with interprocess_file_lock(GRADING_FEEDBACK_LOG_FILE.with_suffix(".lock")):
+        with open(GRADING_FEEDBACK_LOG_FILE, "a", encoding="utf-8") as fb_f:
+            fb_f.write(json.dumps(feedback_record, ensure_ascii=False) + "\n")
+
+    return {
+        "success": True,
+        "sku": resolved["sku"],
+        "card": updated_card,
+        "diagnostics": updated_diag,
+        "gradesBefore": grades_before,
+        "gradesAfter": grades_after,
+        "feedbackLogged": True,
+        **extra_rows,
     }
 
 

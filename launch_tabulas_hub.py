@@ -1132,6 +1132,66 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw_bytes)
             return
 
+        if route == "/api/grading/crop":
+            import io
+            from PIL import Image
+            from Core.vision_grader import resolve_card_row_and_images
+
+            t_type = str((query.get("targetType") or ["inventory"])[0] or "inventory").strip().lower()
+            sku_v = str((query.get("sku") or [""])[0] or "").strip()
+            b_name = str((query.get("batchName") or [""])[0] or "").strip()
+            side_v = str((query.get("side") or ["front"])[0] or "front").strip().lower()
+            try:
+                nx = float((query.get("x") or ["0"])[0] or 0.0)
+                ny = float((query.get("y") or ["0"])[0] or 0.0)
+                nw = float((query.get("w") or ["0.15"])[0] or 0.15)
+                nh = float((query.get("h") or ["0.15"])[0] or 0.15)
+                pad_f = float((query.get("pad") or ["0.03"])[0] or 0.03)
+                out_sz = max(64, min(512, int((query.get("size") or ["240"])[0] or 240)))
+            except Exception:
+                self._send_json({"success": False, "error": "Invalid crop coordinates."}, status=400)
+                return
+
+            resolved = resolve_card_row_and_images(t_type, sku_v, batch_name=b_name)
+            if not resolved.get("success"):
+                self._send_json(resolved, status=404)
+                return
+            img_p = resolved.get("back_path") if side_v == "back" else resolved.get("front_path")
+            if img_p is None:
+                img_p = resolved.get("front_path") or resolved.get("back_path")
+            if img_p is None or not Path(img_p).exists():
+                self._send_json({"success": False, "error": "Card image not found."}, status=404)
+                return
+
+            resolved_img = Path(img_p).resolve()
+            allowed_root = BATCHES_DIR.resolve() if t_type == "batch" else REVIEWED_CARDS_DIR.resolve()
+            if not str(resolved_img).startswith(str(allowed_root)):
+                self._send_json({"success": False, "error": "Forbidden image path."}, status=403)
+                return
+
+            try:
+                with Image.open(resolved_img) as im:
+                    rgb = im.convert("RGB")
+                    iw, ih = rgb.size
+                    pad_f = max(0.0, min(0.25, pad_f))
+                    cx1 = max(0, int(round((nx - pad_f) * iw)))
+                    cy1 = max(0, int(round((ny - pad_f) * ih)))
+                    cx2 = min(iw, max(cx1 + 16, int(round((nx + nw + pad_f) * iw))))
+                    cy2 = min(ih, max(cy1 + 16, int(round((ny + nh + pad_f) * ih))))
+                    crop_im = rgb.crop((cx1, cy1, cx2, cy2)).resize((out_sz, out_sz), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    crop_im.save(buf, format="JPEG", quality=92)
+                    jpg_bytes = buf.getvalue()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "private, max-age=60")
+                self.send_header("Content-Length", str(len(jpg_bytes)))
+                self.end_headers()
+                self.wfile.write(jpg_bytes)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, status=500)
+            return
+
         if route == "/api/lanes":
             self._send_json(_get_live_lanes_and_logs())
             return
@@ -2070,6 +2130,53 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 self._send_json(res_rep)
             else:
                 self._send_json(res_rep, status=400)
+            return
+
+        if route == "/api/grading/inspect-card" and isinstance(payload, dict):
+            from Core.vision_grader import inspect_card_grading_diagnostics
+            t_type = str(payload.get("targetType") or "inventory").strip().lower()
+            sku_v = str(payload.get("sku") or "").strip()
+            b_name = str(payload.get("batchName") or "").strip()
+            force_r = bool(payload.get("forceRecompute", False))
+            reset_ov = bool(payload.get("resetOverrides", False))
+            try:
+                res_insp = inspect_card_grading_diagnostics(
+                    target_type=t_type,
+                    sku=sku_v,
+                    batch_name=b_name,
+                    force_recompute=force_r,
+                    reset_overrides=reset_ov,
+                )
+                self._send_json(res_insp, status=200 if res_insp.get("success") else 404)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, status=500)
+            return
+
+        if route == "/api/grading/flag-error" and isinstance(payload, dict):
+            from Core.vision_grader import flag_grading_error_and_reevaluate
+            t_type = str(payload.get("targetType") or "inventory").strip().lower()
+            sku_v = str(payload.get("sku") or "").strip()
+            b_name = str(payload.get("batchName") or "").strip()
+            try:
+                res_flag = flag_grading_error_and_reevaluate(
+                    target_type=t_type,
+                    sku=sku_v,
+                    batch_name=b_name,
+                    payload=payload,
+                )
+                if res_flag.get("success"):
+                    gb = res_flag.get("gradesBefore") or {}
+                    ga = res_flag.get("gradesAfter") or {}
+                    _log_ui_action_to_file(
+                        "Grading",
+                        f"Flag Error ({payload.get('errorType', 'feedback')}) — SKU {sku_v}",
+                        f"PSA {gb.get('Est_PSA', '?')}->{ga.get('Est_PSA', '?')} | BGS {gb.get('Est_BGS', '?')}->{ga.get('Est_BGS', '?')}",
+                    )
+                    self._send_json(res_flag, status=200)
+                else:
+                    self._send_json(res_flag, status=400)
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, status=500)
             return
 
         if route == "/api/batches/commit" and isinstance(payload, dict):
