@@ -55,6 +55,8 @@ from Core.config import (
     PRICECHARTING_API_KEY,
     PSA_PROB_MATRIX,
     RUNTIME_CONFIG,
+    atomic_write_bytes,
+    atomic_write_text,
     canonical_subset_key,
     ensure_directories,
     format_print_run,
@@ -107,6 +109,9 @@ MARKET_COMPS_COLUMNS = [
     "PSA_10",
     "BGS_10",
     "Sales_Volume",
+    "Valuation_Source",
+    "Comp_Count",
+    "Comp_Confidence",
     "Card_URL",
     "Comp_URL",
     "Source_URL",
@@ -142,13 +147,83 @@ def _abbreviate_turnaround(turnaround_raw: str) -> str:
     return s
 
 
-def build_comp_key(set_name: str, subset_name: str, card_number: str, player_name: str = "") -> str:
-    """Builds a canonical lookup key for market_comps_cache.csv."""
+def build_comp_key(
+    set_name: str,
+    subset_name: str,
+    card_number: str,
+    player_name: str = "",
+    print_run: str = "",
+) -> str:
+    """Builds a canonical lookup key for market_comps_cache.csv (print-run-aware)."""
     s_k = norm(set_name)
     sub_k = canonical_subset_key(subset_name, set_name)
     cn_k = norm(str(card_number or "").lstrip("#"))
     p_k = norm(player_name)
+    pr_k = format_print_run(print_run)
+    if pr_k:
+        return f"{s_k}|{sub_k}|{cn_k}|{p_k}|/{pr_k}"
     return f"{s_k}|{sub_k}|{cn_k}|{p_k}"
+
+
+def _lookup_comp_row(
+    comps_by_key: dict[str, dict],
+    set_name: str,
+    subset_name: str,
+    card_number: str,
+    player_name: str = "",
+    print_run: str = "",
+) -> Optional[dict]:
+    """
+    Looks up a comp record by print-run-aware key first, falling back to the 4-part
+    legacy key ONLY when the cached row's Print Run matches `print_run`.
+    """
+    if not comps_by_key:
+        return None
+    pr_k = format_print_run(print_run)
+    exact_key = build_comp_key(set_name, subset_name, card_number, player_name, print_run=pr_k)
+    if exact_key in comps_by_key:
+        return comps_by_key[exact_key]
+    if pr_k:
+        legacy_key = build_comp_key(set_name, subset_name, card_number, player_name, print_run="")
+        cand = comps_by_key.get(legacy_key)
+        if cand is not None and format_print_run(cand.get("Print Run", "")) == pr_k:
+            return cand
+    return None
+
+
+def _resolve_comp_valuation_source(comp_row: Optional[dict]) -> tuple[str, bool]:
+    """
+    Determines `(valuation_source, is_verified)` for a cached comp row, including
+    backward compatibility for legacy Market_Comps.csv rows that lack `Valuation_Source`.
+    """
+    if not comp_row or _safe_float(comp_row.get("Ungraded"), 0.0) <= 0.0:
+        return "Uncomped", False
+
+    raw_src = str(comp_row.get("Valuation_Source") or "").strip()
+    src_low = raw_src.lower()
+    if raw_src:
+        if src_low in ("verified median comp", "verified scp exact"):
+            return raw_src, True
+        if any(tok in src_low for tok in ("uncomped", "proxy", "estimated")):
+            return "Uncomped", False
+
+    # Legacy row without Valuation_Source: verify it has a real Card_URL / Source_URL and is not a proxy/estimate
+    sales_vol = str(comp_row.get("Sales_Volume") or "").strip().lower()
+    if any(tok in sales_vol for tok in ("proxy", "estimated", "uncomped")):
+        return "Uncomped", False
+
+    card_u = str(comp_row.get("Card_URL") or "").strip()
+    source_u = str(comp_row.get("Source_URL") or "").strip()
+    comp_u = str(comp_row.get("Comp_URL") or "").strip()
+    if comp_u and card_u and comp_u != card_u:
+        return "Uncomped", False
+
+    if ("http" in card_u.lower() or "/game/" in card_u.lower()) or (
+        "http" in source_u.lower() or "/game/" in source_u.lower()
+    ):
+        return "Verified SCP Exact", True
+
+    return "Uncomped", False
 
 
 # ==============================================================================
@@ -398,23 +473,305 @@ _SCP_NON_BASE_SLUG_TOKENS = (
     "framed", "relic", "autograph", "auto", "chrome", "black-border", "gold-border",
     "no-number", "brooklyn-back", "ag-back", "a&g-back", "wood", "metal", "cloth",
     "silk", "rip-card", "glossy", "superfractor", "printing-plate", "refractor",
-    "x-fractor", "logofractor", "frozenfractor", "foilfractor", "prizm", "holo-foil",
-    "holofoil", "rainbow-foil", "diamante", "confetti", "spring-training", "companion",
-    "golden-mirror", "true-photo", "image-variation", "design-variation", "ssp",
-    "clear", "acetate", "canvas", "first-card", "vintage-stock", "independence-day",
+    "x-fractor", "xfractor", "logofractor", "frozenfractor", "foilfractor", "prizm", "prism",
+    "holo-foil", "holofoil", "rainbow-foil", "diamante", "confetti", "spring-training", "companion",
+    "golden-mirror", "true-photo", "image-variation", "design-variation", "img-var", "ssp", "sp",
+    "short-print", "clear", "acetate", "canvas", "first-card", "vintage-stock", "independence-day",
     "mothers-day", "fathers-day", "memorial-day", "camo", "black-finite", "gold-vinyl",
     "wave", "shimmer", "mojo", "sonar", "speckle", "pulsar", "raywave", "1-of-1",
     "blue", "green", "orange", "purple", "red", "pink", "aqua", "yellow", "gold", "black",
+    "silver", "emerald", "sapphire", "foilboard", "sepia", "negative", "atomic", "lava",
+    "cracked-ice", "patch", "jersey", "memorabilia", "bat", "signed", "numbered", "golden",
+    "geometric", "vintage", "logo",
 )
 
 _SCP_EXCLUSIVE_FINISH_TOKENS = (
-    "chrome", "refractor", "x-fractor", "superfractor", "logofractor",
+    "chrome", "refractor", "x-fractor", "xfractor", "superfractor", "logofractor",
     "frozenfractor", "foilfractor", "filigree", "portrait", "mini",
     "framed", "relic", "autograph", "auto", "tin-type", "tintype",
     "wood", "metal", "cloth", "silk", "rip", "brooklyn", "no-number",
     "glossy", "diamante", "confetti", "holofoil", "sonar", "wave",
     "shimmer", "mojo", "speckle", "camo", "acetate", "clear", "canvas",
+    "silver", "gold", "blue", "green", "orange", "purple", "red", "pink", "aqua",
+    "yellow", "black", "emerald", "sapphire", "foilboard", "sepia", "negative",
+    "atomic", "lava", "cracked-ice", "patch", "jersey", "memorabilia", "prism", "prizm",
 )
+
+_SET_EDITION_MUTEX_GROUPS = (
+    ("ALLEN", "allen"),
+    ("CHROME", "chrome"),
+    ("SAPPHIRE", "sapphire"),
+    ("HERITAGE", "heritage"),
+    ("UPDATE", "update"),
+    ("SERIES 1", "series-1"),
+    ("SERIES 2", "series-2"),
+    ("BOWMAN", "bowman"),
+    ("FINEST", "finest"),
+    ("STADIUM CLUB", "stadium-club"),
+    ("HOLIDAY", "holiday"),
+    ("PRIZM", "prizm"),
+    ("OPTIC", "optic"),
+    ("SELECT", "select"),
+    ("MOSAIC", "mosaic"),
+    ("DONRUSS", "donruss"),
+    ("COSMIC", "cosmic"),
+    ("LOGOFRACTOR", "logofractor"),
+    ("ARCHIVE", "archive"),
+    ("INCEPTION", "inception"),
+    ("STERLING", "sterling"),
+    ("DRAFT", "draft"),
+    ("MEGA", "mega"),
+    ("OPENING DAY", "opening-day"),
+    ("BIG LEAGUE", "big-league"),
+    ("GYPSY QUEEN", "gypsy-queen"),
+    ("GALLERY", "gallery"),
+    ("MUSEUM", "museum"),
+    ("TIER ONE", "tier-one"),
+    ("TRIPLE THREADS", "triple-threads"),
+)
+
+_NOISE_LOT_RE = re.compile(
+    r"(?:\b(?:lot|bundle|complete\s+set|team\s+set|set\s+of|pick\s+your|you\s+pick|u-?pick|"
+    r"complete\s+your\s+set|break|sealed\s+(?:box|pack|case)|hobby\s+box|blaster\s+box|"
+    r"repack|mystery|digital|bunt|reprint|custom)\b|"
+    r"\b\d+\s*x\b|\bx\s*\d+\b|\(\s*\d+\s*(?:cards?)?\s*\)|\b\d+\s+cards?\b)",
+    re.IGNORECASE,
+)
+
+_SLAB_TITLE_RE = re.compile(
+    r"(?:\b(?:psa|bgs|sgc|cgc|csg|bvg|hga|tag|bccg|gma|isa|ksa)\b|"
+    r"\bgem\s*mt\b|\bgem\s*mint\s*10\b|\bmint\s*9\b|\bnm-?mt\s*8\b|"
+    r"\bpristine\s*10\b|\bslab(?:bed)?\b|\bgraded\b|\bpop\s+\d+\b)",
+    re.IGNORECASE,
+)
+
+
+def _extract_serial_print_runs_from_text(text: str, is_slug: bool = False) -> set[str]:
+    """Extracts serial-number denominators (e.g. '50', '99', '1') from a listing title or URL slug."""
+    found: set[str] = set()
+    s = str(text or "").strip().lower()
+    if not s:
+        return found
+    if is_slug:
+        if "1-of-1" in s or "one-of-one" in s or "1-1" in s:
+            found.add("1")
+        for m in re.finditer(r"(?:out-of|numbered-to|to)-(\d{1,4})\b", s):
+            found.add(m.group(1).lstrip("0") or "1")
+    else:
+        if re.search(r"\b1\s*/\s*1\b|\b1\s+of\s+1\b", s):
+            found.add("1")
+        for m in re.finditer(r"(?:#\s*/\s*|(?:\d+\s*/\s*)|(?<!\w)/\s*|out\s+of\s+)(\d{1,4})\b", s):
+            denom = m.group(1).lstrip("0")
+            if denom:
+                found.add(denom)
+    return found
+
+
+def is_comp_listing_exact_match(
+    title: str,
+    set_name: str,
+    subset_name: str,
+    card_number: str,
+    player_name: str,
+    print_run: str = "",
+    expected_raw: bool = True,
+    expected_grader: str = "",
+    expected_grade: str = "",
+) -> tuple[bool, str]:
+    """
+    Validates a completed-sale listing title against the exact card identity:
+      - Rejects multi-card lots, breaks, sealed boxes, digital/reprint/custom listings.
+      - Enforces Raw vs. Graded status (rejects slabs when pricing raw; requires matching grader+grade when pricing graded).
+      - Enforces Year, Set Brand/Edition, Card Number, Player, Subset/Parallel, and Print Run (#/N).
+    Returns `(True, "")` on exact match or `(False, reason)` on rejection.
+    """
+    t_clean = strip_accents(str(title or "")).strip()
+    if not t_clean:
+        return False, "empty_title"
+    t_low = t_clean.lower()
+    set_clean = strip_accents(str(set_name or "")).strip()
+    set_low = set_clean.lower()
+    sub_clean = strip_accents(str(subset_name or "Base")).strip()
+    sub_low = sub_clean.lower().replace("a&g", "ag").replace("a and g", "ag")
+
+    # 1. Lot / non-single rejection (unless target set/subset explicitly contains the word)
+    m_lot = _NOISE_LOT_RE.search(t_low)
+    if m_lot:
+        matched_w = m_lot.group(0).strip().lower()
+        if matched_w not in set_low and matched_w not in sub_low:
+            return False, "lot_or_non_single"
+
+    # 2. Raw vs. Graded enforcement
+    has_slab = bool(_SLAB_TITLE_RE.search(t_low))
+    if expected_raw and has_slab:
+        return False, "graded_slab"
+    if not expected_raw and expected_grader and expected_grade:
+        g_tok = str(expected_grader).strip().lower()
+        gr_num = str(expected_grade).strip().lower()
+        if not re.search(rf"\b{re.escape(g_tok)}\b", t_low):
+            return False, "grader_mismatch"
+        if not re.search(rf"(?<!\d){re.escape(gr_num)}(?!\d)", t_low):
+            return False, "grade_mismatch"
+
+    # 3. Year match
+    yr_m = re.search(r"\b(19\d\d|20\d\d)\b", set_clean)
+    if yr_m and yr_m.group(1) not in t_low:
+        return False, "year_mismatch"
+
+    # 4. Set Brand / Edition mutual exclusion
+    set_up = set_clean.upper()
+    for kw_up, kw_slug in _SET_EDITION_MUTEX_GROUPS:
+        kw_words = kw_slug.replace("-", " ")
+        in_target = kw_up in set_up
+        in_title = bool(re.search(rf"\b{re.escape(kw_words)}\b", t_low))
+        if in_target and not in_title:
+            return False, f"missing_set_edition:{kw_words}"
+        if not in_target and in_title and kw_words not in sub_low:
+            return False, f"unexpected_set_edition:{kw_words}"
+
+    # 5. Exact Card Number boundary match
+    cn_clean = strip_accents(str(card_number or "")).strip().lstrip("#").lower()
+    if cn_clean:
+        if not re.search(rf"(?<![a-z0-9])#?{re.escape(cn_clean)}(?![a-z0-9])", t_low):
+            return False, "card_number_mismatch"
+
+    # 6. Player match
+    p_tokens = [t for t in re.findall(r"[a-z0-9]{2,}", strip_accents(str(player_name or "")).lower()) if t not in ("jr", "sr", "ii", "iii", "iv")]
+    if p_tokens:
+        last_tok = p_tokens[-1]
+        if not re.search(rf"\b{re.escape(last_tok)}\b", t_low):
+            return False, "player_mismatch"
+        if len(p_tokens) >= 2:
+            first_tok = p_tokens[0]
+            if not (re.search(rf"\b{re.escape(first_tok)}\b", t_low) or re.search(rf"\b{re.escape(first_tok[0])}\.?\s+{re.escape(last_tok)}\b", t_low)):
+                return False, "player_first_mismatch"
+
+    # 7. Print Run (#/N) match
+    pr_clean = format_print_run(print_run)
+    title_prs = _extract_serial_print_runs_from_text(t_clean, is_slug=False)
+    if pr_clean:
+        if title_prs and pr_clean not in title_prs:
+            return False, "print_run_mismatch"
+    else:
+        if title_prs:
+            return False, "unexpected_print_run"
+
+    # 8. Subset / Parallel match
+    set_words = set(re.findall(r"[a-z0-9]{2,}", set_low))
+    if sub_low in ("", "base", "base set"):
+        for bad_tok in _SCP_NON_BASE_SLUG_TOKENS:
+            bad_w = bad_tok.replace("-", " ")
+            if bad_w in set_words or bad_w in set_low:
+                continue
+            if re.search(rf"\b{re.escape(bad_w)}\b", t_low):
+                return False, f"non_base_token:{bad_w}"
+    else:
+        sub_tokens = [
+            t for t in re.findall(r"[a-z0-9]{2,}", sub_low)
+            if t not in ("base", "variation", "variations", "parallel", "card", "cards", "set", "the", "and", "back", "border", "bordered")
+        ]
+        if sub_tokens and not all(re.search(rf"\b{re.escape(st)}\b", t_low) for st in sub_tokens):
+            return False, "subset_token_missing"
+        for excl_tok in _SCP_EXCLUSIVE_FINISH_TOKENS:
+            excl_w = excl_tok.replace("-", " ")
+            if excl_w in sub_low or excl_w in set_low:
+                continue
+            if re.search(rf"\b{re.escape(excl_w)}\b", t_low):
+                return False, f"conflicting_finish:{excl_w}"
+
+    return True, ""
+
+
+def compute_trimmed_median_comp_price(prices: list[float]) -> dict:
+    """
+    Computes the outlier-trimmed median market price from matched completed sales:
+      - n == 0: returns price=None, confidence="None"
+      - n == 1: returns single value, confidence="Medium"
+      - n == 2: if max/min > 4.0, uses conservative lower value and marks confidence="Low"
+      - n >= 3: applies 1.5*IQR + 3x median ratio outlier rejection, then returns median of inliers
+    """
+    vals = []
+    for p in prices or []:
+        try:
+            f = float(p)
+            if np.isfinite(f) and f > 0.0:
+                vals.append(f)
+        except Exception:
+            continue
+
+    n = len(vals)
+    if n == 0:
+        return {
+            "price": None,
+            "sample_count": 0,
+            "raw_count": 0,
+            "rejected_outliers": 0,
+            "min_comp": None,
+            "max_comp": None,
+            "confidence": "None",
+        }
+    if n == 1:
+        v = round(vals[0], 2)
+        return {
+            "price": v,
+            "sample_count": 1,
+            "raw_count": 1,
+            "rejected_outliers": 0,
+            "min_comp": v,
+            "max_comp": v,
+            "confidence": "Medium",
+        }
+    if n == 2:
+        lo, hi = sorted(vals)
+        if hi / lo > 4.0:
+            v_lo = round(lo, 2)
+            return {
+                "price": v_lo,
+                "sample_count": 1,
+                "raw_count": 2,
+                "rejected_outliers": 1,
+                "min_comp": v_lo,
+                "max_comp": v_lo,
+                "confidence": "Low",
+            }
+        mid = round((lo + hi) / 2.0, 2)
+        return {
+            "price": mid,
+            "sample_count": 2,
+            "raw_count": 2,
+            "rejected_outliers": 0,
+            "min_comp": round(lo, 2),
+            "max_comp": round(hi, 2),
+            "confidence": "Medium",
+        }
+
+    arr = np.array(sorted(vals), dtype=float)
+    q1, q3 = np.percentile(arr, [25, 75])
+    iqr = float(q3 - q1)
+    raw_med = float(np.median(arr))
+
+    if iqr > 0.0:
+        lo_bound = max(raw_med / 3.0, float(q1) - 1.5 * iqr)
+        hi_bound = min(raw_med * 3.0, float(q3) + 1.5 * iqr)
+    else:
+        lo_bound = raw_med / 3.0
+        hi_bound = raw_med * 3.0
+
+    inliers = [float(v) for v in arr if lo_bound <= float(v) <= hi_bound]
+    if not inliers:
+        inliers = [float(v) for v in arr]
+
+    med = round(float(np.median(inliers)), 2)
+    confidence = "High" if len(inliers) >= 3 else "Medium"
+    return {
+        "price": med,
+        "sample_count": len(inliers),
+        "raw_count": n,
+        "rejected_outliers": n - len(inliers),
+        "min_comp": round(float(min(inliers)), 2),
+        "max_comp": round(float(max(inliers)), 2),
+        "confidence": confidence,
+    }
 
 
 def _classify_sportscardspro_slug_match(
@@ -423,6 +780,7 @@ def _classify_sportscardspro_slug_match(
     subset_name: str,
     card_number: str,
     player_name: str,
+    print_run: str = "",
 ) -> str:
     u_low = str(source_url or "").strip().lower()
     if "/game/" not in u_low:
@@ -438,25 +796,39 @@ def _classify_sportscardspro_slug_match(
         return "MISMATCH"
 
     set_up = str(set_name or "").upper()
-    if "ALLEN" in set_up and "allen" not in set_slug:
-        return "MISMATCH"
-    if "ALLEN" not in set_up and "allen" in set_slug:
-        return "MISMATCH"
-    if "CHROME" not in set_up and "chrome" in set_slug:
-        return "MISMATCH"
-    if "BOWMAN" not in set_up and "bowman" in set_slug:
-        return "MISMATCH"
-    if "HOLIDAY" not in set_up and "holiday" in set_slug:
-        return "MISMATCH"
+    sub_clean = strip_accents(str(subset_name or "Base")).strip().lower()
+    sub_norm = sub_clean.replace("a&g", "ag").replace("a and g", "ag")
+
+    for kw_up, kw_slug in _SET_EDITION_MUTEX_GROUPS:
+        in_set = kw_up in set_up
+        in_slug = kw_slug in set_slug
+        if in_set and not in_slug:
+            return "MISMATCH"
+        if not in_set and in_slug and kw_slug.replace("-", " ") not in sub_norm:
+            return "MISMATCH"
 
     cn_clean = re.sub(r"[^a-z0-9]+", "-", strip_accents(str(card_number or "")).lower().lstrip("#")).strip("-")
-    if cn_clean and not (card_slug.endswith(f"-{cn_clean}") or f"-{cn_clean}-" in card_slug or card_slug == cn_clean):
+    if cn_clean and not (
+        card_slug.endswith(f"-{cn_clean}")
+        or f"-{cn_clean}-" in card_slug
+        or card_slug == cn_clean
+    ):
         return "MISMATCH"
 
     p_slug = re.sub(r"[^a-z0-9]+", "-", strip_accents(str(player_name or "")).lower()).strip("-")
     p_tokens = [t for t in p_slug.split("-") if len(t) >= 3]
-    if p_tokens and not all(pt in card_slug for pt in p_tokens[:2]):
+    if p_tokens and not all(re.search(rf"(?:^|-){re.escape(pt)}(?:-|$)", card_slug) for pt in p_tokens[:2]):
         return "MISMATCH"
+
+    # Print-run compatibility on slug
+    pr_clean = format_print_run(print_run)
+    slug_prs = _extract_serial_print_runs_from_text(card_slug, is_slug=True)
+    if pr_clean:
+        if slug_prs and pr_clean not in slug_prs:
+            return "MISMATCH"
+    else:
+        if slug_prs:
+            return "MISMATCH"
 
     rem_slug = card_slug
     for p_tok in [t for t in p_slug.split("-") if len(t) >= 2]:
@@ -465,13 +837,10 @@ def _classify_sportscardspro_slug_match(
         rem_slug = re.sub(rf"\b{re.escape(cn_clean)}\b", "", rem_slug)
     rem_slug = re.sub(r"-+", "-", rem_slug).strip("-")
 
-    sub_clean = strip_accents(str(subset_name or "Base")).strip().lower()
-    sub_norm = sub_clean.replace("a&g", "ag").replace("a and g", "ag")
-
     if sub_clean in ("", "base", "base set"):
         if rem_slug:
             for bad_tok in _SCP_NON_BASE_SLUG_TOKENS:
-                if bad_tok in rem_slug or bad_tok in card_slug:
+                if bad_tok in rem_slug or (bad_tok not in set_slug and re.search(rf"(?:^|-){re.escape(bad_tok)}(?:-|$)", card_slug)):
                     return "MISMATCH"
             allowed_base_extras = {"series-1", "series-2", "update", "base", "rc", "rookie"}
             extra_words = {w for w in rem_slug.split("-") if len(w) >= 2}
@@ -490,7 +859,7 @@ def _classify_sportscardspro_slug_match(
 
     has_conflicting_finish = False
     for excl_tok in _SCP_EXCLUSIVE_FINISH_TOKENS:
-        if excl_tok in rem_slug and excl_tok not in sub_norm:
+        if excl_tok in rem_slug and excl_tok.replace("-", " ") not in sub_norm and excl_tok not in sub_norm:
             has_conflicting_finish = True
             break
 
@@ -513,9 +882,12 @@ def _is_valid_sportscardspro_url_for_subset(
     subset_name: str,
     card_number: str,
     player_name: str,
+    print_run: str = "",
 ) -> bool:
     return (
-        _classify_sportscardspro_slug_match(source_url, set_name, subset_name, card_number, player_name)
+        _classify_sportscardspro_slug_match(
+            source_url, set_name, subset_name, card_number, player_name, print_run=print_run
+        )
         == "EXACT"
     )
 
@@ -524,23 +896,34 @@ def load_market_comps_cache() -> pd.DataFrame:
     ensure_directories()
     if not MARKET_COMPS_CACHE_FILE.exists():
         empty_df = pd.DataFrame(columns=MARKET_COMPS_COLUMNS)
-        empty_df.to_csv(MARKET_COMPS_CACHE_FILE, index=False, encoding="utf-8-sig")
+        atomic_write_text(MARKET_COMPS_CACHE_FILE, empty_df.to_csv(index=False), encoding="utf-8-sig")
         return empty_df
     try:
         df = pd.read_csv(MARKET_COMPS_CACHE_FILE, dtype=str, keep_default_na=False)
+        modified = False
         for col in MARKET_COMPS_COLUMNS:
             if col not in df.columns:
                 df[col] = ""
+                modified = True
 
         if not df.empty:
             keep_rows = []
-            modified = False
             for _, row in df.iterrows():
                 r_dict = row.to_dict()
                 s_n = r_dict.get("Set", "")
                 sub_n = r_dict.get("Subset", "Base")
                 c_n = r_dict.get("Card Number", "")
                 p_n = r_dict.get("Player", "")
+                pr_n = format_print_run(r_dict.get("Print Run", ""))
+                if r_dict.get("Print Run", "") != pr_n:
+                    r_dict["Print Run"] = pr_n
+                    modified = True
+
+                expected_ck = build_comp_key(s_n, sub_n, c_n, p_n, print_run=pr_n)
+                if not r_dict.get("Comp_Key") or (pr_n and r_dict.get("Comp_Key") != expected_ck):
+                    r_dict["Comp_Key"] = expected_ck
+                    modified = True
+
                 exact_u = build_sportscardspro_url(s_n, sub_n, c_n, p_n, keep_literal_ampersand=True)
 
                 curr_src = str(r_dict.get("Source_URL") or r_dict.get("Card_URL") or "").strip()
@@ -548,17 +931,17 @@ def load_market_comps_cache() -> pd.DataFrame:
                     r_dict["Card_URL"] = exact_u
                     modified = True
 
-                match_kind = _classify_sportscardspro_slug_match(curr_src, s_n, sub_n, c_n, p_n)
+                match_kind = _classify_sportscardspro_slug_match(curr_src, s_n, sub_n, c_n, p_n, print_run=pr_n)
                 if match_kind == "MISMATCH":
                     modified = True
                     continue
                 elif match_kind == "PROXY_COMP":
-                    if r_dict.get("Card_URL") != exact_u or r_dict.get("Comp_URL") != curr_src:
-                        r_dict["Card_URL"] = exact_u
-                        r_dict["Comp_URL"] = curr_src
-                        r_dict["Source_URL"] = exact_u
-                        comp_slug_tail = curr_src.rstrip("/").split("/")[-1]
-                        r_dict["Sales_Volume"] = f"Proxy Comp ({comp_slug_tail})"
+                    # Do not allow proxy comps to masquerade as verified exact comps
+                    if r_dict.get("Valuation_Source") != "Uncomped":
+                        r_dict["Valuation_Source"] = "Uncomped"
+                        r_dict["Ungraded"] = ""
+                        r_dict["Comp_Count"] = "0"
+                        r_dict["Comp_Confidence"] = "None"
                         modified = True
                 else:
                     if r_dict.get("Card_URL") != curr_src and "/game/" in curr_src:
@@ -567,16 +950,30 @@ def load_market_comps_cache() -> pd.DataFrame:
                     if r_dict.get("Comp_URL") == r_dict.get("Card_URL"):
                         r_dict["Comp_URL"] = ""
                         modified = True
+                    # Legacy backward compatibility: backfill Valuation_Source on verified cached rows
+                    if not str(r_dict.get("Valuation_Source") or "").strip():
+                        resolved_src, is_ver = _resolve_comp_valuation_source(r_dict)
+                        r_dict["Valuation_Source"] = resolved_src
+                        if not str(r_dict.get("Comp_Confidence") or "").strip():
+                            r_dict["Comp_Confidence"] = "Medium" if is_ver else "None"
+                        if not str(r_dict.get("Comp_Count") or "").strip():
+                            r_dict["Comp_Count"] = "0"
+                        modified = True
 
                 keep_rows.append(r_dict)
 
             df = pd.DataFrame(keep_rows, columns=MARKET_COMPS_COLUMNS) if keep_rows else pd.DataFrame(columns=MARKET_COMPS_COLUMNS)
             if modified:
-                df.to_csv(MARKET_COMPS_CACHE_FILE, index=False, encoding="utf-8-sig")
+                atomic_write_text(MARKET_COMPS_CACHE_FILE, df.to_csv(index=False), encoding="utf-8-sig")
+        elif modified:
+            atomic_write_text(MARKET_COMPS_CACHE_FILE, df[MARKET_COMPS_COLUMNS].to_csv(index=False), encoding="utf-8-sig")
 
         return df[MARKET_COMPS_COLUMNS]
     except Exception:
         return pd.DataFrame(columns=MARKET_COMPS_COLUMNS)
+
+
+load_market_comps_df = load_market_comps_cache
 
 
 def save_market_comps_cache(df: pd.DataFrame) -> pd.DataFrame:
@@ -586,7 +983,7 @@ def save_market_comps_cache(df: pd.DataFrame) -> pd.DataFrame:
         if col not in out.columns:
             out[col] = ""
     out = out.drop_duplicates(subset=["Comp_Key"], keep="last")[MARKET_COMPS_COLUMNS].reset_index(drop=True)
-    out.to_csv(MARKET_COMPS_CACHE_FILE, index=False, encoding="utf-8-sig")
+    atomic_write_text(MARKET_COMPS_CACHE_FILE, out.to_csv(index=False), encoding="utf-8-sig")
     return out
 
 
@@ -628,7 +1025,72 @@ def build_sportscardspro_url(
     return f"{SPORTSCARDSPRO_BASE_URL}/game/{sport_prefix}-{set_slug}/{card_slug}"
 
 
-def _parse_sportscardspro_html(html_text: str, url: str = "") -> Optional[dict]:
+def _extract_completed_sales_median_from_table(
+    soup,
+    table_id: str,
+    set_name: str = "",
+    subset_name: str = "Base",
+    card_number: str = "",
+    player_name: str = "",
+    print_run: str = "",
+    expected_raw: bool = True,
+    expected_grader: str = "",
+    expected_grade: str = "",
+) -> dict:
+    """Extracts and filters completed-sale rows from a SportsCardsPro auction table and computes trimmed median."""
+    tbl = soup.find(id=table_id)
+    if tbl is None:
+        return compute_trimmed_median_comp_price([])
+    matched_prices: list[float] = []
+    has_identity = bool(set_name or player_name or card_number)
+    for tr in tbl.find_all("tr"):
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        title_td = tr.find("td", class_="title") or (tds[1] if len(tds) > 1 else tds[0])
+        row_title = title_td.get_text(" ", strip=True)
+        if not row_title:
+            continue
+        price_td = tr.find("td", class_=re.compile(r"numeric|price", re.IGNORECASE))
+        price_val = 0.0
+        if price_td is not None:
+            price_val = _safe_float(price_td.get_text(" ", strip=True), 0.0)
+        if price_val <= 0:
+            for td_c in tds:
+                m_p = re.search(r"\$([0-9,]+\.\d{2}|[0-9,]+)", td_c.get_text(" ", strip=True))
+                if m_p:
+                    price_val = _safe_float(m_p.group(1), 0.0)
+                    if price_val > 0:
+                        break
+        if price_val <= 0:
+            continue
+        if has_identity:
+            is_ok, _ = is_comp_listing_exact_match(
+                row_title,
+                set_name=set_name,
+                subset_name=subset_name,
+                card_number=card_number,
+                player_name=player_name,
+                print_run=print_run,
+                expected_raw=expected_raw,
+                expected_grader=expected_grader,
+                expected_grade=expected_grade,
+            )
+            if not is_ok:
+                continue
+        matched_prices.append(price_val)
+    return compute_trimmed_median_comp_price(matched_prices)
+
+
+def _parse_sportscardspro_html(
+    html_text: str,
+    url: str = "",
+    set_name: str = "",
+    subset_name: str = "Base",
+    card_number: str = "",
+    player_name: str = "",
+    print_run: str = "",
+) -> Optional[dict]:
     if BeautifulSoup is None or not html_text:
         return None
     soup = BeautifulSoup(html_text, "html.parser")
@@ -671,6 +1133,63 @@ def _parse_sportscardspro_html(html_text: str, url: str = "") -> Optional[dict]:
                 if v > 0:
                     prices[k] = v
 
+    # Extract actual completed-sales trimmed medians when sold-listings tables are present
+    raw_med_stats = _extract_completed_sales_median_from_table(
+        soup,
+        "completed-auctions-used",
+        set_name=set_name,
+        subset_name=subset_name,
+        card_number=card_number,
+        player_name=player_name,
+        print_run=print_run,
+        expected_raw=True,
+    )
+    g9_med_stats = _extract_completed_sales_median_from_table(
+        soup,
+        "completed-auctions-graded",
+        set_name=set_name,
+        subset_name=subset_name,
+        card_number=card_number,
+        player_name=player_name,
+        print_run=print_run,
+        expected_raw=False,
+        expected_grader="PSA",
+        expected_grade="9",
+    )
+    bgs95_med_stats = _extract_completed_sales_median_from_table(
+        soup,
+        "completed-auctions-box-only",
+        set_name=set_name,
+        subset_name=subset_name,
+        card_number=card_number,
+        player_name=player_name,
+        print_run=print_run,
+        expected_raw=False,
+        expected_grader="BGS",
+        expected_grade="9.5",
+    )
+    psa10_med_stats = _extract_completed_sales_median_from_table(
+        soup,
+        "completed-auctions-manual-only",
+        set_name=set_name,
+        subset_name=subset_name,
+        card_number=card_number,
+        player_name=player_name,
+        print_run=print_run,
+        expected_raw=False,
+        expected_grader="PSA",
+        expected_grade="10",
+    )
+
+    if raw_med_stats["price"] is not None:
+        prices["Ungraded"] = raw_med_stats["price"]
+    if g9_med_stats["price"] is not None:
+        prices["Grade_9"] = g9_med_stats["price"]
+    if bgs95_med_stats["price"] is not None:
+        prices["BGS_9_5"] = bgs95_med_stats["price"]
+    if psa10_med_stats["price"] is not None:
+        prices["PSA_10"] = psa10_med_stats["price"]
+
     if not prices:
         return None
 
@@ -678,8 +1197,21 @@ def _parse_sportscardspro_html(html_text: str, url: str = "") -> Optional[dict]:
     vol_str = vol_m.group(1) if vol_m else "live_scp"
     raw_v = prices.get("Ungraded", 0.0)
     psa10_v = prices.get("PSA_10", 0.0)
-    bgs95_v = prices.get("BGS_9_5", round(psa10_v * 0.65, 2) if psa10_v > 0 else 0.0)
-    bgs10_v = prices.get("BGS_10", round(psa10_v * 1.35, 2) if psa10_v > 0 else 0.0)
+    bgs95_v = prices.get("BGS_9_5", 0.0)
+    bgs10_v = prices.get("BGS_10", 0.0)
+
+    if raw_med_stats["price"] is not None:
+        val_source = "Verified Median Comp"
+        comp_cnt = str(raw_med_stats["sample_count"])
+        comp_conf = raw_med_stats["confidence"]
+    elif raw_v > 0:
+        val_source = "Verified SCP Exact"
+        comp_cnt = "0"
+        comp_conf = "Medium"
+    else:
+        val_source = "Uncomped"
+        comp_cnt = "0"
+        comp_conf = "None"
 
     return {
         "Ungraded": f"{raw_v:.2f}" if raw_v > 0 else "",
@@ -690,6 +1222,9 @@ def _parse_sportscardspro_html(html_text: str, url: str = "") -> Optional[dict]:
         "PSA_10": f"{psa10_v:.2f}" if psa10_v > 0 else "",
         "BGS_10": f"{bgs10_v:.2f}" if bgs10_v > 0 else "",
         "Sales_Volume": vol_str,
+        "Valuation_Source": val_source,
+        "Comp_Count": comp_cnt,
+        "Comp_Confidence": comp_conf,
         "Source_URL": url,
     }
 
@@ -702,6 +1237,7 @@ def _parse_sportscardspro_search_results(
     subset_name: str,
     headers: dict,
     exact_card_url: str = "",
+    print_run: str = "",
 ) -> Optional[dict]:
     if BeautifulSoup is None or not html_text:
         return None
@@ -711,7 +1247,6 @@ def _parse_sportscardspro_search_results(
     target_sub = strip_accents(str(subset_name or "Base")).strip().lower()
 
     exact_candidates = []
-    proxy_candidates = []
 
     for tr in soup.find_all("tr"):
         a_game = tr.find("a", href=re.compile(r"/game/", re.IGNORECASE))
@@ -721,9 +1256,9 @@ def _parse_sportscardspro_search_results(
         full_game_url = href if href.startswith("http") else f"{SPORTSCARDSPRO_BASE_URL}{href if href.startswith('/') else '/' + href}"
 
         match_type = _classify_sportscardspro_slug_match(
-            full_game_url, set_name, subset_name, card_number, player_name
+            full_game_url, set_name, subset_name, card_number, player_name, print_run=print_run
         )
-        if match_type == "MISMATCH":
+        if match_type != "EXACT":
             continue
 
         title_cell = tr.find("td", class_="title") or a_game
@@ -753,28 +1288,29 @@ def _parse_sportscardspro_search_results(
         if has_inline_price:
             score += 15
 
-        cand_info = {
+        exact_candidates.append({
             "url": full_game_url,
             "score": score,
             "inline_prices": inline_prices,
             "has_price": has_inline_price,
-        }
-        if match_type == "EXACT":
-            exact_candidates.append(cand_info)
-        elif match_type == "PROXY_COMP" and has_inline_price:
-            proxy_candidates.append(cand_info)
+        })
 
     exact_candidates.sort(key=lambda x: x["score"], reverse=True)
-    proxy_candidates.sort(key=lambda x: x["score"], reverse=True)
-
-    resolved_exact_url = exact_candidates[0]["url"] if exact_candidates else exact_card_url
 
     if exact_candidates:
         best_ex = exact_candidates[0]
         try:
             g_resp = _adaptive_http_get("sportscardspro", best_ex["url"], headers=headers, timeout=10)
             if g_resp and g_resp.status_code == 200:
-                parsed_full = _parse_sportscardspro_html(g_resp.text, url=best_ex["url"])
+                parsed_full = _parse_sportscardspro_html(
+                    g_resp.text,
+                    url=best_ex["url"],
+                    set_name=set_name,
+                    subset_name=subset_name,
+                    card_number=card_number,
+                    player_name=player_name,
+                    print_run=print_run,
+                )
                 if parsed_full:
                     parsed_full["Card_URL"] = best_ex["url"]
                     parsed_full["Comp_URL"] = ""
@@ -795,42 +1331,13 @@ def _parse_sportscardspro_search_results(
                 "PSA_10": f"{psa10_v:.2f}" if psa10_v > 0 else "",
                 "BGS_10": f"{psa10_v * 1.35:.2f}" if psa10_v > 0 else "",
                 "Sales_Volume": "Exact Match",
+                "Valuation_Source": "Verified SCP Exact" if raw_v > 0 else "Uncomped",
+                "Comp_Count": "0",
+                "Comp_Confidence": "Medium" if raw_v > 0 else "None",
                 "Card_URL": best_ex["url"],
                 "Comp_URL": "",
                 "Source_URL": best_ex["url"],
             }
-
-    if proxy_candidates:
-        best_px = proxy_candidates[0]
-        px_slug_name = best_px["url"].rstrip("/").split("/")[-1]
-        try:
-            p_resp = _adaptive_http_get("sportscardspro", best_px["url"], headers=headers, timeout=10)
-            if p_resp and p_resp.status_code == 200:
-                parsed_px = _parse_sportscardspro_html(p_resp.text, url=best_px["url"])
-                if parsed_px:
-                    parsed_px["Card_URL"] = resolved_exact_url or exact_card_url
-                    parsed_px["Comp_URL"] = best_px["url"]
-                    parsed_px["Source_URL"] = resolved_exact_url or exact_card_url
-                    parsed_px["Sales_Volume"] = f"Proxy Comp ({px_slug_name})"
-                    return parsed_px
-        except Exception:
-            pass
-
-        ip = best_px["inline_prices"]
-        raw_v, g9_v, psa10_v = ip["Ungraded"], ip["Grade_9"], ip["PSA_10"]
-        return {
-            "Ungraded": f"{raw_v:.2f}" if raw_v > 0 else "",
-            "Grade_7": "",
-            "Grade_8": "",
-            "Grade_9": f"{g9_v:.2f}" if g9_v > 0 else "",
-            "BGS_9_5": f"{psa10_v * 0.65:.2f}" if psa10_v > 0 else "",
-            "PSA_10": f"{psa10_v:.2f}" if psa10_v > 0 else "",
-            "BGS_10": f"{psa10_v * 1.35:.2f}" if psa10_v > 0 else "",
-            "Sales_Volume": f"Proxy Comp ({px_slug_name})",
-            "Card_URL": resolved_exact_url or exact_card_url,
-            "Comp_URL": best_px["url"],
-            "Source_URL": resolved_exact_url or exact_card_url,
-        }
 
     return None
 
@@ -841,9 +1348,10 @@ def fetch_card_market_comps(
     card_number: str,
     player_name: str,
     print_run: str = "",
-    fallback_raw_price: float = 2.00,
+    fallback_raw_price: float = 0.0,
 ) -> dict:
-    comp_key = build_comp_key(set_name, subset_name, card_number, player_name)
+    pr_clean = format_print_run(print_run)
+    comp_key = build_comp_key(set_name, subset_name, card_number, player_name, print_run=pr_clean)
     direct_url = build_sportscardspro_url(set_name, subset_name, card_number, player_name, keep_literal_ampersand=True)
     alt_direct_url = build_sportscardspro_url(set_name, subset_name, card_number, player_name, keep_literal_ampersand=False)
     headers = {
@@ -860,9 +1368,19 @@ def fetch_card_market_comps(
         try:
             resp = _adaptive_http_get("sportscardspro", cand_u, headers=headers, timeout=10)
             if resp and resp.status_code == 200 and "Ungraded" in resp.text:
-                if _is_valid_sportscardspro_url_for_subset(resp.url, set_name, subset_name, card_number, player_name):
+                if _is_valid_sportscardspro_url_for_subset(
+                    resp.url, set_name, subset_name, card_number, player_name, print_run=pr_clean
+                ):
                     verified_exact_url = resp.url
-                    extracted = _parse_sportscardspro_html(resp.text, url=resp.url)
+                    extracted = _parse_sportscardspro_html(
+                        resp.text,
+                        url=resp.url,
+                        set_name=set_name,
+                        subset_name=subset_name,
+                        card_number=card_number,
+                        player_name=player_name,
+                        print_run=pr_clean,
+                    )
                     if extracted:
                         extracted["Card_URL"] = verified_exact_url
                         extracted["Comp_URL"] = ""
@@ -876,29 +1394,31 @@ def fetch_card_market_comps(
         q_parts = [set_name, f"#{str(card_number).lstrip('#')}", first_player]
         if subset_name and subset_name.lower() != "base":
             q_parts.append(subset_name)
+        if pr_clean:
+            q_parts.append(f"/{pr_clean}")
         search_url = f"{SPORTSCARDSPRO_BASE_URL}/search-products?q={quote(' '.join(q_parts))}&type=prices"
         try:
             s_resp = _adaptive_http_get("sportscardspro", search_url, headers=headers, timeout=12, allow_redirects=True)
             if s_resp and s_resp.status_code == 200:
                 if "/game/" in s_resp.url:
                     match_kind = _classify_sportscardspro_slug_match(
-                        s_resp.url, set_name, subset_name, card_number, player_name
+                        s_resp.url, set_name, subset_name, card_number, player_name, print_run=pr_clean
                     )
                     if match_kind == "EXACT":
                         verified_exact_url = s_resp.url
-                        extracted = _parse_sportscardspro_html(s_resp.text, url=s_resp.url)
+                        extracted = _parse_sportscardspro_html(
+                            s_resp.text,
+                            url=s_resp.url,
+                            set_name=set_name,
+                            subset_name=subset_name,
+                            card_number=card_number,
+                            player_name=player_name,
+                            print_run=pr_clean,
+                        )
                         if extracted:
                             extracted["Card_URL"] = verified_exact_url
                             extracted["Comp_URL"] = ""
                             extracted["Source_URL"] = verified_exact_url
-                    elif match_kind == "PROXY_COMP":
-                        extracted = _parse_sportscardspro_html(s_resp.text, url=s_resp.url)
-                        if extracted:
-                            px_slug = s_resp.url.rstrip("/").split("/")[-1]
-                            extracted["Card_URL"] = verified_exact_url
-                            extracted["Comp_URL"] = s_resp.url
-                            extracted["Source_URL"] = verified_exact_url
-                            extracted["Sales_Volume"] = f"Proxy Comp ({px_slug})"
                 else:
                     extracted = _parse_sportscardspro_search_results(
                         s_resp.text,
@@ -908,26 +1428,39 @@ def fetch_card_market_comps(
                         subset_name,
                         headers,
                         exact_card_url=verified_exact_url,
+                        print_run=pr_clean,
                     )
         except Exception:
             extracted = None
 
-    pr_clean = format_print_run(print_run)
     raw_val = _safe_float((extracted or {}).get("Ungraded"), 0.0)
+    final_card_url = (extracted or {}).get("Card_URL") or verified_exact_url
+    final_comp_url = (extracted or {}).get("Comp_URL", "")
+
     if raw_val <= 0:
-        sub_up = str(subset_name or "Base").upper()
-        if pr_clean == "1":
-            raw_val = max(fallback_raw_price, 150.00)
-        elif pr_clean.isdigit() and int(pr_clean) <= 10:
-            raw_val = max(fallback_raw_price, 45.00)
-        elif pr_clean.isdigit() and int(pr_clean) <= 50:
-            raw_val = max(fallback_raw_price, 18.00)
-        elif pr_clean.isdigit() and int(pr_clean) <= 199:
-            raw_val = max(fallback_raw_price, 7.50)
-        elif any(k in sub_up for k in ("AUTO", "RELIC", "SILVER PORTRAIT", "FOIL FILIGREE", "CHROME", "BLACK BORDER")):
-            raw_val = max(fallback_raw_price, 4.00)
-        else:
-            raw_val = min(fallback_raw_price, 2.50) if fallback_raw_price > 25.0 else max(0.99, fallback_raw_price)
+        return {
+            "Comp_Key": comp_key,
+            "Set": str(set_name).strip(),
+            "Subset": str(subset_name or "Base").strip(),
+            "Card Number": str(card_number).strip().lstrip("#"),
+            "Player": str(player_name).strip(),
+            "Print Run": pr_clean,
+            "Ungraded": "",
+            "Grade_7": "",
+            "Grade_8": "",
+            "Grade_9": "",
+            "BGS_9_5": "",
+            "PSA_10": "",
+            "BGS_10": "",
+            "Sales_Volume": "Uncomped (No exact sales found)",
+            "Valuation_Source": "Uncomped",
+            "Comp_Count": "0",
+            "Comp_Confidence": "None",
+            "Card_URL": final_card_url,
+            "Comp_URL": "",
+            "Source_URL": final_card_url,
+            "Last_Updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
 
     g7_default = round(max(raw_val * DEFAULT_GRADE_MULTIPLIERS["PSA"][7.0], raw_val + 2.00), 2)
     g8_default = round(max(raw_val * DEFAULT_GRADE_MULTIPLIERS["PSA"][8.0], raw_val + 4.50), 2)
@@ -943,9 +1476,6 @@ def fetch_card_market_comps(
     bgs95 = _safe_float((extracted or {}).get("BGS_9_5"), round(psa10 * 0.68, 2) if (extracted or {}).get("PSA_10") else bgs95_default)
     bgs10 = _safe_float((extracted or {}).get("BGS_10"), round(psa10 * 1.35, 2) if (extracted or {}).get("PSA_10") else bgs10_default)
 
-    final_card_url = (extracted or {}).get("Card_URL") or verified_exact_url
-    final_comp_url = (extracted or {}).get("Comp_URL", "")
-
     return {
         "Comp_Key": comp_key,
         "Set": str(set_name).strip(),
@@ -960,7 +1490,10 @@ def fetch_card_market_comps(
         "BGS_9_5": f"{bgs95:.2f}",
         "PSA_10": f"{psa10:.2f}",
         "BGS_10": f"{bgs10:.2f}",
-        "Sales_Volume": (extracted or {}).get("Sales_Volume", "Estimated (No sales on exact page)"),
+        "Sales_Volume": (extracted or {}).get("Sales_Volume", "live_scp"),
+        "Valuation_Source": (extracted or {}).get("Valuation_Source", "Verified SCP Exact"),
+        "Comp_Count": (extracted or {}).get("Comp_Count", "0"),
+        "Comp_Confidence": (extracted or {}).get("Comp_Confidence", "Medium"),
         "Card_URL": final_card_url,
         "Comp_URL": final_comp_url,
         "Source_URL": final_card_url,
@@ -976,27 +1509,31 @@ def purge_mismatched_comps_and_recalculate_inventory(inv_df: pd.DataFrame) -> tu
         return inv_df, 0
 
     out = inv_df.copy()
+    if "Valuation_Source" not in out.columns:
+        out["Valuation_Source"] = ""
     reset_count = 0
     tiers_data = load_grading_tiers_cache()
     settings = load_market_alert_settings()
     pricing_cfg = _load_pricing_strategy_settings()
-    default_raw = float(RUNTIME_CONFIG.get("default_raw_price", 2.00))
 
     for row_idx, row in out.iterrows():
         r_dict = row.to_dict()
-        ck = build_comp_key(
+        pr_s = format_print_run(r_dict.get("Print Run", ""))
+        comp_rec = _lookup_comp_row(
+            comps_by_key,
             r_dict.get("Set", ""),
             r_dict.get("Subset", "Base"),
             r_dict.get("Card Number", ""),
             r_dict.get("Player", ""),
+            print_run=pr_s,
         )
-        comp_rec = comps_by_key.get(ck)
-        sub_up = str(r_dict.get("Subset", "Base")).strip().upper()
-        pr_s = format_print_run(r_dict.get("Print Run", ""))
-        curr_raw = _safe_float(r_dict.get("Raw_Price"), default_raw)
+        _, is_verified_comp = _resolve_comp_valuation_source(comp_rec)
+        curr_raw = _safe_float(r_dict.get("Raw_Price"), 0.0)
+        is_manual = str(r_dict.get("Valuation_Source") or "").strip().lower() == "manual"
 
-        if comp_rec is None and ((sub_up in ("BASE", "BASE SET") and not pr_s and curr_raw > 35.0) or curr_raw > 100.0):
-            r_dict["Raw_Price"] = f"{default_raw:.2f}"
+        if not is_verified_comp and not is_manual and curr_raw > 0.0:
+            r_dict["Raw_Price"] = ""
+            r_dict["Valuation_Source"] = "Uncomped"
             r_dict["PSA_9_Price"] = ""
             r_dict["BGS_9_5_Price"] = ""
             r_dict["PSA_10_Price"] = ""
@@ -1091,13 +1628,59 @@ def compute_tier_aware_roi_and_recommendation(
     if pricing_cfg is None:
         pricing_cfg = _load_pricing_strategy_settings()
 
-    default_raw = float(RUNTIME_CONFIG.get("default_raw_price", 2.00))
-    raw_val = _safe_float(
-        (comp_row or {}).get("Ungraded") or card_row.get("Raw_Price"),
-        default=default_raw,
+    comp_src, comp_verified = _resolve_comp_valuation_source(comp_row)
+    existing_val_src = str(card_row.get("Valuation_Source") or "").strip()
+    existing_raw = _safe_float(card_row.get("Raw_Price"), 0.0)
+
+    if comp_verified:
+        raw_val = _safe_float((comp_row or {}).get("Ungraded"), 0.0)
+        valuation_source = comp_src
+    elif existing_val_src.lower() == "manual" and existing_raw > 0.0:
+        raw_val = existing_raw
+        valuation_source = "Manual"
+    else:
+        raw_val = 0.0
+        valuation_source = "Uncomped"
+
+    unit_cogs = float(pricing_cfg.get("computed_unit_cogs_and_overhead", 0.25))
+    set_cogs_map = pricing_cfg.get("per_set_unit_cogs", {})
+    card_set_name = str(card_row.get("Set", "")).strip()
+    if isinstance(set_cogs_map, dict) and card_set_name in set_cogs_map:
+        unit_cogs = float(set_cogs_map[card_set_name])
+
+    supplies_cost = (
+        float(pricing_cfg.get("per_card_supplies_cost", 0.18))
+        + float(pricing_cfg.get("per_order_packaging_cost", 0.35))
+        + float(pricing_cfg.get("per_order_shipping_cost", 0.00))
     )
-    if raw_val <= 0:
-        raw_val = default_raw
+    fixed_fee = float(pricing_cfg.get("fixed_transaction_fee", 0.30))
+    fee_rate = min(0.50, max(0.0, float(pricing_cfg.get("marketplace_fee_pct", 13.25)) / 100.0))
+    min_profit = float(pricing_cfg.get("target_min_net_profit_per_card", 0.50))
+    global_floor = float(pricing_cfg.get("global_min_price_floor", 0.99))
+
+    break_even_price = (unit_cogs + supplies_cost + fixed_fee) / max(0.10, 1.0 - fee_rate)
+    min_sale_price = max(global_floor, round(break_even_price + (min_profit / max(0.10, 1.0 - fee_rate)), 2))
+    hold_tag = str(card_row.get("Hold_Tag", "For Sale")).strip() or "For Sale"
+
+    if raw_val <= 0.0:
+        is_pc = ("Personal Collection" in hold_tag) or (str(card_row.get("Status", "")) == "PC / Hold")
+        uncomped_action = "PC HOLD (Uncomped)" if is_pc else f"UNCOMPED — NEEDS COMP (Min ${min_sale_price:.2f})"
+        return {
+            "Raw_Price": "",
+            "Valuation_Source": "Uncomped",
+            "Min_Sale_Price": f"{min_sale_price:.2f}",
+            "Rec_Sale_Price": f"{min_sale_price:.2f}",
+            "PSA_9_Price": "",
+            "BGS_9_5_Price": "",
+            "PSA_10_Price": "",
+            "Est_Graded_PSA": "",
+            "Est_Graded_BGS": "",
+            "EV_PSA": "",
+            "EV_BGS": "",
+            "Best_Grader": "RAW",
+            "Max_Net_Gain": "",
+            "Recommended_Action": uncomped_action,
+        }
 
     est_phys = float(
         np.clip(
@@ -1198,29 +1781,8 @@ def compute_tier_aware_roi_and_recommendation(
         best_roi = roi_bgs
         best_tier_lbl = f"BGS {bgs_tier['tier']} (${bgs_tier['price']:.0f})"
 
-    unit_cogs = float(pricing_cfg.get("computed_unit_cogs_and_overhead", 0.25))
-    set_cogs_map = pricing_cfg.get("per_set_unit_cogs", {})
-    card_set_name = str(card_row.get("Set", "")).strip()
-    if isinstance(set_cogs_map, dict) and card_set_name in set_cogs_map:
-        unit_cogs = float(set_cogs_map[card_set_name])
-
-    supplies_cost = (
-        float(pricing_cfg.get("per_card_supplies_cost", 0.18))
-        + float(pricing_cfg.get("per_order_packaging_cost", 0.35))
-        + float(pricing_cfg.get("per_order_shipping_cost", 0.00))
-    )
-    fixed_fee = float(pricing_cfg.get("fixed_transaction_fee", 0.30))
-    fee_rate = min(0.50, max(0.0, float(pricing_cfg.get("marketplace_fee_pct", 13.25)) / 100.0))
-    min_profit = float(pricing_cfg.get("target_min_net_profit_per_card", 0.50))
-    global_floor = float(pricing_cfg.get("global_min_price_floor", 0.99))
-
-    break_even_price = (unit_cogs + supplies_cost + fixed_fee) / max(0.10, 1.0 - fee_rate)
-    min_sale_price = max(global_floor, round(break_even_price + (min_profit / max(0.10, 1.0 - fee_rate)), 2))
-
-    hold_tag = str(card_row.get("Hold_Tag", "For Sale")).strip() or "For Sale"
     base_markup_pct = float(pricing_cfg.get("market_markup_pct", 0.0))
     offer_markup_pct = float(pricing_cfg.get("make_offer_markup_pct", 25.0))
-
     effective_markup_pct = max(base_markup_pct, offer_markup_pct) if "Make Me an Offer" in hold_tag else base_markup_pct
 
     pr_str = format_print_run(card_row.get("Print Run") or card_row.get("Print_Run") or "")
@@ -1258,6 +1820,7 @@ def compute_tier_aware_roi_and_recommendation(
 
     return {
         "Raw_Price": f"{raw_val:.2f}",
+        "Valuation_Source": valuation_source,
         "Min_Sale_Price": f"{min_sale_price:.2f}",
         "Rec_Sale_Price": f"{rec_sale_price:.2f}",
         "PSA_9_Price": f"{psa9_comp:.2f}",
@@ -1460,8 +2023,10 @@ def refresh_inventory_market_valuations(
     out = inv_df.copy()
     if "Hold_Tag" not in out.columns:
         out["Hold_Tag"] = "For Sale"
+    if "Valuation_Source" not in out.columns:
+        out["Valuation_Source"] = ""
     if "Rec_Sale_Price" not in out.columns:
-        out["Rec_Sale_Price"] = out.get("Raw_Price", "2.00")
+        out["Rec_Sale_Price"] = out.get("Raw_Price", "")
 
     unique_cards = {}
     for _, row in out.iterrows():
@@ -1472,6 +2037,7 @@ def refresh_inventory_market_valuations(
             row.get("Subset", "Base"),
             row.get("Card Number", ""),
             row.get("Player", ""),
+            print_run=row.get("Print Run", ""),
         )
         if c_key not in unique_cards:
             unique_cards[c_key] = row.to_dict()
@@ -1480,7 +2046,14 @@ def refresh_inventory_market_valuations(
     total_unique = max(1, len(unique_cards))
 
     for idx_u, (c_key, sample_row) in enumerate(unique_cards.items(), 1):
-        existing_comp = comps_by_key.get(c_key)
+        existing_comp = _lookup_comp_row(
+            comps_by_key,
+            sample_row.get("Set", ""),
+            sample_row.get("Subset", "Base"),
+            sample_row.get("Card Number", ""),
+            sample_row.get("Player", ""),
+            print_run=sample_row.get("Print Run", ""),
+        )
         already_fresh_today = bool(
             existing_comp and str(existing_comp.get("Last_Updated", "")).startswith(today_prefix)
         )
@@ -1491,7 +2064,7 @@ def refresh_inventory_market_valuations(
                 card_number=sample_row.get("Card Number", ""),
                 player_name=sample_row.get("Player", ""),
                 print_run=sample_row.get("Print Run", ""),
-                fallback_raw_price=_safe_float(sample_row.get("Raw_Price"), 2.00),
+                fallback_raw_price=0.0,
             )
             comps_by_key[c_key] = comp_rec
 
@@ -1502,7 +2075,8 @@ def refresh_inventory_market_valuations(
                 f"Valued [{idx_u}/{total_unique}] {sample_row.get('Set','')} #{sample_row.get('Card Number','')} {sample_row.get('Player','')}",
             )
 
-    save_market_comps_cache(pd.DataFrame(list(comps_by_key.values())))
+    if fetch_live_web_comps:
+        save_market_comps_cache(pd.DataFrame(list(comps_by_key.values())))
 
     new_alerts = []
     existing_alerts = load_market_alerts()
@@ -1513,16 +2087,17 @@ def refresh_inventory_market_valuations(
         if str(row.get("Status", "")).strip().lower() == "sold":
             continue
         r_dict = row.to_dict()
-        c_key = build_comp_key(
+        comp_rec = _lookup_comp_row(
+            comps_by_key,
             r_dict.get("Set", ""),
             r_dict.get("Subset", "Base"),
             r_dict.get("Card Number", ""),
             r_dict.get("Player", ""),
+            print_run=r_dict.get("Print Run", ""),
         )
-        comp_rec = comps_by_key.get(c_key)
 
         old_action = str(r_dict.get("Recommended_Action", "")).strip()
-        old_raw = _safe_float(r_dict.get("Raw_Price"), 2.00)
+        old_raw = _safe_float(r_dict.get("Raw_Price"), 0.0)
 
         roi_res = compute_tier_aware_roi_and_recommendation(
             r_dict,
@@ -1536,7 +2111,7 @@ def refresh_inventory_market_valuations(
             out.at[row_idx, k] = v
 
         new_action = roi_res["Recommended_Action"]
-        new_raw = _safe_float(roi_res["Raw_Price"], old_raw)
+        new_raw = _safe_float(roi_res["Raw_Price"], 0.0)
 
         old_cat = old_action.split(" ")[0] if old_action else ""
         new_cat = new_action.split(" ")[0] if new_action else ""
@@ -1581,6 +2156,8 @@ def record_collection_value_snapshot(inv_df: pd.DataFrame, persist_to_disk: bool
             "Total_Rec_Sale_Value": 0.0,
             "Total_Optimal_EV": 0.0,
             "Grade_Candidates_Count": 0,
+            "Verified_Comped_Cards": 0,
+            "Uncomped_Cards": 0,
         }
 
     in_stock = inv_df[inv_df["Status"] != "Sold"].copy()
@@ -1591,6 +2168,8 @@ def record_collection_value_snapshot(inv_df: pd.DataFrame, persist_to_disk: bool
 
     optimal_vals = np.maximum(raw_vals, np.maximum(ev_psa, ev_bgs))
     grade_candidates = int(in_stock["Recommended_Action"].astype(str).str.startswith("GRADE").sum())
+    comped_cnt = int((raw_vals > 0.0).sum())
+    uncomped_cnt = int(len(in_stock) - comped_cnt)
 
     snap = {
         "Date": datetime.now().strftime("%Y-%m-%d"),
@@ -1600,6 +2179,8 @@ def record_collection_value_snapshot(inv_df: pd.DataFrame, persist_to_disk: bool
         "Total_Rec_Sale_Value": round(float(rec_vals.sum()), 2),
         "Total_Optimal_EV": round(float(optimal_vals.sum()), 2),
         "Grade_Candidates_Count": grade_candidates,
+        "Verified_Comped_Cards": comped_cnt,
+        "Uncomped_Cards": uncomped_cnt,
     }
 
     if persist_to_disk or not COLLECTION_HISTORY_FILE.exists():
@@ -1844,9 +2425,16 @@ def generate_cards_to_buy_list(
     est_prices = []
     buy_links = []
     for _, r in missing_df.iterrows():
-        c_key = build_comp_key(r["Set"], r["Subset"], r["Card Number"], r["Player"])
-        cached_c = comps_by_key.get(c_key)
-        if cached_c and _safe_float(cached_c.get("Ungraded"), 0.0) > 0:
+        cached_c = _lookup_comp_row(
+            comps_by_key,
+            r["Set"],
+            r["Subset"],
+            r["Card Number"],
+            r["Player"],
+            print_run=r.get("Print Run", ""),
+        )
+        _, is_ver = _resolve_comp_valuation_source(cached_c)
+        if is_ver and cached_c and _safe_float(cached_c.get("Ungraded"), 0.0) > 0:
             p_val = _safe_float(cached_c["Ungraded"], 1.50)
         else:
             pr_s = format_print_run(r.get("Print Run", ""))

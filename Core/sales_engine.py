@@ -30,6 +30,7 @@ from Core.config import (
     LISTING_DRAFTS_FILE,
     PLAYER_BIOS_CACHE_FILE,
     RECOMMENDED_LOTS_FILE,
+    atomic_write_text,
     canonical_subset_key,
     ensure_directories,
     format_print_run,
@@ -284,11 +285,16 @@ def load_expenses_and_pricing_config() -> dict:
     """Loads `Inventory/Expenses.csv` + `pricing_strategy` from `expenses_and_pricing_config.json`."""
     ensure_directories()
     default_cfg = _default_expenses_and_pricing_config()
+    default_cfg["last_recalculated_at"] = ""
+    default_cfg["last_recalc_trigger"] = ""
     if EXPENSES_PRICING_CONFIG_FILE.exists():
         try:
             loaded = json.loads(EXPENSES_PRICING_CONFIG_FILE.read_text(encoding="utf-8-sig"))
             if isinstance(loaded, dict) and isinstance(loaded.get("pricing_strategy"), dict):
                 default_cfg["pricing_strategy"].update(loaded["pricing_strategy"])
+            if isinstance(loaded, dict):
+                default_cfg["last_recalculated_at"] = str(loaded.get("last_recalculated_at") or "").strip()
+                default_cfg["last_recalc_trigger"] = str(loaded.get("last_recalc_trigger") or "").strip()
         except Exception:
             pass
     default_cfg["expenses_ledger"] = load_expenses_csv_rows()
@@ -296,7 +302,7 @@ def load_expenses_and_pricing_config() -> dict:
 
 
 def save_expenses_and_pricing_config(cfg: dict) -> dict:
-    """Saves `expenses_ledger` to `Inventory/Expenses.csv` and `pricing_strategy` to JSON."""
+    """Saves `expenses_ledger` to `Inventory/Expenses.csv` and `pricing_strategy` atomically to JSON."""
     ensure_directories()
     ledger_rows = cfg.get("expenses_ledger")
     if isinstance(ledger_rows, list):
@@ -307,8 +313,10 @@ def save_expenses_and_pricing_config(cfg: dict) -> dict:
         "pricing_strategy": cfg.get("pricing_strategy", _default_expenses_and_pricing_config()["pricing_strategy"]),
         "expenses_csv_path": str(EXPENSES_CSV_FILE),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_recalculated_at": str(cfg.get("last_recalculated_at") or "").strip(),
+        "last_recalc_trigger": str(cfg.get("last_recalc_trigger") or "").strip(),
     }
-    EXPENSES_PRICING_CONFIG_FILE.write_text(json.dumps(strat_payload, indent=2), encoding="utf-8")
+    atomic_write_text(EXPENSES_PRICING_CONFIG_FILE, json.dumps(strat_payload, indent=2), encoding="utf-8")
     return cfg
 
 
@@ -510,6 +518,7 @@ def build_card_level_inventory_df(
         "Best_PSA",
         "Best_BGS",
         "Unit_Raw_Price",
+        "Valuation_Source",
         "Unit_Rec_Sale_Price",
         "Total_Sellable_Value",
         "For_Sale_SKUs",
@@ -566,7 +575,8 @@ def build_card_level_inventory_df(
         sorted_by_grade = sorted(in_stock_copies, key=_grade_sort_key, reverse=True) if in_stock_copies else copies
         best_copy = sorted_by_grade[0]
 
-        unit_raw = _safe_float(best_copy.get("Raw_Price"), 2.00)
+        unit_raw = _safe_float(best_copy.get("Raw_Price"), 0.0)
+        val_src = str(best_copy.get("Valuation_Source") or ("Manual" if unit_raw > 0 else "Uncomped")).strip()
         unit_rec = _safe_float(best_copy.get("Rec_Sale_Price"), unit_raw)
         sellable_val = round(len(sale_skus) * unit_rec, 2)
 
@@ -589,7 +599,8 @@ def build_card_level_inventory_df(
             "Best_SKU": str(best_copy.get("SKU", "")),
             "Best_PSA": str(best_copy.get("Est_PSA", "")),
             "Best_BGS": str(best_copy.get("Est_BGS", "")),
-            "Unit_Raw_Price": round(unit_raw, 2),
+            "Unit_Raw_Price": round(unit_raw, 2) if unit_raw > 0 else "",
+            "Valuation_Source": val_src,
             "Unit_Rec_Sale_Price": round(unit_rec, 2),
             "Total_Sellable_Value": sellable_val,
             "For_Sale_SKUs": ", ".join(sale_skus),
@@ -796,7 +807,7 @@ def generate_lot_and_set_recommendations(
                     if surplus_skus_by_key.get(ck):
                         s_item = surplus_skus_by_key[ck][0]
                         chosen_skus.append(str(s_item["SKU"]))
-                        raw_sum += _safe_float(s_item.get("Raw_Price"), 1.50)
+                        raw_sum += _safe_float(s_item.get("Raw_Price"), 0.0)
 
                 rec_price = round(raw_sum * prem_mult, 2)
                 recommendations.append({
@@ -822,7 +833,7 @@ def generate_lot_and_set_recommendations(
                     if surplus_skus_by_key.get(ck):
                         s_item = surplus_skus_by_key[ck][0]
                         chosen_skus.append(str(s_item["SKU"]))
-                        raw_sum += _safe_float(s_item.get("Raw_Price"), 1.50)
+                        raw_sum += _safe_float(s_item.get("Raw_Price"), 0.0)
                 rec_price = round(raw_sum * disc_mult, 2)
                 recommendations.append({
                     "Lot_ID": f"LOT-{lot_seq:03d}",
@@ -854,7 +865,7 @@ def generate_lot_and_set_recommendations(
             if surplus_skus_by_key.get(ck):
                 s_item = surplus_skus_by_key[ck][0]
                 chosen_skus.append(str(s_item["SKU"]))
-                raw_sum += _safe_float(s_item.get("Raw_Price"), 1.50)
+                raw_sum += _safe_float(s_item.get("Raw_Price"), 0.0)
 
         if len(chosen_skus) >= 3:
             rec_price = max(3.99, round(raw_sum * disc_mult, 2))
@@ -885,7 +896,7 @@ def generate_lot_and_set_recommendations(
                     s_item = surplus_skus_by_key[ck][0]
                     chosen_skus.append(str(s_item["SKU"]))
                     subs_included.append(str(r_row["Subset"]))
-                    raw_sum += _safe_float(s_item.get("Raw_Price"), 2.00)
+                    raw_sum += _safe_float(s_item.get("Raw_Price"), 0.0)
             if len(chosen_skus) >= 2:
                 rec_price = round(raw_sum * 1.05, 2)
                 recommendations.append({
@@ -913,7 +924,7 @@ def generate_lot_and_set_recommendations(
                 if surplus_skus_by_key.get(ck):
                     s_item = surplus_skus_by_key[ck][0]
                     chosen_skus.append(str(s_item["SKU"]))
-                    raw_sum += _safe_float(s_item.get("Raw_Price"), 2.50)
+                    raw_sum += _safe_float(s_item.get("Raw_Price"), 0.0)
             if len(chosen_skus) >= 3:
                 rec_price = round(raw_sum * disc_mult, 2)
                 recommendations.append({
@@ -941,7 +952,7 @@ def generate_lot_and_set_recommendations(
         lot_qty = min(10, len(surplus_list))
         picked_items = surplus_list[:lot_qty]
         skus_str = ", ".join(str(x["SKU"]) for x in picked_items)
-        raw_sum = sum(_safe_float(x.get("Raw_Price"), 1.50) for x in picked_items)
+        raw_sum = sum(_safe_float(x.get("Raw_Price"), 0.0) for x in picked_items)
         rec_price = max(3.99, round(raw_sum * 0.80, 2))
         recommendations.append({
             "Lot_ID": f"LOT-{lot_seq:03d}",
@@ -959,12 +970,10 @@ def generate_lot_and_set_recommendations(
         lot_seq += 1
 
     rec_df = pd.DataFrame(recommendations, columns=cols)
-    if not rec_df.empty:
-        try:
-            with open(RECOMMENDED_LOTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(recommendations, f, indent=2)
-        except Exception:
-            pass
+    try:
+        atomic_write_text(RECOMMENDED_LOTS_FILE, json.dumps(recommendations, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     return rec_df
 
 
@@ -1619,11 +1628,18 @@ def compute_expense_based_strategy_recommendations(inv_df: pd.DataFrame, cfg: Op
     total_exp = float(summary.get("total_expenses", 0.0))
 
     active_inv = inv_df[inv_df["Status"] != "Sold"].copy() if (inv_df is not None and not inv_df.empty) else pd.DataFrame()
-    total_rec_val = (
-        float(pd.to_numeric(active_inv.get("Rec_Sale_Price", active_inv.get("Raw_Price", 0.0)), errors="coerce").fillna(0.0).sum())
-        if not active_inv.empty
-        else 0.0
-    )
+    if not active_inv.empty:
+        raw_series = pd.to_numeric(active_inv.get("Raw_Price", 0.0), errors="coerce").fillna(0.0)
+        rec_series = pd.to_numeric(active_inv.get("Rec_Sale_Price", raw_series), errors="coerce").fillna(0.0)
+        total_verified_market_val = round(float(raw_series[raw_series > 0.0].sum()), 2)
+        total_rec_val = round(float(rec_series.sum()), 2)
+        comped_count = int((raw_series > 0.0).sum())
+        uncomped_count = int(len(active_inv) - comped_count)
+    else:
+        total_verified_market_val = 0.0
+        total_rec_val = 0.0
+        comped_count = 0
+        uncomped_count = 0
 
     recommendations = []
     if curr_floor < avg_min:
@@ -1671,4 +1687,62 @@ def compute_expense_based_strategy_recommendations(inv_df: pd.DataFrame, cfg: Op
     return {
         "summary": summary,
         "recommendations": recommendations,
+        "total_verified_market_value": total_verified_market_val,
+        "total_projected_listing_value": total_rec_val,
+        "comped_cards_count": comped_count,
+        "uncomped_cards_count": uncomped_count,
+        "last_recalculated_at": str(cfg.get("last_recalculated_at") or "").strip(),
+        "last_recalc_trigger": str(cfg.get("last_recalc_trigger") or "").strip(),
+    }
+
+
+def recalculate_sales_strategy_from_cache(
+    inv_df: Optional[pd.DataFrame] = None,
+    cfg: Optional[dict] = None,
+    save_inventory: bool = True,
+    trigger_source: str = "manual",
+) -> dict:
+    """
+    Offline / cache-only Sales Strategy recalculator:
+      - Recomputes unit COGS & per-set COGS from Expenses.csv + current Inventory.csv.
+      - Re-evaluates Raw_Price, Valuation_Source, Min_Sale_Price, Rec_Sale_Price, and
+        grading EV/ROI using ONLY local cached market comps and cached grading tiers
+        (zero external web requests).
+      - Persists Inventory.csv, Collection_Value_History.csv, recommended_lots.json,
+        and expenses_and_pricing_config.json atomically.
+    """
+    from Core.database import load_inventory_df, save_inventory_df
+    from Core.market_engine import record_collection_value_snapshot
+
+    if inv_df is None:
+        inv_df = load_inventory_df()
+    if cfg is None:
+        cfg = load_expenses_and_pricing_config()
+
+    updated_inv, summary = apply_pricing_strategy_to_inventory_df(inv_df, cfg=cfg)
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cfg["last_recalculated_at"] = now_ts
+    cfg["last_recalc_trigger"] = str(trigger_source or "manual").strip()
+    save_expenses_and_pricing_config(cfg)
+
+    if save_inventory and updated_inv is not None:
+        updated_inv = save_inventory_df(updated_inv)
+
+    record_collection_value_snapshot(updated_inv, persist_to_disk=True)
+    lots_df = generate_lot_and_set_recommendations(updated_inv)
+    strat_res = compute_expense_based_strategy_recommendations(updated_inv, cfg=cfg)
+
+    return {
+        "success": True,
+        "updated_cards": int(len(updated_inv)) if updated_inv is not None else 0,
+        "summary": strat_res["summary"],
+        "recommendations": strat_res["recommendations"],
+        "lots_count": int(len(lots_df)) if lots_df is not None else 0,
+        "last_recalculated_at": now_ts,
+        "last_recalc_trigger": cfg["last_recalc_trigger"],
+        "total_verified_market_value": strat_res["total_verified_market_value"],
+        "total_projected_listing_value": strat_res["total_projected_listing_value"],
+        "comped_cards_count": strat_res["comped_cards_count"],
+        "uncomped_cards_count": strat_res["uncomped_cards_count"],
+        "inventory_df": updated_inv,
     }

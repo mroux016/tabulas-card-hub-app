@@ -1753,6 +1753,7 @@ def run_background_job_from_file(payload_path: Path):
                     move_images_and_archive=move_imgs,
                     progress_callback=_on_commit_card,
                     log_cb=_on_commit_log,
+                    recalculate_sales_strategy=False,
                 )
                 if res_one.get("success"):
                     committed_batches_ok += 1
@@ -1761,6 +1762,22 @@ def run_background_job_from_file(payload_path: Path):
 
             if committed_batches_ok == 0:
                 raise RuntimeError("No batches were successfully committed.")
+
+            try:
+                from Core.sales_engine import recalculate_sales_strategy_from_cache
+                strat_res = recalculate_sales_strategy_from_cache(
+                    save_inventory=True,
+                    trigger_source="auto_on_commit",
+                )
+                _worker_log_cb(
+                    f"📈 Auto-recalculated Sales Strategy: Unit COGS=${strat_res['summary'].get('overall_unit_cogs', 0.0):.2f} | "
+                    f"Verified Market=${strat_res.get('total_verified_market_value', 0.0):,.2f} "
+                    f"({strat_res.get('comped_cards_count', 0)} comped, {strat_res.get('uncomped_cards_count', 0)} uncomped) | "
+                    f"Lots={strat_res.get('lots_count', 0)}"
+                )
+            except Exception as strat_err:
+                _worker_log_cb(f"⚠️ Post-commit Sales Strategy recalculation skipped: {strat_err}")
+
             _worker_log_cb(
                 f"🎉 Commit Complete: Committed {cards_done_all:,} card(s) across {committed_batches_ok}/{total_batches_cnt} batch(es) to Inventory.csv!"
             )

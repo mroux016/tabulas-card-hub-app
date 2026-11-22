@@ -1352,7 +1352,7 @@ function InventoryGuidedCardItem({
         </div>
         <div className="md:col-span-1">
           <label className="block text-[10px] text-slate-400 mb-0.5">Raw ($)</label>
-          <input type="number" step="0.25" value={draft.Raw_Price ?? ''} onChange={(e) => onDraftChange({ ...draft, Raw_Price: e.target.value })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono" />
+          <input type="number" step="0.25" value={draft.Raw_Price ?? ''} onChange={(e) => onDraftChange({ ...draft, Raw_Price: e.target.value, Valuation_Source: String(e.target.value || '').trim() ? 'Manual' : 'Uncomped' })} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono" />
         </div>
         <div className="md:col-span-2">
           <label className="block text-[10px] text-slate-400 mb-0.5">Sale Price ($)</label>
@@ -2138,6 +2138,7 @@ export default function App() {
   const [availabilityExpanded, setAvailabilityExpanded] = useState(false);
   const [gradeRecSetFilter, setGradeRecSetFilter] = useState('All Sets');
   const [inspectorIdx, setInspectorIdx] = useState(0);
+  const [recalculatingStrategy, setRecalculatingStrategy] = useState(false);
 
   const [lotCatF, setLotCatF] = useState('All Categories');
   const [lotSportF, setLotSportF] = useState('All Sports');
@@ -2746,6 +2747,9 @@ export default function App() {
       prev.map((r) => {
         if (r.SKU !== sku) return r;
         const nextRow = { ...r, [field]: value };
+        if (field === 'Raw_Price') {
+          nextRow.Valuation_Source = String(value || '').trim() ? 'Manual' : 'Uncomped';
+        }
         // Auto-flag Label_Printed = False whenever any label-visible card field changes
         if (LABEL_IDENTITY_FIELDS.has(field) && String(r[field] || '') !== String(value || '')) {
           nextRow.Label_Printed = 'False';
@@ -2924,6 +2928,46 @@ export default function App() {
         pushNotification(applyToInv ? 'Strategy Applied' : 'Expenses.csv Saved', `Saved ${ledgerToSave.length} expense row(s) to Data\\Bookkeeping\\Expenses.csv.`, 'Bookkeeping', 'success');
       }
     }).catch(() => {});
+  };
+
+  const handleRecalculateSalesStrategy = () => {
+    if (recalculatingStrategy) return;
+    setRecalculatingStrategy(true);
+    fetch(`${NODE_API_BASE}/sales/recalculate-strategy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ triggerSource: 'manual' }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && res.success) {
+          if (Array.isArray(res.inventoryRows)) setInventory(res.inventoryRows);
+          if (res.config && res.config.pricing_strategy) {
+            setPricingStrategy((p) => ({ ...p, ...res.config.pricing_strategy }));
+          }
+          setStrategyRecs({
+            summary: res.summary || {},
+            recommendations: res.recommendations || [],
+            total_verified_market_value: res.total_verified_market_value ?? 0,
+            total_projected_listing_value: res.total_projected_listing_value ?? 0,
+            comped_cards_count: res.comped_cards_count ?? 0,
+            uncomped_cards_count: res.uncomped_cards_count ?? 0,
+            last_recalculated_at: res.lastRecalculatedAt || '',
+            last_recalc_trigger: res.triggerSource || 'manual',
+          });
+          fetch(`${NODE_API_BASE}/sales/lots`).then((r) => r.json()).then((l) => l && setLotsData(l)).catch(() => {});
+          pushNotification(
+            'Sales Strategy Recalculated',
+            `Updated ${res.updatedCards || 0} card(s) from cached comps • Verified Market ${fmtCurrency(res.total_verified_market_value || 0)} • Projected List ${fmtCurrency(res.total_projected_listing_value || 0)}`,
+            'Sales Strategy',
+            'success'
+          );
+        } else {
+          pushNotification('Recalculation Failed', res?.error || 'Could not recalculate Sales Strategy.', 'Sales Strategy', 'error');
+        }
+      })
+      .catch((err) => pushNotification('Recalculation Error', err.message, 'Sales Strategy', 'error'))
+      .finally(() => setRecalculatingStrategy(false));
   };
 
   const stageSetIntoCart = (item) => {
@@ -7867,7 +7911,7 @@ export default function App() {
                     </div>
                     <div className="max-h-48 overflow-auto border border-slate-800 rounded-lg">
                       <table className="w-full text-left text-[11px] whitespace-nowrap">
-                        <thead className="bg-slate-900 text-slate-400 sticky top-0"><tr><th className="p-1.5">Set</th><th className="p-1.5">Card #</th><th className="p-1.5">Player</th><th className="p-1.5">Subset</th><th className="p-1.5">Raw</th><th className="p-1.5">PSA 9</th><th className="p-1.5">BGS 9.5</th><th className="p-1.5">PSA 10</th><th className="p-1.5">Links</th></tr></thead>
+                        <thead className="bg-slate-900 text-slate-400 sticky top-0"><tr><th className="p-1.5">Set</th><th className="p-1.5">Card #</th><th className="p-1.5">Player</th><th className="p-1.5">Subset</th><th className="p-1.5">Raw</th><th className="p-1.5">Source</th><th className="p-1.5">PSA 9</th><th className="p-1.5">BGS 9.5</th><th className="p-1.5">PSA 10</th><th className="p-1.5">Links</th></tr></thead>
                         <tbody className="divide-y divide-slate-800">
                           {(marketData.comps || []).filter((cm) => !compsSearch.trim() || `${cm.Set} ${cm['Card Number']} ${cm.Player} ${cm.Subset}`.toLowerCase().includes(compsSearch.toLowerCase())).slice(0, 150).map((cm, ci) => (
                             <tr key={ci} className="hover:bg-slate-800/40">
@@ -7875,10 +7919,11 @@ export default function App() {
                               <td className="p-1.5 font-mono">#{cm['Card Number']}</td>
                               <td className="p-1.5 font-bold text-white">{cm.Player}</td>
                               <td className="p-1.5">{cm.Subset}</td>
-                              <td className="p-1.5 font-mono">{fmtCurrency(cm.Ungraded)}</td>
-                              <td className="p-1.5 font-mono">{fmtCurrency(cm.Grade_9)}</td>
-                              <td className="p-1.5 font-mono">{fmtCurrency(cm.BGS_9_5)}</td>
-                              <td className="p-1.5 font-mono text-emerald-400 font-bold">{fmtCurrency(cm.PSA_10)}</td>
+                              <td className="p-1.5 font-mono">{safeNum(cm.Ungraded, 0) > 0 ? fmtCurrency(cm.Ungraded) : <span className="text-slate-500">Uncomped</span>}</td>
+                              <td className="p-1.5 text-[10px] text-slate-300">{cm.Valuation_Source || 'Legacy'}</td>
+                              <td className="p-1.5 font-mono">{safeNum(cm.Grade_9, 0) > 0 ? fmtCurrency(cm.Grade_9) : '—'}</td>
+                              <td className="p-1.5 font-mono">{safeNum(cm.BGS_9_5, 0) > 0 ? fmtCurrency(cm.BGS_9_5) : '—'}</td>
+                              <td className="p-1.5 font-mono text-emerald-400 font-bold">{safeNum(cm.PSA_10, 0) > 0 ? fmtCurrency(cm.PSA_10) : '—'}</td>
                               <td className="p-1.5 flex gap-2">
                                 {(cm.Card_URL || cm.Source_URL) && <a href={cm.Card_URL || cm.Source_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Card ↗</a>}
                                 {cm.Comp_URL && <a href={cm.Comp_URL} target="_blank" rel="noreferrer" className="text-amber-300 hover:underline">Comp ↗</a>}
@@ -8360,9 +8405,45 @@ export default function App() {
             {activePage === 'sales_strategy' && (
               <div className="space-y-4">
                 <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-sm font-bold text-white">💡 Expense-Based Sales Strategy Recommendations</h2>
-                    <span className="text-xs font-mono text-slate-400">Logged Expenses: {fmtCurrency(financialSummary.totalExpenses)} • Unit COGS: {fmtCurrency(financialSummary.unitCostBasis)}/card</span>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-sm font-bold text-white">💡 Expense-Based Sales Strategy Recommendations</h2>
+                      <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                        Logged Expenses: {fmtCurrency(financialSummary.totalExpenses)} • Unit COGS: {fmtCurrency(strategyRecs.summary?.overall_unit_cogs ?? financialSummary.unitCostBasis)}/card
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleRecalculateSalesStrategy}
+                      disabled={recalculatingStrategy}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs shadow-sm transition-colors"
+                    >
+                      {recalculatingStrategy ? '⏳ Recalculating...' : '🔄 Recalculate Sales Strategy'}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                    <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                      <div className="text-[10px] text-slate-400 uppercase font-semibold">Verified Market Value</div>
+                      <div className="text-base font-bold text-sky-400 font-mono">{fmtCurrency(strategyRecs.total_verified_market_value ?? financialSummary.totalRawVal)}</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">{(strategyRecs.comped_cards_count ?? 0).toLocaleString()} comped card(s)</div>
+                    </div>
+                    <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                      <div className="text-[10px] text-slate-400 uppercase font-semibold">Uncomped Cards</div>
+                      <div className="text-base font-bold text-amber-300 font-mono">{(strategyRecs.uncomped_cards_count ?? 0).toLocaleString()}</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">No $1.00 inflation</div>
+                    </div>
+                    <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                      <div className="text-[10px] text-slate-400 uppercase font-semibold">Projected List Value</div>
+                      <div className="text-base font-bold text-emerald-400 font-mono">{fmtCurrency(strategyRecs.total_projected_listing_value ?? financialSummary.totalRecVal)}</div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">Asking w/ markup &amp; floors</div>
+                    </div>
+                    <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                      <div className="text-[10px] text-slate-400 uppercase font-semibold">Last Recalculated</div>
+                      <div className="text-xs font-bold text-white font-mono mt-0.5">{strategyRecs.last_recalculated_at || 'Not yet run'}</div>
+                      <div className="text-[10px] text-sky-300 mt-0.5">
+                        {strategyRecs.last_recalc_trigger === 'auto_on_commit' ? 'Auto on Commit' : (strategyRecs.last_recalc_trigger === 'manual' ? 'Manual Trigger' : 'Cached')}
+                      </div>
+                    </div>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     {(strategyRecs.recommendations || []).map((rec, i) => (

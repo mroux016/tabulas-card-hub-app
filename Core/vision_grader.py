@@ -4579,9 +4579,11 @@ def recalculate_dataframe_multi_grader_roi(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
-    from Core.market_engine import _load_pricing_strategy_settings
+    from Core.market_engine import _load_pricing_strategy_settings, _lookup_comp_row
 
     out = df.copy()
+    if "Valuation_Source" not in out.columns:
+        out["Valuation_Source"] = ""
     tiers_data = load_grading_tiers_cache()
     comps_df = load_market_comps_cache()
     comps_by_key = {str(r["Comp_Key"]): r.to_dict() for _, r in comps_df.iterrows() if r.get("Comp_Key")}
@@ -4590,16 +4592,18 @@ def recalculate_dataframe_multi_grader_roi(df: pd.DataFrame) -> pd.DataFrame:
 
     cnum_col = "Card Number" if "Card Number" in out.columns else "Card_Number"
     sub_col = "Subset" if "Subset" in out.columns else "Subset_Parallel"
+    pr_col = "Print Run" if "Print Run" in out.columns else "Print_Run"
 
     for idx, row in out.iterrows():
         r_dict = row.to_dict()
-        ck = build_comp_key(
+        comp_rec = _lookup_comp_row(
+            comps_by_key,
             r_dict.get("Set", ""),
             r_dict.get(sub_col, "Base"),
             r_dict.get(cnum_col, ""),
             r_dict.get("Player", ""),
+            print_run=r_dict.get(pr_col, ""),
         )
-        comp_rec = comps_by_key.get(ck)
         roi_res = compute_tier_aware_roi_and_recommendation(
             r_dict,
             comp_row=comp_rec,
@@ -4978,9 +4982,10 @@ def process_single_batch(
             "Attributes": attr_str,
             "Copy_Number": str(copy_num),
             **grade_info,
-            "Raw_Price": f"{default_raw_price:.2f}",
-            "Min_Sale_Price": f"{default_raw_price:.2f}",
-            "Rec_Sale_Price": f"{default_raw_price:.2f}",
+            "Raw_Price": "",
+            "Valuation_Source": "Uncomped",
+            "Min_Sale_Price": "",
+            "Rec_Sale_Price": "",
             "PSA_9_Price": "",
             "BGS_9_5_Price": "",
             "PSA_10_Price": "",

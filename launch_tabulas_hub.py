@@ -1812,10 +1812,15 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                             in_df[col_c] = ""
                         in_df.loc[recalc_indices, col_c] = sub_recalc[col_c]
 
-                # Strictly preserve user-typed Raw_Price and Rec_Sale_Price edits
+                # Strictly preserve user-typed Raw_Price and Rec_Sale_Price edits & stamp Valuation_Source='Manual'
                 for idx_r, (keep_raw, keep_rec) in manual_price_overrides.items():
                     if keep_raw is not None:
                         in_df.at[idx_r, "Raw_Price"] = keep_raw
+                        try:
+                            raw_f = float(re.sub(r"[^0-9.\-]", "", str(keep_raw)) or "0")
+                        except Exception:
+                            raw_f = 0.0
+                        in_df.at[idx_r, "Valuation_Source"] = "Manual" if raw_f > 0 else "Uncomped"
                     if keep_rec is not None:
                         in_df.at[idx_r, "Rec_Sale_Price"] = keep_rec
 
@@ -2637,6 +2642,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                             u_d = upd_by_key[ck_r]
                             if u_d.get("Unit_Raw_Price") not in (None, ""):
                                 inv_df.at[r_idx, "Raw_Price"] = f"{float(u_d['Unit_Raw_Price']):.2f}"
+                                inv_df.at[r_idx, "Valuation_Source"] = "Manual" if float(u_d['Unit_Raw_Price']) > 0 else "Uncomped"
                             if u_d.get("Unit_Rec_Sale_Price") not in (None, ""):
                                 inv_df.at[r_idx, "Rec_Sale_Price"] = f"{float(u_d['Unit_Rec_Sale_Price']):.2f}"
                             updated_skus_cnt += 1
@@ -2665,6 +2671,35 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, **saved_b})
             return
 
+        if route == "/api/sales/recalculate-strategy":
+            from Core.sales_engine import load_expenses_and_pricing_config, recalculate_sales_strategy_from_cache
+            try:
+                res_rec = recalculate_sales_strategy_from_cache(save_inventory=True, trigger_source="manual")
+                upd_df = res_rec.get("inventory_df")
+                _log_ui_action_to_file(
+                    "Sales Strategy",
+                    "Manual Recalculate Sales Strategy",
+                    f"Updated {res_rec.get('updated_cards', 0)} cards | Verified=${res_rec.get('total_verified_market_value', 0.0):,.2f} | Lots={res_rec.get('lots_count', 0)}",
+                )
+                self._send_json({
+                    "success": True,
+                    "updatedCards": res_rec.get("updated_cards", 0),
+                    "summary": res_rec.get("summary", {}),
+                    "recommendations": res_rec.get("recommendations", []),
+                    "config": load_expenses_and_pricing_config(),
+                    "inventoryRows": upd_df.to_dict(orient="records") if upd_df is not None else [],
+                    "lotsCount": res_rec.get("lots_count", 0),
+                    "lastRecalculatedAt": res_rec.get("last_recalculated_at", ""),
+                    "triggerSource": res_rec.get("last_recalc_trigger", "manual"),
+                    "total_verified_market_value": res_rec.get("total_verified_market_value", 0.0),
+                    "total_projected_listing_value": res_rec.get("total_projected_listing_value", 0.0),
+                    "comped_cards_count": res_rec.get("comped_cards_count", 0),
+                    "uncomped_cards_count": res_rec.get("uncomped_cards_count", 0),
+                })
+            except Exception as e:
+                self._send_json({"success": False, "error": str(e)}, status=500)
+            return
+
         if route == "/api/sales/action" and isinstance(payload, dict):
             from datetime import datetime
             import pandas as pd
@@ -2673,9 +2708,28 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 auto_allocate_pc_and_sale_copies,
                 generate_card_listing_copy,
                 load_listing_drafts_df,
+                recalculate_sales_strategy_from_cache,
                 save_listing_drafts_df,
             )
             act = str(payload.get("action") or "")
+            if act == "recalculate_strategy":
+                res_rec = recalculate_sales_strategy_from_cache(save_inventory=True, trigger_source="manual")
+                upd_df = res_rec.get("inventory_df")
+                self._send_json({
+                    "success": True,
+                    "updatedCards": res_rec.get("updated_cards", 0),
+                    "summary": res_rec.get("summary", {}),
+                    "recommendations": res_rec.get("recommendations", []),
+                    "inventoryRows": upd_df.to_dict(orient="records") if upd_df is not None else [],
+                    "lotsCount": res_rec.get("lots_count", 0),
+                    "lastRecalculatedAt": res_rec.get("last_recalculated_at", ""),
+                    "triggerSource": res_rec.get("last_recalc_trigger", "manual"),
+                    "total_verified_market_value": res_rec.get("total_verified_market_value", 0.0),
+                    "total_projected_listing_value": res_rec.get("total_projected_listing_value", 0.0),
+                    "comped_cards_count": res_rec.get("comped_cards_count", 0),
+                    "uncomped_cards_count": res_rec.get("uncomped_cards_count", 0),
+                })
+                return
             if act == "auto_allocate":
                 inv_df = load_inventory_df()
                 upd_inv, stats = auto_allocate_pc_and_sale_copies(inv_df, default_retain_qty=int(payload.get("defaultRetainQty") or 1))

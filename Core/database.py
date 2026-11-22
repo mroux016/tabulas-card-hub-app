@@ -554,19 +554,25 @@ def load_inventory_df() -> pd.DataFrame:
                 df[col] = "1"
             elif col in ("Needs_Review", "Label_Printed"):
                 df[col] = "False"
+            elif col == "Valuation_Source":
+                df[col] = ""
             elif col in ("Rec_Sale_Price", "Min_Sale_Price"):
-                df[col] = df.get("Raw_Price", "1.00")
+                df[col] = df.get("Raw_Price", "")
             else:
                 df[col] = ""
 
     df["Hold_Tag"] = df["Hold_Tag"].replace("", "For Sale")
     df["Min_Sale_Price"] = [
-        msp if str(msp).strip() else (raw if str(raw).strip() else "1.00")
+        msp if str(msp).strip() else str(raw or "").strip()
         for msp, raw in zip(df["Min_Sale_Price"], df["Raw_Price"])
     ]
     df["Rec_Sale_Price"] = [
-        rsp if str(rsp).strip() else (raw if str(raw).strip() else "1.00")
+        rsp if str(rsp).strip() else str(raw or "").strip()
         for rsp, raw in zip(df["Rec_Sale_Price"], df["Raw_Price"])
+    ]
+    df["Valuation_Source"] = [
+        vs if str(vs).strip() else ("Uncomped" if not str(raw or "").strip() else "")
+        for vs, raw in zip(df["Valuation_Source"], df["Raw_Price"])
     ]
     df["Card Number"] = df["Card Number"].astype(str).str.strip().str.lstrip("#")
     df["Print Run"] = df["Print Run"].map(format_print_run)
@@ -583,7 +589,7 @@ def save_inventory_df(df: pd.DataFrame) -> pd.DataFrame:
             if col == "Hold_Tag":
                 out[col] = "For Sale"
             elif col == "Rec_Sale_Price":
-                out[col] = out.get("Raw_Price", "1.00")
+                out[col] = out.get("Raw_Price", "")
             else:
                 out[col] = ""
     out["Hold_Tag"] = out["Hold_Tag"].replace("", "For Sale")
@@ -1310,6 +1316,7 @@ def apply_manifest_overrides_and_rename(
 def commit_batch_to_inventory(
     batch_dir: Path,
     move_images_and_archive: bool = True,
+    recalculate_sales_strategy: bool = True,
 ) -> dict:
     """Finalizes a verified batch, moves images to _Cards, and appends rows to Inventory.csv."""
     batch_dir = Path(batch_dir)
@@ -1350,7 +1357,10 @@ def commit_batch_to_inventory(
     new_inv_rows = []
     for _, row in df.iterrows():
         sku_str = str(row["SKU"]).strip()
-        raw_p = str(row.get("Raw_Price", "1.00")).strip() or "1.00"
+        raw_p = str(row.get("Raw_Price", "")).strip()
+        val_src = str(row.get("Valuation_Source", "")).strip() or (
+            "Manual" if raw_p else "Uncomped"
+        )
         min_p = str(row.get("Min_Sale_Price", "")).strip() or raw_p
         rec_p = str(row.get("Rec_Sale_Price", "")).strip() or raw_p
         new_rec = {
@@ -1376,6 +1386,7 @@ def commit_batch_to_inventory(
             "Est_BGS": str(row.get("Est_BGS", "")).strip(),
             "Grading_Notes": str(row.get("Grading_Notes", "")).strip(),
             "Raw_Price": raw_p,
+            "Valuation_Source": val_src,
             "Min_Sale_Price": min_p,
             "Rec_Sale_Price": rec_p,
             "PSA_9_Price": str(row.get("PSA_9_Price", "")).strip(),
@@ -1411,6 +1422,13 @@ def commit_batch_to_inventory(
 
     save_inventory_df(inv_df)
     df.to_csv(batch_dir / "Batch_Inventory_Manifest.csv", index=False, encoding="utf-8-sig")
+
+    if recalculate_sales_strategy:
+        try:
+            from Core.sales_engine import recalculate_sales_strategy_from_cache
+            recalculate_sales_strategy_from_cache(save_inventory=True, trigger_source="auto_on_commit")
+        except Exception:
+            pass
 
     if move_images_and_archive:
         source_batches = set(df["Source_Batch"].dropna().unique()) if "Source_Batch" in df.columns else set()
@@ -1582,6 +1600,7 @@ def commit_batch_to_inventory_v2(
     move_images_and_archive: bool = True,
     progress_callback: Optional[Callable[[int, int, dict], None]] = None,
     log_cb: Optional[Callable[[str], None]] = None,
+    recalculate_sales_strategy: bool = True,
 ) -> dict:
     """
     Hardened 3-Drive Batch Commit Engine (`v0.24.0-beta.44`):
@@ -1706,9 +1725,12 @@ def commit_batch_to_inventory_v2(
             "Sub_Edges": str(r.get("Sub_Edges") or "").strip(),
             "Sub_Surface": str(r.get("Sub_Surface") or "").strip(),
             "Grading_Notes": str(r.get("Grading_Notes") or "").strip(),
-            "Raw_Price": str(r.get("Raw_Price") or "1.00").strip(),
+            "Raw_Price": str(r.get("Raw_Price") or "").strip(),
+            "Valuation_Source": str(r.get("Valuation_Source") or "").strip() or (
+                "Uncomped" if not str(r.get("Raw_Price") or "").strip() else "Verified SCP Exact"
+            ),
             "Min_Sale_Price": str(r.get("Min_Sale_Price") or "").strip(),
-            "Rec_Sale_Price": str(r.get("Rec_Sale_Price") or r.get("Raw_Price") or "1.49").strip(),
+            "Rec_Sale_Price": str(r.get("Rec_Sale_Price") or r.get("Raw_Price") or "").strip(),
             "PSA_9_Price": str(r.get("PSA_9_Price") or "").strip(),
             "BGS_9_5_Price": str(r.get("BGS_9_5_Price") or "").strip(),
             "PSA_10_Price": str(r.get("PSA_10_Price") or "").strip(),
@@ -1760,6 +1782,27 @@ def commit_batch_to_inventory_v2(
             log_cb(f"  📦 Archiving committed batch folder -> {PROCESSED_ARCHIVE_DIR / batch_name} ...")
         archived_batch = _safe_archive_folder_move(batch_dir, PROCESSED_ARCHIVE_DIR / batch_name)
 
+    sales_strategy_res = None
+    if recalculate_sales_strategy:
+        try:
+            from Core.sales_engine import recalculate_sales_strategy_from_cache
+            sales_strategy_res = recalculate_sales_strategy_from_cache(
+                save_inventory=True,
+                trigger_source="auto_on_commit",
+            )
+            if log_cb:
+                log_cb(
+                    f"  📈 Auto-recalculated Sales Strategy from cached comps: "
+                    f"Unit COGS=${sales_strategy_res['summary'].get('overall_unit_cogs', 0.0):.2f} | "
+                    f"Verified Market=${sales_strategy_res.get('total_verified_market_value', 0.0):,.2f} "
+                    f"({sales_strategy_res.get('comped_cards_count', 0)} comped, "
+                    f"{sales_strategy_res.get('uncomped_cards_count', 0)} uncomped) | "
+                    f"Lots={sales_strategy_res.get('lots_count', 0)}"
+                )
+        except Exception as strat_err:
+            if log_cb:
+                log_cb(f"  [!] Warning: Auto Sales Strategy recalculation skipped: {strat_err}")
+
     if log_cb:
         log_cb(
             f"  ✅ Batch '{batch_name}' committed: {len(new_rows):,} card(s) added to Inventory.csv "
@@ -1773,4 +1816,6 @@ def commit_batch_to_inventory_v2(
         "moved_images": moved_images,
         "archived_scans": archived_scans,
         "archived_batch": archived_batch,
+        "sales_strategy_recalculated": bool(sales_strategy_res and sales_strategy_res.get("success")),
+        "sales_strategy_summary": (sales_strategy_res or {}).get("summary", {}),
     }
