@@ -2,8 +2,10 @@ from __future__ import annotations
 # ==============================================================================
 # launch_tabulas_hub.py
 # Unified Python React + Full REST API Server & Launcher for C:\Tabulas Card Hub
-# Release: v0.24.0-beta.45
+# Release: v0.25.0-beta.1
 # ==============================================================================
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 import argparse
 import csv
 import json
@@ -771,6 +773,156 @@ def _save_tracked_sets_list(items: list[dict]):
     save_all_tracked_sets(new_dict)
 
 
+def _build_dashboard_summary() -> dict:
+    """
+    Fast, read-only Home Dashboard telemetry endpoint built purely from cached
+    inventory, tracked sets, rate learner stats, and Listing_Drafts.csv — ZERO
+    recursive media scans and ZERO external HTTP requests.
+    """
+    from datetime import datetime
+    from Core.config import sanitize_filename_part
+
+    def _safe_float(v, default: float = 0.0) -> float:
+        try:
+            s = str(v or "").strip().replace("$", "").replace(",", "")
+            return float(s) if s else default
+        except Exception:
+            return default
+
+    # 1. Tracked sets missing checklists (Last_Scraped blank/NEVER or CSV absent on disk)
+    tracked_sets: list[dict] = []
+    try:
+        tracked_sets = _load_tracked_sets_list()
+    except Exception:
+        tracked_sets = []
+
+    existing_csv_stems: set[str] = set()
+    try:
+        if SET_CHECKLISTS_DIR.exists():
+            existing_csv_stems = {p.stem.strip().lower() for p in SET_CHECKLISTS_DIR.glob("*.csv") if p.is_file()}
+    except Exception:
+        existing_csv_stems = set()
+
+    never_scraped_sets: list[dict] = []
+    for ts in tracked_sets:
+        folder_name = str(ts.get("Folder_Name") or "").strip()
+        set_name = folder_name.replace("_", " ").strip()
+        last_scraped = str(ts.get("Last_Scraped") or "").strip()
+        cand_stems = {
+            sanitize_filename_part(set_name).lower(),
+            sanitize_filename_part(folder_name).lower(),
+            folder_name.lower(),
+            set_name.lower(),
+        }
+        has_csv = bool(existing_csv_stems.intersection(cand_stems))
+        if (not last_scraped) or (last_scraped.upper() == "NEVER") or (not has_csv):
+            never_scraped_sets.append({
+                "setName": set_name or folder_name,
+                "folderName": folder_name,
+                "sport": str(ts.get("Sport") or "Baseball").strip(),
+                "year": str(ts.get("Year") or "").strip(),
+                "url": str(ts.get("TCDB_URL") or "").strip(),
+            })
+
+    # 2. Tracked sets with remaining TCDB reference front images to download
+    sets_needing_images: list[dict] = []
+    try:
+        from Core.rate_learner import get_rate_learner
+        rl_summary = get_rate_learner().get_dashboard_summary() or {}
+        set_stats = rl_summary.get("setStats") or []
+        stats_lookup: dict[str, dict] = {}
+        for st in set_stats:
+            if not isinstance(st, dict):
+                continue
+            sk = str(st.get("set_key") or "").strip().lower()
+            sn = str(st.get("set_name") or "").strip().lower()
+            for k in (sk, sn, sk.replace("_", " "), sn.replace(" ", "_"), sanitize_filename_part(sn).lower()):
+                if k:
+                    stats_lookup[k] = st
+
+        seen_img_sets: set[str] = set()
+        for ts in tracked_sets:
+            folder_name = str(ts.get("Folder_Name") or "").strip()
+            set_name = folder_name.replace("_", " ").strip()
+            dedupe_k = (folder_name or set_name).lower()
+            if not dedupe_k or dedupe_k in seen_img_sets:
+                continue
+            seen_img_sets.add(dedupe_k)
+            st = None
+            for k in (
+                folder_name.lower(),
+                set_name.lower(),
+                sanitize_filename_part(set_name).lower(),
+                sanitize_filename_part(folder_name).lower(),
+            ):
+                if k in stats_lookup:
+                    st = stats_lookup[k]
+                    break
+            if not st:
+                continue
+            imaged = int(st.get("imaged_cards_on_tcdb", 0) or 0)
+            fronts = int(st.get("fronts_downloaded", 0) or 0)
+            total_cards = int(st.get("total_cards", 0) or 0)
+            if imaged > fronts:
+                sets_needing_images.append({
+                    "setName": set_name or str(st.get("set_name") or folder_name),
+                    "totalCards": total_cards,
+                    "imagedOnTcdb": imaged,
+                    "frontsDownloaded": fronts,
+                    "remainingImages": imaged - fronts,
+                })
+        sets_needing_images.sort(key=lambda x: (-int(x["remainingImages"]), str(x["setName"])))
+    except Exception:
+        sets_needing_images = []
+
+    # 3. Cached inventory-derived KPIs & workflow counts
+    inv_rows = _get_cached_inventory_records()
+    grading_candidates_count = 0
+    grading_upside_total = 0.0
+    unprinted_labels_count = 0
+
+    drafted_skus: set[str] = set()
+    try:
+        from Core.sales_engine import load_listing_drafts_df
+        df_drafts = load_listing_drafts_df()
+        if df_drafts is not None and not df_drafts.empty and "SKU" in df_drafts.columns:
+            drafted_skus = {str(s).strip() for s in df_drafts["SKU"].tolist() if str(s).strip()}
+    except Exception:
+        drafted_skus = set()
+
+    sellable_missing_drafts_count = 0
+    for r in inv_rows:
+        if str(r.get("Label_Printed") or "").strip().lower() != "true":
+            unprinted_labels_count += 1
+
+        status_low = str(r.get("Status") or "").strip().lower()
+        if status_low == "sold":
+            continue
+
+        rec_act = str(r.get("Recommended_Action") or "").strip().upper()
+        max_gain = _safe_float(r.get("Max_Net_Gain"), 0.0)
+        if rec_act.startswith("GRADE") or rec_act.startswith("PC SLAB") or max_gain > 0.0:
+            grading_candidates_count += 1
+            if max_gain > 0.0:
+                grading_upside_total += max_gain
+
+        hold_low = str(r.get("Hold_Tag") or "").strip().lower()
+        is_pc = ("personal collection" in hold_low) or ("(pc)" in hold_low) or (hold_low == "pc") or (status_low == "pc / hold")
+        sku_str = str(r.get("SKU") or "").strip()
+        if (not is_pc) and sku_str and (sku_str not in drafted_skus):
+            sellable_missing_drafts_count += 1
+
+    return {
+        "neverScrapedSets": never_scraped_sets,
+        "setsNeedingImages": sets_needing_images,
+        "gradingCandidatesCount": grading_candidates_count,
+        "gradingUpsideTotal": round(grading_upside_total, 2),
+        "unprintedLabelsCount": unprinted_labels_count,
+        "sellableMissingDraftsCount": sellable_missing_drafts_count,
+        "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
     def log_message(self, format_str, *args):
         pass
@@ -921,6 +1073,10 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
         if route == "/api/rate-learner":
             from Core.rate_learner import get_rate_learner
             self._send_json(get_rate_learner().get_dashboard_summary())
+            return
+
+        if route == "/api/dashboard/summary":
+            self._send_json(_build_dashboard_summary())
             return
 
         if route == "/api/logs/list":

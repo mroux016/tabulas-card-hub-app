@@ -21,8 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-__version__ = "0.24.0-beta.36"
-__last_updated__ = "2026-11-21 01:30:00"
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 
 _DEFAULT_HUB_DIR = r"C:\Tabulas Card Hub" if os.path.exists(r"C:\Tabulas Card Hub") else os.getcwd()
 BASE_DIR = Path(os.environ.get("CARDS_BASE_DIR", _DEFAULT_HUB_DIR))

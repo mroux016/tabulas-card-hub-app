@@ -1518,7 +1518,7 @@ class TabulasErrorBoundary extends React.Component {
               }}
               className="px-3.5 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold"
             >
-              🔄 Recover &amp; Return to Batch Scan Processor
+              🔄 Recover &amp; Return to Home Dashboard
             </button>
           </div>
         </div>
@@ -1758,20 +1758,66 @@ export default function App() {
   const skin = CHROME_PULSE_SKINS[skinKey] || CHROME_PULSE_SKINS.screenshot_signature_3d;
   const [devMode, setDevMode] = useState(() => localStorage.getItem('tabulas_dev_mode') === 'true');
 
-  const [activePage, setActivePage] = useState('inventory');
+  const [activePage, setActivePage] = useState('dashboard');
   const [navPinned, setNavPinned] = useState(false);
   const [navHovered, setNavHovered] = useState(false);
   const [hoveredCatId, setHoveredCatId] = useState(null);
   const [unlockedHiddenPages, setUnlockedHiddenPages] = useState({});
 
   const activeCategoryId = useMemo(
-    () => (activePage === 'live_monitor' ? '' : (NAV_CATEGORIES.find((c) => c.items.some((it) => it.id === activePage))?.id || 'inventory_mgmt')),
+    () => (
+      activePage === 'live_monitor' || activePage === 'dashboard'
+        ? ''
+        : (NAV_CATEGORIES.find((c) => c.items.some((it) => it.id === activePage))?.id || 'inventory_mgmt')
+    ),
     [activePage]
   );
 
   const [showMonitor, setShowMonitor] = useState(false);
   const [monitorPinned, setMonitorPinned] = useState(false);
-  const [previousPageBeforeMonitor, setPreviousPageBeforeMonitor] = useState('inventory');
+  const [previousPageBeforeMonitor, setPreviousPageBeforeMonitor] = useState('dashboard');
+  const [dashboardSummary, setDashboardSummary] = useState({
+    neverScrapedSets: [],
+    setsNeedingImages: [],
+    gradingCandidatesCount: 0,
+    gradingUpsideTotal: 0,
+    unprintedLabelsCount: 0,
+    sellableMissingDraftsCount: 0,
+    generatedAt: '',
+  });
+  const [dashboardDonutMode, setDashboardDonutMode] = useState('set');
+  const [showAllNeverScraped, setShowAllNeverScraped] = useState(false);
+  const [customTodos, setCustomTodos] = useState(() => {
+    try {
+      const raw = localStorage.getItem('tabulas_custom_todos_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_e) {
+      return [];
+    }
+  });
+  const [customTodoInput, setCustomTodoInput] = useState('');
+  useEffect(() => {
+    try {
+      localStorage.setItem('tabulas_custom_todos_v1', JSON.stringify(customTodos));
+    } catch (_e) {}
+  }, [customTodos]);
+
+  const addCustomTodo = () => {
+    const txt = String(customTodoInput || '').trim();
+    if (!txt) return;
+    setCustomTodos((prev) => [{ id: `todo_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, text: txt, done: false, createdAt: new Date().toLocaleDateString() }, ...prev]);
+    setCustomTodoInput('');
+  };
+  const toggleCustomTodo = (id) => {
+    setCustomTodos((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
+  };
+  const deleteCustomTodo = (id) => {
+    setCustomTodos((prev) => prev.filter((t) => t.id !== id));
+  };
+  const clearCompletedCustomTodos = () => {
+    setCustomTodos((prev) => prev.filter((t) => !t.done));
+  };
   const [invertTerminalLogs, setInvertTerminalLogs] = useState(true);
   const [selectedMonitorLane, setSelectedMonitorLane] = useState('slot_1');
   const [showArchivedRollbacks, setShowArchivedRollbacks] = useState(false);
@@ -2246,6 +2292,9 @@ export default function App() {
     fetch(`${NODE_API_BASE}/schedules`).then((r) => r.json()).then((sc) => Array.isArray(sc) && setSchedules(sc)).catch(() => {});
     fetch(`${NODE_API_BASE}/notifications`).then((r) => r.json()).then((nt) => nt && Array.isArray(nt.notifications) && setNotifications(nt.notifications)).catch(() => {});
     fetch(`${NODE_API_BASE}/rate-learner`).then((r) => r.json()).then((rl) => rl && setRateLearnerStats(rl)).catch(() => {});
+    fetch(`${NODE_API_BASE}/dashboard/summary`).then((r) => r.json()).then((ds) => {
+      if (ds && typeof ds === 'object') setDashboardSummary(ds);
+    }).catch(() => {});
     refreshComputeStatus(false);
     fetch(`${NODE_API_BASE}/inventory/card-level`).then((r) => r.json()).then((cl) => {
       if (cl && Array.isArray(cl.rows)) {
@@ -2888,7 +2937,7 @@ export default function App() {
           <div className={`flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b ${skin.border} shrink-0`}>
             <div className="flex items-center gap-2.5">
               <button
-                onClick={() => setActivePage(previousPageBeforeMonitor || 'inventory')}
+                onClick={() => setActivePage(previousPageBeforeMonitor || 'dashboard')}
                 className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200"
               >
                 ⬅ Back
@@ -3250,21 +3299,30 @@ export default function App() {
             navExpanded ? 'w-64' : 'w-[74px]'
           } ${!navPinned && navHovered ? 'absolute left-0 top-0 bottom-0 z-40' : 'relative'}`}
         >
-          <div className={`px-3 py-3 border-b ${skin.border} flex items-center justify-between gap-2 shrink-0`}>
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className={`w-11 h-11 rounded-2xl ${skin.iconBg} border flex items-center justify-center text-2xl shadow-lg shrink-0`}>🗃️</div>
+          <div className={`px-2.5 py-2.5 border-b ${skin.border} flex items-center ${navExpanded ? 'justify-between gap-2' : 'justify-center'} shrink-0`}>
+            <button
+              type="button"
+              onClick={() => setActivePage('dashboard')}
+              title="Tabulas Home Dashboard"
+              className={`flex items-center ${navExpanded ? 'gap-2.5 flex-1 px-1.5 py-1' : 'justify-center p-1'} min-w-0 rounded-2xl border text-left transition-all cursor-pointer ${
+                activePage === 'dashboard'
+                  ? `${skin.accentActive} ring-1 ring-white/25 shadow-md`
+                  : 'border-transparent hover:bg-slate-800/75'
+              }`}
+            >
+              <div className={`w-11 h-11 rounded-2xl ${skin.iconBg} border flex items-center justify-center text-2xl shadow-lg shrink-0 transition-transform ${activePage === 'dashboard' ? 'scale-[1.03]' : 'hover:scale-105'}`}>🗃️</div>
               {navExpanded && (
                 <div className="min-w-0">
                   <div className="text-sm font-extrabold tracking-tight text-white truncate">Tabulas Hub</div>
                   <div className={`text-[10px] font-mono ${skin.accentText}`}>v{updaterInfo.current_version || APP_VERSION}{devMode ? ' • DEV' : ''}</div>
                 </div>
               )}
-            </div>
+            </button>
             {navExpanded && (
               <button
                 onClick={() => setNavPinned(!navPinned)}
                 title={navPinned ? 'Unpin Nav Rail (Auto-Collapse)' : 'Pin Nav Rail Open'}
-                className={`w-7 h-7 rounded-lg border flex items-center justify-center transition ${navPinned ? skin.accentActive : 'bg-slate-800/80 border-slate-700 text-slate-400 hover:text-white'}`}
+                className={`w-7 h-7 rounded-lg border flex items-center justify-center shrink-0 transition ${navPinned ? skin.accentActive : 'bg-slate-800/80 border-slate-700 text-slate-400 hover:text-white'}`}
               >
                 <ThumbtackPinIcon pinned={navPinned} className="w-3.5 h-3.5" />
               </button>
@@ -3634,7 +3692,782 @@ export default function App() {
 
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
           <main ref={mainScrollRef} className="flex-1 flex flex-col min-w-0 min-h-0 overflow-y-auto p-4 gap-4">
-            <TabulasErrorBoundary resetKey={`${activePage}-${activeBatchName}-${deepDiveIdx}`} onReset={() => setActivePage('scan_ingestion')}>
+            <TabulasErrorBoundary resetKey={`${activePage}-${activeBatchName}-${deepDiveIdx}`} onReset={() => setActivePage('dashboard')}>
+            {/* 0. HOME DASHBOARD (DEFAULT STARTUP SCREEN — ALWAYS REACHABLE VIA TOP-LEFT LOGO) */}
+            {activePage === 'dashboard' && (() => {
+              const inStockCards = inventory.filter((c) => String(c.Status || '').trim().toLowerCase() !== 'sold');
+              const cardOptVal = (c) => Math.max(safeNum(c.Raw_Price, 0), safeNum(c.EV_PSA, 0), safeNum(c.EV_BGS, 0));
+
+              const pcCount = inStockCards.filter((c) => {
+                const ht = String(c.Hold_Tag || '').toLowerCase();
+                const st = String(c.Status || '').toLowerCase();
+                return ht.includes('personal collection') || ht.includes('(pc)') || ht === 'pc' || st === 'pc / hold';
+              }).length;
+              const forSaleCount = Math.max(0, inStockCards.length - pcCount);
+              const avgCardVal = inStockCards.length > 0 ? financialSummary.totalOptimalEv / inStockCards.length : 0;
+
+              const hasDashSummary = Boolean(dashboardSummary && dashboardSummary.generatedAt);
+              const dashGradingCount = hasDashSummary
+                ? Number(dashboardSummary.gradingCandidatesCount || 0)
+                : gradingCandidates.length;
+              const dashGradingUpside = hasDashSummary
+                ? safeNum(dashboardSummary.gradingUpsideTotal, 0)
+                : gradingCandidates.reduce((a, c) => a + Math.max(0, safeNum(c.Max_Net_Gain, 0)), 0);
+              const dashUnprintedCount = hasDashSummary
+                ? Number(dashboardSummary.unprintedLabelsCount || 0)
+                : inventory.filter((c) => String(c.Label_Printed || '').trim().toLowerCase() !== 'true').length;
+              const dashMissingDraftsCount = hasDashSummary
+                ? Number(dashboardSummary.sellableMissingDraftsCount || 0)
+                : 0;
+              const neverScrapedSets = Array.isArray(dashboardSummary?.neverScrapedSets) ? dashboardSummary.neverScrapedSets : [];
+              const setsNeedingImages = Array.isArray(dashboardSummary?.setsNeedingImages) ? dashboardSummary.setsNeedingImages : [];
+              const totalRemainingRefImages = setsNeedingImages.reduce((a, s) => a + Math.max(0, Number(s.remainingImages || 0)), 0);
+
+              const activeLabelTpl = LABEL_TEMPLATES[labelTemplate] || LABEL_TEMPLATES.R037L;
+              const dashCellsPerSheet = Math.max(1, (activeLabelTpl?.rows || 10) * (activeLabelTpl?.cols || 3));
+              const estLabelSheets = dashUnprintedCount > 0 ? Math.ceil(dashUnprintedCount / dashCellsPerSheet) : 0;
+
+              const nf = computeStatus?.neural_foundation || {};
+              const cachedEmbeddingsCount = Number(nf.cached_embeddings_count || 0);
+              const primaryGpuName = computeStatus?.primary_gpu?.name || 'Detecting GPU...';
+              const activeProvider = computeStatus?.active_ocr_provider || 'CPUExecutionProvider';
+              const shortProvider = activeProvider.replace('ExecutionProvider', '');
+
+              // Collection Breakdown Donut Data (By Set / By Sport)
+              const dashSetCounts = {};
+              const dashSportCounts = {};
+              inStockCards.forEach((c) => {
+                const sName = c.Set || 'Unknown Set';
+                dashSetCounts[sName] = (dashSetCounts[sName] || 0) + 1;
+                const sp = inferSportFromSet(sName);
+                dashSportCounts[sp] = (dashSportCounts[sp] || 0) + 1;
+              });
+              const sortedDashSets = Object.entries(dashSetCounts).sort((a, b) => b[1] - a[1]);
+              const dashSetDonut = sortedDashSets.slice(0, 6).map(([label, value]) => ({ label, value }));
+              if (sortedDashSets.length > 6) {
+                dashSetDonut.push({
+                  label: `Other (${sortedDashSets.length - 6} sets)`,
+                  value: sortedDashSets.slice(6).reduce((a, [, v]) => a + v, 0),
+                });
+              }
+              const dashSportDonut = Object.entries(dashSportCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([label, value]) => ({ label, value }));
+              const activeDonutData = dashboardDonutMode === 'sport' ? dashSportDonut : dashSetDonut;
+
+              // Top 5 Most Valuable In-Stock Cards by Optimal EV
+              const top5ValuableCards = [...inStockCards]
+                .sort((a, b) => cardOptVal(b) - cardOptVal(a))
+                .slice(0, 5);
+
+              // Value Trend Mini-Chart (last 20 snapshots)
+              const histPts = (marketData.history || []).slice(-20);
+              const latestHist = histPts.length > 0 ? histPts[histPts.length - 1] : null;
+              const prevHist = histPts.length > 1 ? histPts[histPts.length - 2] : null;
+              const histDeltaEv = (latestHist && prevHist)
+                ? (safeNum(latestHist.Total_Optimal_EV, 0) - safeNum(prevHist.Total_Optimal_EV, 0))
+                : null;
+
+              // Active Parallel Workers
+              const { ordered: dashOrderedLanes } = getOrderedLanes();
+              const runningDashLanes = dashOrderedLanes.filter(([lk]) => {
+                const st = liveLanes[lk] || {};
+                return st.status === 'RUNNING' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
+              });
+
+              // Smart Interactive Task To-Do Hub (Priority-Sorted: urgent -> action -> maintenance)
+              const incomingPdfTotal = incomingScans.reduce((a, b) => a + Number(b.pdfCount || 0), 0);
+              const alertCount = (marketData.alerts || []).length;
+              const autoTasks = [];
+
+              if (Number(updaterInfo.pending_count || 0) > 0) {
+                autoTasks.push({
+                  id: 'pending_updates',
+                  priority: 'urgent',
+                  priorityOrder: 1,
+                  icon: '🔄',
+                  title: `Pending Software Updates (${updaterInfo.pending_count})`,
+                  detail: `New release package${updaterInfo.pending_count === 1 ? '' : 's'} detected in Updates/ ready to inspect and install.`,
+                  primaryLabel: 'Check for Updates',
+                  onPrimary: () => setActivePage('about'),
+                });
+              }
+              if (incomingScans.length > 0) {
+                autoTasks.push({
+                  id: 'incoming_scans',
+                  priority: 'urgent',
+                  priorityOrder: 2,
+                  icon: '📂',
+                  title: `Incoming Scans Ready to Process (${incomingScans.length} folder${incomingScans.length === 1 ? '' : 's'} • ${incomingPdfTotal.toLocaleString()} PDF${incomingPdfTotal === 1 ? '' : 's'})`,
+                  detail: incomingScans.slice(0, 3).map((b) => `${b.batchName} (${b.pdfCount || 0})`).join(' · '),
+                  primaryLabel: 'Open Processor',
+                  onPrimary: () => setActivePage('scan_ingestion'),
+                });
+              }
+              batches.forEach((b) => {
+                const flagged = Number(b.needsReviewCount || 0);
+                const totalC = Number(b.cardCount || 0);
+                autoTasks.push({
+                  id: `uncommitted_batch_${b.batchName}`,
+                  priority: flagged > 0 ? 'urgent' : 'action',
+                  priorityOrder: flagged > 0 ? 3 : 5,
+                  icon: '🚩',
+                  title: `Uncommitted Batch: ${b.batchName}`,
+                  detail: `${totalC.toLocaleString()} card${totalC === 1 ? '' : 's'} staged${flagged > 0 ? ` • 🚩 ${flagged.toLocaleString()} flagged for review` : ' • Ready to review & commit'}`,
+                  primaryLabel: 'Guided Review',
+                  onPrimary: () => { setActiveBatchName(b.batchName); openHiddenPage('guided_batch_review'); },
+                  secondaryLabel: 'Open Batch',
+                  onSecondary: () => { setActiveBatchName(b.batchName); setActivePage('scan_ingestion'); },
+                });
+              });
+              if (alertCount > 0) {
+                autoTasks.push({
+                  id: 'market_alerts',
+                  priority: 'urgent',
+                  priorityOrder: 4,
+                  icon: '🔔',
+                  title: `Market Price & Grading Alerts (${alertCount.toLocaleString()})`,
+                  detail: 'Price spikes or new profitable grading opportunities detected in your portfolio.',
+                  primaryLabel: 'View Alerts',
+                  onPrimary: () => setActivePage('grading_engine'),
+                });
+              }
+              if (dashUnprintedCount > 0) {
+                autoTasks.push({
+                  id: 'unprinted_labels',
+                  priority: 'action',
+                  priorityOrder: 6,
+                  icon: '🏷️',
+                  title: `Unprinted Inventory Labels (${dashUnprintedCount.toLocaleString()})`,
+                  detail: `~${estLabelSheets.toLocaleString()} sheet${estLabelSheets === 1 ? '' : 's'} queued using ${activeLabelTpl?.name || labelTemplate} (${dashCellsPerSheet}/sheet).`,
+                  primaryLabel: 'Print Labels',
+                  onPrimary: () => setActivePage('label_hub'),
+                });
+              }
+              if (neverScrapedSets.length > 0) {
+                const visiblePreview = showAllNeverScraped ? neverScrapedSets : neverScrapedSets.slice(0, 4);
+                autoTasks.push({
+                  id: 'never_scraped_sets',
+                  priority: 'action',
+                  priorityOrder: 7,
+                  icon: '🏛️',
+                  title: `Tracked Sets Missing Checklists (${neverScrapedSets.length.toLocaleString()})`,
+                  detail: visiblePreview.map((s) => s.setName).join(' · ') + (!showAllNeverScraped && neverScrapedSets.length > 4 ? ` (+${neverScrapedSets.length - 4} more)` : ''),
+                  expandableCount: neverScrapedSets.length > 4 ? neverScrapedSets.length : 0,
+                  primaryLabel: 'Open Checklist Builder',
+                  onPrimary: () => setActivePage('checklist_builder'),
+                });
+              }
+              if (dashMissingDraftsCount > 0) {
+                autoTasks.push({
+                  id: 'missing_listing_drafts',
+                  priority: 'action',
+                  priorityOrder: 8,
+                  icon: '✍️',
+                  title: `Sellable Cards Missing Listing Drafts (${dashMissingDraftsCount.toLocaleString()})`,
+                  detail: 'In-stock For Sale / Make Offer cards without a generated eBay/Marketplace draft yet.',
+                  primaryLabel: 'Open Listing Writer',
+                  onPrimary: () => setActivePage('listing_writer'),
+                });
+              }
+              if (setsNeedingImages.length > 0) {
+                const topImgSets = setsNeedingImages.slice(0, 3).map((s) => `${s.setName} (${Number(s.remainingImages || 0).toLocaleString()} left)`).join(' · ');
+                autoTasks.push({
+                  id: 'sets_needing_images',
+                  priority: 'maintenance',
+                  priorityOrder: 9,
+                  icon: '🖼️',
+                  title: `Reference Images Ready to Download (${setsNeedingImages.length} set${setsNeedingImages.length === 1 ? '' : 's'} • ${totalRemainingRefImages.toLocaleString()} fronts)`,
+                  detail: topImgSets,
+                  primaryLabel: 'Open Checklist Builder',
+                  onPrimary: () => setActivePage('checklist_builder'),
+                });
+              }
+              if (computeStatus && !nf.dinov2_installed) {
+                autoTasks.push({
+                  id: 'dinov2_check',
+                  priority: 'maintenance',
+                  priorityOrder: 10,
+                  icon: '🧬',
+                  title: 'DINOv2 Neural Index Not Installed',
+                  detail: 'Download the local DINOv2-small ONNX model (~88 MB) for GPU-accelerated deep visual card matching.',
+                  primaryLabel: 'Open GPU Settings',
+                  onPrimary: () => setActivePage('general_settings'),
+                });
+              }
+              autoTasks.sort((a, b) => a.priorityOrder - b.priorityOrder);
+
+              const completedCustomCount = customTodos.filter((t) => t.done).length;
+              const priorityBadgeStyle = {
+                urgent: { label: '🔴 Urgent', cls: 'bg-rose-950/90 text-rose-200 border-rose-500/60' },
+                action: { label: '🟠 Action', cls: 'bg-amber-950/90 text-amber-200 border-amber-500/60' },
+                maintenance: { label: '🔵 Maintenance', cls: 'bg-sky-950/90 text-sky-200 border-sky-500/60' },
+              };
+
+              return (
+                <div className="space-y-4">
+                  {/* 1. HEADER BAR & QUICK-LAUNCH STRIP */}
+                  <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-2.5 min-w-0">
+                        <h1 className="text-lg font-extrabold tracking-tight text-white">
+                          🗃️ Tabulas Card Hub — Home Dashboard
+                        </h1>
+                        <span className={`px-2 py-0.5 rounded-lg text-[10.5px] font-mono font-bold border ${skin.accentActive}`}>
+                          v{updaterInfo.current_version || APP_VERSION}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setActivePage('general_settings')}
+                        title="Open Hardware & GPU Acceleration Settings"
+                        className="flex flex-wrap items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-950/80 hover:bg-slate-900 border border-slate-700/80 text-[11px] transition text-left"
+                      >
+                        <span className="font-bold text-emerald-300">⚡ {primaryGpuName}</span>
+                        <span className="text-slate-600">•</span>
+                        <span className={`font-mono font-semibold ${skin.accentText}`}>{shortProvider}</span>
+                        <span className="text-slate-600">•</span>
+                        <span className="font-mono text-slate-300">🧬 {cachedEmbeddingsCount.toLocaleString()} DINOv2</span>
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button type="button" onClick={() => setActivePage('scan_ingestion')} className={`px-3 py-1.5 rounded-xl text-xs font-bold transition ${skin.accentBtn}`}>
+                        📥 Process Scans
+                      </button>
+                      <button type="button" onClick={() => setActivePage('inventory')} className="px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 text-slate-100 text-xs font-semibold transition">
+                        🗂️ Inventory
+                      </button>
+                      <button type="button" onClick={() => setActivePage('label_hub')} className="px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 text-slate-100 text-xs font-semibold transition">
+                        🏷️ Label Hub
+                      </button>
+                      <button type="button" onClick={() => setActivePage('checklist_builder')} className="px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 text-slate-100 text-xs font-semibold transition">
+                        🏛️ Checklist Builder
+                      </button>
+                      <button type="button" onClick={() => setActivePage('listing_writer')} className="px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700/80 text-slate-100 text-xs font-semibold transition">
+                        ✍️ Listing Writer
+                      </button>
+                      <button type="button" onClick={() => openMonitorPage()} className={`px-3 py-1.5 rounded-xl border text-xs font-semibold transition ${anyLaneRunning ? 'bg-emerald-950/80 hover:bg-emerald-900 border-emerald-500/70 text-emerald-200' : 'bg-slate-900/90 hover:bg-slate-800 border-slate-700/80 text-slate-100'}`}>
+                        🖥️ Live Monitor{anyLaneRunning ? ` (${runningDashLanes.length})` : ''}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* 2. TOP VISUAL KPI CARDS (6 INTERACTIVE METRIC CARDS) */}
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('inventory')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>🗂️ Collection Size</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className="text-xl font-extrabold text-white font-mono leading-tight">
+                        {financialSummary.inStockCount.toLocaleString()}
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 leading-snug">
+                        {cardLevelRows.length.toLocaleString()} unique • {pcCount.toLocaleString()} PC / {forSaleCount.toLocaleString()} Sale
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('collection_value')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>💎 Optimal EV</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className="text-xl font-extrabold text-emerald-400 font-mono leading-tight">
+                        {fmtCurrency(financialSummary.totalOptimalEv)}
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 leading-snug">
+                        Raw {fmtCurrency(financialSummary.totalRawVal)} • Avg {fmtCurrency(avgCardVal)}
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('accounting')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>💵 Sales &amp; Profit</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className={`text-xl font-extrabold font-mono leading-tight ${financialSummary.netProfit >= 0 ? 'text-cyan-300' : 'text-rose-400'}`}>
+                        {fmtCurrency(financialSummary.netProfit)}
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 leading-snug">
+                        Rev {fmtCurrency(financialSummary.totalRevenue)} ({soldCards.length}) • Exp {fmtCurrency(financialSummary.totalExpenses)}
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('grading_engine')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>🏅 Grading EV</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className="text-xl font-extrabold text-amber-300 font-mono leading-tight">
+                        {dashGradingCount.toLocaleString()}
+                      </div>
+                      <div className="text-[10.5px] text-emerald-300 font-mono leading-snug">
+                        +{fmtCurrency(dashGradingUpside)} net upside
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('label_hub')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>🏷️ Label Queue</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className={`text-xl font-extrabold font-mono leading-tight ${dashUnprintedCount > 0 ? 'text-sky-300' : 'text-emerald-400'}`}>
+                        {dashUnprintedCount.toLocaleString()}
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 leading-snug">
+                        {dashUnprintedCount > 0 ? `~${estLabelSheets.toLocaleString()} sheet${estLabelSheets === 1 ? '' : 's'} (${dashCellsPerSheet}/pg)` : 'All labels printed ✓'}
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setActivePage('checklist_builder')}
+                      className={`${skin.cardBg} border ${skin.border} hover:brightness-110 rounded-2xl p-3.5 text-left transition-all flex flex-col justify-between gap-1.5 group`}
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold">
+                        <span>🏛️ Set Library</span>
+                        <span className="opacity-0 group-hover:opacity-100 transition text-[10px]">↗</span>
+                      </div>
+                      <div className="text-xl font-extrabold text-white font-mono leading-tight">
+                        {trackedSets.length.toLocaleString()} <span className="text-xs font-semibold text-slate-400">sets</span>
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 leading-snug">
+                        {Number(chkData.totalRecords || 0).toLocaleString()} rows • {cachedEmbeddingsCount.toLocaleString()} AI emb
+                      </div>
+                    </button>
+                  </div>
+
+                  {/* 3 & 4. MAIN 12-COL RESPONSIVE GRID (TASK TO-DO HUB + ANALYTICS SPOTLIGHT) */}
+                  <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+                    {/* LEFT / PRIMARY COLUMN (7 of 12 cols): SMART TASK TO-DO HUB + PERSONAL CHECKLIST */}
+                    <div className="xl:col-span-7 space-y-4">
+                      {/* SMART INTERACTIVE TASK TO-DO HUB */}
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <h2 className="text-sm font-extrabold text-white">✅ Smart Action &amp; Workflow To-Do Hub</h2>
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${autoTasks.length > 0 ? 'bg-amber-950/80 text-amber-200 border-amber-500/60' : 'bg-emerald-950/80 text-emerald-200 border-emerald-500/60'}`}>
+                              {autoTasks.length} {autoTasks.length === 1 ? 'Task' : 'Tasks'}
+                            </span>
+                          </div>
+                          {dashboardSummary?.generatedAt && (
+                            <span className="text-[10px] font-mono text-slate-500">Synced {dashboardSummary.generatedAt.slice(11)}</span>
+                          )}
+                        </div>
+
+                        {autoTasks.length === 0 ? (
+                          <div className="rounded-xl bg-emerald-950/35 border border-emerald-500/40 p-6 text-center space-y-1.5">
+                            <div className="text-2xl">✅</div>
+                            <div className="text-sm font-bold text-emerald-200">All caught up! No pending workflow tasks.</div>
+                            <div className="text-xs text-slate-400">Scans, uncommitted batches, labels, checklists, and listing drafts are all up to date.</div>
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            {autoTasks.map((task) => {
+                              const pMeta = priorityBadgeStyle[task.priority] || priorityBadgeStyle.action;
+                              return (
+                                <div
+                                  key={task.id}
+                                  className="rounded-xl bg-slate-950/75 border border-slate-800 hover:border-slate-700 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition"
+                                >
+                                  <div className="min-w-0 space-y-1">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <span className={`px-2 py-0.5 rounded-md text-[9.5px] font-extrabold border shrink-0 ${pMeta.cls}`}>
+                                        {pMeta.label}
+                                      </span>
+                                      <span className="text-xs font-bold text-white break-words">
+                                        {task.icon} {task.title}
+                                      </span>
+                                    </div>
+                                    {task.detail && (
+                                      <div className="text-[11px] text-slate-400 leading-snug break-words">
+                                        {task.detail}
+                                        {task.expandableCount > 0 && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setShowAllNeverScraped((prev) => !prev)}
+                                            className={`ml-1.5 font-semibold hover:underline ${skin.accentText}`}
+                                          >
+                                            {showAllNeverScraped ? 'Show less' : `Show all ${task.expandableCount}`}
+                                          </button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {task.secondaryLabel && (
+                                      <button
+                                        type="button"
+                                        onClick={task.onSecondary}
+                                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[11px] font-semibold transition"
+                                      >
+                                        {task.secondaryLabel}
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={task.onPrimary}
+                                      className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition ${task.priority === 'urgent' ? skin.accentBtn : `${skin.accentActive} border hover:brightness-110`}`}
+                                    >
+                                      {task.primaryLabel} →
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* PERSONAL HOBBY TO-DO CHECKLIST (LOCALSTORAGE) */}
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                            📝 Personal Hobby To-Do Checklist
+                          </h3>
+                          {completedCustomCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={clearCompletedCustomTodos}
+                              className="text-[11px] font-semibold text-amber-300 hover:text-amber-200 transition"
+                            >
+                              🧹 Clear Completed ({completedCustomCount})
+                            </button>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={customTodoInput}
+                            onChange={(e) => setCustomTodoInput(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomTodo(); } }}
+                            placeholder="Add a quick reminder (e.g., Sleeve Bowman Chrome autos, ship eBay order...)"
+                            className="flex-1 min-w-0 bg-slate-950/90 border border-slate-700 focus:border-cyan-400 rounded-xl px-3 py-1.5 text-xs text-white placeholder-slate-500 outline-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={addCustomTodo}
+                            disabled={!String(customTodoInput || '').trim()}
+                            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold disabled:opacity-40 transition shrink-0 ${skin.accentBtn}`}
+                          >
+                            + Add
+                          </button>
+                        </div>
+                        {customTodos.length === 0 ? (
+                          <div className="text-[11px] text-slate-500 py-1.5">
+                            No personal reminders yet — saved automatically in your browser.
+                          </div>
+                        ) : (
+                          <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
+                            {customTodos.map((item) => (
+                              <div
+                                key={item.id}
+                                className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-slate-950/75 border border-slate-800 text-xs"
+                              >
+                                <label className="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(item.done)}
+                                    onChange={() => toggleCustomTodo(item.id)}
+                                    className="rounded border-slate-600 accent-emerald-500 shrink-0"
+                                  />
+                                  <span className={`truncate ${item.done ? 'line-through text-slate-500' : 'text-slate-200'}`}>
+                                    {item.text}
+                                  </span>
+                                </label>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  {item.createdAt && <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">{item.createdAt}</span>}
+                                  <button
+                                    type="button"
+                                    onClick={() => deleteCustomTodo(item.id)}
+                                    title="Delete reminder"
+                                    className="text-slate-500 hover:text-rose-400 text-xs px-1"
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* RIGHT COLUMN (5 of 12 cols): VISUAL ANALYTICS & SPOTLIGHT */}
+                    <div className="xl:col-span-5 space-y-4">
+                      {/* COLLECTION BREAKDOWN DONUT CARD */}
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                            🍩 Collection Breakdown
+                          </h3>
+                          <div className="flex items-center gap-2">
+                            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[10.5px]">
+                              <button
+                                type="button"
+                                onClick={() => setDashboardDonutMode('set')}
+                                className={`px-2 py-0.5 rounded-md font-bold transition ${dashboardDonutMode === 'set' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                              >
+                                By Set
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDashboardDonutMode('sport')}
+                                className={`px-2 py-0.5 rounded-md font-bold transition ${dashboardDonutMode === 'sport' ? skin.accentActive : 'text-slate-400 hover:text-white'}`}
+                              >
+                                By Sport
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setActivePage('collection_value')}
+                              className={`text-[11px] font-semibold hover:underline ${skin.accentText}`}
+                            >
+                              Full Breakdown →
+                            </button>
+                          </div>
+                        </div>
+                        <SvgDonutChart
+                          data={activeDonutData}
+                          centerLabel={inStockCards.length.toLocaleString()}
+                          centerSub={dashboardDonutMode === 'sport' ? 'Sports' : 'Cards'}
+                        />
+                      </div>
+
+                      {/* COLLECTION VALUE TREND MINI-CHART */}
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-2.5`}>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                              📈 Portfolio Value Trend
+                            </h3>
+                            {histDeltaEv !== null && (
+                              <span className={`px-1.5 py-0.5 rounded-md text-[10px] font-mono font-bold border ${histDeltaEv >= 0 ? 'bg-emerald-950/80 text-emerald-300 border-emerald-600/60' : 'bg-rose-950/80 text-rose-300 border-rose-600/60'}`}>
+                                {histDeltaEv >= 0 ? '+' : ''}{fmtCurrency(histDeltaEv)}
+                              </span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setActivePage('collection_value')}
+                            className={`text-[11px] font-semibold hover:underline ${skin.accentText}`}
+                          >
+                            View Trends →
+                          </button>
+                        </div>
+
+                        {histPts.length === 0 ? (
+                          <div className="text-xs text-slate-400 py-6 text-center bg-slate-950/60 rounded-xl border border-slate-800/80">
+                            No valuation snapshots yet — run a Market Refresh to start plotting portfolio trends.
+                          </div>
+                        ) : (() => {
+                          const rawMax = Math.max(10, ...histPts.map((h) => Math.max(safeNum(h.Total_Raw_Value), safeNum(h.Total_Optimal_EV))));
+                          const maxV = Math.ceil(rawMax * 1.12);
+                          const W = 420, H = 112, padL = 8, padR = 8, padT = 10, padB = 18;
+                          const plotW = W - padL - padR;
+                          const plotH = H - padT - padB;
+                          const toX = (i) => (histPts.length === 1 ? padL + plotW * 0.5 : padL + (i / (histPts.length - 1)) * plotW);
+                          const toY = (v) => padT + plotH - (Math.max(0, v) / maxV) * plotH;
+                          const evLine = histPts.map((h, i) => `${toX(i)},${toY(safeNum(h.Total_Optimal_EV))}`).join(' ');
+                          const rawLine = histPts.map((h, i) => `${toX(i)},${toY(safeNum(h.Total_Raw_Value))}`).join(' ');
+                          const areaPoly = histPts.length >= 2 ? `${toX(0)},${padT + plotH} ${evLine} ${toX(histPts.length - 1)},${padT + plotH}` : '';
+
+                          return (
+                            <div className="space-y-1.5">
+                              <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-28 bg-slate-950/90 rounded-xl border border-slate-800">
+                                <defs>
+                                  <linearGradient id="dashEvGrad" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#10b981" stopOpacity="0.32" />
+                                    <stop offset="100%" stopColor="#10b981" stopOpacity="0.02" />
+                                  </linearGradient>
+                                </defs>
+                                {areaPoly && <polygon fill="url(#dashEvGrad)" points={areaPoly} />}
+                                {histPts.length >= 2 && <polyline fill="none" stroke="#38bdf8" strokeWidth="1.8" strokeDasharray="3 2" points={rawLine} />}
+                                {histPts.length >= 2 && <polyline fill="none" stroke="#10b981" strokeWidth="2.4" points={evLine} />}
+                                {histPts.map((h, i) => (
+                                  <circle key={i} cx={toX(i)} cy={toY(safeNum(h.Total_Optimal_EV))} r="2.8" fill="#10b981">
+                                    <title>{`${h.Date} — Optimal EV: ${fmtCurrency(h.Total_Optimal_EV)} | Raw: ${fmtCurrency(h.Total_Raw_Value)}`}</title>
+                                  </circle>
+                                ))}
+                                <text x={padL + 2} y={H - 4} fill="#64748b" fontSize="9.5" fontFamily="monospace">
+                                  {String(histPts[0]?.Date || '').slice(0, 10)}
+                                </text>
+                                <text x={W - padR - 2} y={H - 4} textAnchor="end" fill="#64748b" fontSize="9.5" fontFamily="monospace">
+                                  {String(histPts[histPts.length - 1]?.Date || '').slice(0, 10)}
+                                </text>
+                              </svg>
+                              <div className="flex items-center justify-between text-[10.5px] text-slate-400">
+                                <span className="flex items-center gap-3">
+                                  <span className="flex items-center gap-1 text-emerald-300"><span className="w-2 h-2 rounded-full bg-emerald-400" />Optimal EV</span>
+                                  <span className="flex items-center gap-1 text-sky-300"><span className="w-2 h-2 rounded-full bg-sky-400" />Raw Value</span>
+                                </span>
+                                <span className="font-mono">{histPts.length} snapshot{histPts.length === 1 ? '' : 's'}</span>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </div>
+
+                      {/* TOP 5 MOST VALUABLE CARDS SPOTLIGHT */}
+                      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-2.5`}>
+                        <div className="flex items-center justify-between gap-2">
+                          <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                            🏆 Top 5 Most Valuable Cards
+                          </h3>
+                          <button
+                            type="button"
+                            onClick={() => setActivePage('collection_value')}
+                            className={`text-[11px] font-semibold hover:underline ${skin.accentText}`}
+                          >
+                            Top 10 →
+                          </button>
+                        </div>
+                        {top5ValuableCards.length === 0 ? (
+                          <div className="text-xs text-slate-500 py-4 text-center">No in-stock cards in Inventory yet.</div>
+                        ) : (
+                          <div className="space-y-1.5">
+                            {top5ValuableCards.map((c, idx) => {
+                              const optV = cardOptVal(c);
+                              const estPsa = safeNum(c.Est_PSA, 0);
+                              const estBgs = safeNum(c.Est_BGS, 0);
+                              return (
+                                <button
+                                  key={c.SKU || idx}
+                                  type="button"
+                                  onClick={() => c.SKU && openInventoryEditorForSkus([c.SKU], 'individual')}
+                                  title={`Open ${c.SKU} in Inventory Editor`}
+                                  className="w-full rounded-xl bg-slate-950/75 hover:bg-slate-900 border border-slate-800 hover:border-slate-600 px-3 py-2 flex items-center justify-between gap-2 text-left transition"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-1.5 text-xs font-bold text-white truncate">
+                                      <span className={`font-mono text-[10.5px] ${skin.accentText}`}>#{idx + 1}</span>
+                                      <span className="truncate">{c.Player || 'Unknown Player'}</span>
+                                      {c['Card Number'] && <span className="text-[10.5px] font-mono text-slate-400 shrink-0">#{String(c['Card Number']).replace(/^#/, '')}</span>}
+                                    </div>
+                                    <div className="text-[10.5px] text-slate-400 truncate">
+                                      {c.Set || 'Unknown Set'} • {c.Subset || 'Base'}
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-col items-end shrink-0">
+                                    <span className="text-xs font-extrabold font-mono text-emerald-400">{fmtCurrency(optV)}</span>
+                                    {(estPsa > 0 || estBgs > 0) && (
+                                      <span className="text-[9.5px] font-mono text-amber-300">
+                                        {estPsa > 0 ? `PSA ${estPsa}` : ''}{estPsa > 0 && estBgs > 0 ? ' / ' : ''}{estBgs > 0 ? `BGS ${estBgs}` : ''}
+                                      </span>
+                                    )}
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* FULL-WIDTH BOTTOM ROW: ACTIVE WORKERS & RECENT ACTIVITY FEED */}
+                  <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3`}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-xs font-extrabold uppercase tracking-wider text-white">
+                          {runningDashLanes.length > 0 ? `⚡ Active Parallel Workers (${runningDashLanes.length})` : '🕒 Recent Activity Feed'}
+                        </h3>
+                        {runningDashLanes.length > 0 && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-950 text-emerald-300 border border-emerald-600 animate-pulse">
+                            LIVE
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-[11px] font-semibold">
+                        <button type="button" onClick={() => openMonitorPage()} className={`hover:underline ${skin.accentText}`}>
+                          🖥️ Open Monitor
+                        </button>
+                        <button type="button" onClick={() => openHiddenPage('notification_history')} className="text-sky-400 hover:underline">
+                          🔔 Full Notification History →
+                        </button>
+                      </div>
+                    </div>
+
+                    {runningDashLanes.length > 0 ? (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                        {runningDashLanes.map(([lk, meta]) => {
+                          const st = liveLanes[lk] || {};
+                          const pct = Math.max(0, Math.min(100, Number(st.percent || 0)));
+                          return (
+                            <button
+                              key={lk}
+                              type="button"
+                              onClick={() => openMonitorPage(lk)}
+                              className="rounded-xl bg-slate-950/85 hover:bg-slate-900 border border-emerald-600/50 p-3 text-left space-y-2 transition"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-bold text-white truncate">
+                                  {st.job_icon || meta.icon} {st.process_name || st.title || meta.shortName}
+                                </span>
+                                <span className="font-mono text-xs font-extrabold text-emerald-300 shrink-0">{pct}%</span>
+                              </div>
+                              <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                                <div className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-all" style={{ width: `${pct}%` }} />
+                              </div>
+                              <div className="flex items-center justify-between gap-2 text-[10.5px] font-mono text-slate-400">
+                                <span className="truncate">{st.current_item || st.status || 'Running...'}</span>
+                                <span className="shrink-0 text-cyan-300">
+                                  ⏱️ {fmtEta(getLaneElapsedSec(st))} • ETA {fmtEta(st.eta_seconds)}
+                                </span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : notifications.length === 0 ? (
+                      <div className="text-xs text-slate-500 py-3 text-center">
+                        All 8 parallel worker slots are idle and no recent notifications are queued.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-5 gap-2.5">
+                        {notifications.slice(0, 5).map((n) => (
+                          <div
+                            key={n.Notification_ID}
+                            className="rounded-xl bg-slate-950/75 border border-slate-800 p-2.5 space-y-1 min-w-0"
+                          >
+                            <div className="flex items-center justify-between gap-1.5 text-[10px]">
+                              <span className={`px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-bold truncate ${skin.accentText}`}>
+                                {n.Category || 'System'}
+                              </span>
+                              <span className="font-mono text-slate-500 shrink-0">{String(n.Timestamp || '').slice(11, 19)}</span>
+                            </div>
+                            <div className="text-xs font-bold text-white truncate" title={n.Title}>{n.Title}</div>
+                            <div className="text-[11px] text-slate-400 line-clamp-2" title={n.Message}>{n.Message}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             {/* INTEGRATED MONITOR WORKSPACE PAGE (LEFT RAIL & TOP BAR REMAIN VISIBLE) */}
             {activePage === 'live_monitor' && (
               <div className={`flex-1 flex flex-col min-h-0 ${skin.cardBg} border ${skin.border} rounded-2xl p-4`}>

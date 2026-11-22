@@ -20,8 +20,8 @@ from urllib.parse import quote, urljoin
 import pandas as pd
 import requests
 
-__version__ = "0.24.0-beta.21"
-__last_updated__ = "2026-11-20 16:50:00"
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 
 try:
     from bs4 import BeautifulSoup

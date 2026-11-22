@@ -20,8 +20,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-__version__ = "0.23.0-beta.14"
-__last_updated__ = "2026-11-18 23:45:00"
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 
 try:
     from bs4 import BeautifulSoup

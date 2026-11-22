@@ -19,8 +19,8 @@ from typing import Callable, Optional
 
 import pandas as pd
 
-__version__ = "0.24.0-beta.45"
-__last_updated__ = "2026-11-21 15:05:00"
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 
 from Core.config import (
     ACTIVE_BATCH_FILE,

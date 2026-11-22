@@ -20,8 +20,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
-__version__ = "0.24.0-beta.42"
-__last_updated__ = "2026-11-21 02:45:00"
+__version__ = "0.25.0-beta.1"
+__last_updated__ = "2026-11-21 18:45:00"
 
 from Core.compute_backend import create_onnx_session, load_compute_settings
 from Core.config import (
