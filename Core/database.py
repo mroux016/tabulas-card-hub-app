@@ -40,12 +40,14 @@ from Core.config import (
     REFERENCE_TEMPLATES_DIR,
     REVIEWED_CARDS_DIR,
     SKU_START,
+    atomic_write_bytes,
     build_card_image_filenames,
     build_card_image_stem,
     canonical_set_key,
     canonical_subset_key,
     ensure_directories,
     format_print_run,
+    interprocess_file_lock,
     norm,
     parse_unified_card_filename,
     sanitize_filename_part,
@@ -435,9 +437,10 @@ def load_master_checklist(
 
     if is_master_file:
         try:
-            CHECKLIST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CHECKLIST_CACHE_FILE, "wb") as f:
-                pickle.dump({"mtime": mtime, "data": result_tuple}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            def _dump_chk_cache(tmp_p: Path):
+                with open(tmp_p, "wb") as f:
+                    pickle.dump({"mtime": mtime, "data": result_tuple}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            atomic_write_bytes(CHECKLIST_CACHE_FILE, _dump_chk_cache)
         except Exception:
             pass
 
@@ -587,7 +590,12 @@ def save_inventory_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Card Number"] = out["Card Number"].astype(str).str.strip().str.lstrip("#")
     out["Print Run"] = out["Print Run"].map(format_print_run)
     out = out[INVENTORY_COLUMNS]
-    out.to_csv(INVENTORY_FILE, index=False, encoding="utf-8-sig")
+    inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+    with interprocess_file_lock(inv_lock):
+        atomic_write_bytes(
+            INVENTORY_FILE,
+            lambda tmp_p: out.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+        )
     return out
 
 
@@ -1182,6 +1190,7 @@ def apply_manifest_overrides_and_rename(
     df = assign_missing_skus(df)
 
     copy_tracker = defaultdict(int)
+    seeded_inventory_stems: set[str] = set()
     renamed_count = 0
     override_applied_count = 0
     temp_moves = []
@@ -1247,8 +1256,9 @@ def apply_manifest_overrides_and_rename(
             df.at[row_idx, oc] = ""
 
         card_stem = build_card_image_stem(set_name, final_sub, cnum_final, player_final)
-        if card_stem not in copy_tracker:
-            copy_tracker[card_stem] = get_existing_copy_count(set_name, final_sub, cnum_final, player_final)
+        if card_stem not in seeded_inventory_stems:
+            copy_tracker[card_stem] += get_existing_copy_count(set_name, final_sub, cnum_final, player_final)
+            seeded_inventory_stems.add(card_stem)
         copy_tracker[card_stem] += 1
         copy_num = copy_tracker[card_stem]
 
@@ -1718,13 +1728,16 @@ def commit_batch_to_inventory_v2(
         log_cb(f"  💾 Moved {moved_images:,} scan image(s) to _My_Collection. Syncing copy numbers & writing Inventory.csv...")
 
     new_df = pd.DataFrame(new_rows, columns=INVENTORY_COLUMNS)
-    combined_df = new_df if prev_inv_df.empty else pd.concat([prev_inv_df, new_df], ignore_index=True)
-
-    try:
-        synced_df, _ = sync_inventory_copy_numbers_and_files(combined_df, previous_inv_df=prev_inv_df)
-    except Exception:
-        synced_df = combined_df
-    save_inventory_df(synced_df)
+    inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+    with interprocess_file_lock(inv_lock):
+        latest_inv_df = load_inventory_df()
+        combined_df = new_df if latest_inv_df.empty else pd.concat([latest_inv_df, new_df], ignore_index=True)
+        combined_df = assign_missing_skus(combined_df)
+        try:
+            synced_df, _ = sync_inventory_copy_numbers_and_files(combined_df, previous_inv_df=latest_inv_df)
+        except Exception:
+            synced_df = combined_df
+        save_inventory_df(synced_df)
 
     # Mark committed immediately before archive moves so UI never sees a ghost batch
     try:

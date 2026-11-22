@@ -94,6 +94,7 @@ from Core.config import (
     REFERENCE_TEMPLATES_DIR,
     REVIEWED_CARDS_DIR,
     RUNTIME_CONFIG,
+    atomic_write_bytes,
     build_card_image_filenames,
     build_card_image_stem,
     canonical_set_key,
@@ -2167,12 +2168,11 @@ def _flush_border_sig_cache(force: bool = False):
         return
     _BORDER_SIG_DIRTY_CNT = 0
     try:
-        _BORDER_SIG_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         trimmed = dict(list(_LAZY_BORDER_SIG_CACHE.items())[-4000:])
-        tmp_p = _BORDER_SIG_CACHE_FILE.with_suffix(".tmp")
-        with open(tmp_p, "wb") as f:
-            pickle.dump(trimmed, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(str(tmp_p), str(_BORDER_SIG_CACHE_FILE))
+        def _dump_border_sig(tmp_p: Path):
+            with open(tmp_p, "wb") as f:
+                pickle.dump(trimmed, f, protocol=pickle.HIGHEST_PROTOCOL)
+        atomic_write_bytes(_BORDER_SIG_CACHE_FILE, _dump_border_sig)
     except Exception:
         pass
 
@@ -3910,9 +3910,10 @@ def index_set_templates_and_reviewed_cards(
     if not locked_key:
         _MEM_TEMPLATE_CACHE = out_tuple
         try:
-            FEATURE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(FEATURE_CACHE_FILE, "wb") as f:
-                pickle.dump({"schema": "v24_lazy", "data": out_tuple}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            def _dump_feat_cache(tmp_p: Path):
+                with open(tmp_p, "wb") as f:
+                    pickle.dump({"schema": "v24_lazy", "data": out_tuple}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            atomic_write_bytes(FEATURE_CACHE_FILE, _dump_feat_cache)
         except Exception:
             pass
 

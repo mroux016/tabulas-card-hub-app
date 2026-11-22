@@ -2,14 +2,17 @@ from __future__ import annotations
 # ==============================================================================
 # Core/config.py - CENTRALIZED PATHS, CONSTANTS, PSA/BGS MATRICES & VERSION REGISTRY
 # ==============================================================================
+import contextlib
 import os
 import re
 import shutil
 import sys
+import threading
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 __version__ = "0.24.0-beta.45"
 __last_updated__ = "2026-11-21 15:05:00"
@@ -1090,3 +1093,184 @@ def ensure_directories():
         except Exception:
             pass
     relocate_root_downloaded_files()
+
+
+# ==============================================================================
+# WINDOWS-SAFE ATOMIC FILE PERSISTENCE & STALE-SAFE CROSS-PROCESS FILE LOCKS
+# ==============================================================================
+_LOCAL_LOCK_REGISTRY_GUARD = threading.Lock()
+_LOCAL_PATH_RLOCKS: dict[str, threading.RLock] = {}
+_LOCAL_LOCK_DEPTH: dict[tuple[str, int], int] = {}
+
+
+def _is_lock_holder_pid_alive(pid: int) -> bool:
+    try:
+        pid_i = int(pid or 0)
+        if pid_i <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid_i)
+            if not h:
+                return ctypes.GetLastError() == 5
+            try:
+                code = ctypes.c_ulong()
+                if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return code.value == 259
+                return True
+            finally:
+                k32.CloseHandle(h)
+        os.kill(pid_i, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def atomic_write_bytes(
+    target_path: Path,
+    writer_fn: Callable[[Path], None],
+    retries: int = 5,
+):
+    """
+    Writes `target_path` atomically via a PID+thread-qualified `.tmp` file and `os.replace()`
+    with short retry backoff for Windows transient file-lock/AV contention and guaranteed `.tmp` cleanup.
+    """
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_p = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    backoffs = (0.04, 0.06, 0.09, 0.12, 0.15)
+    try:
+        writer_fn(tmp_p)
+        last_err: Optional[Exception] = None
+        attempts = max(1, int(retries))
+        for attempt in range(attempts):
+            try:
+                os.replace(str(tmp_p), str(target))
+                return
+            except (PermissionError, OSError) as exc:
+                last_err = exc
+                if attempt + 1 < attempts:
+                    time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+        if last_err is not None:
+            raise last_err
+    finally:
+        try:
+            if tmp_p.exists():
+                tmp_p.unlink()
+        except Exception:
+            pass
+
+
+def atomic_write_text(
+    target_path: Path,
+    text: str,
+    encoding: str = "utf-8",
+    retries: int = 5,
+):
+    """Windows-safe atomic text/JSON writer backed by `atomic_write_bytes()`."""
+    atomic_write_bytes(
+        target_path,
+        lambda tmp_p: tmp_p.write_text(text, encoding=encoding),
+        retries=retries,
+    )
+
+
+@contextlib.contextmanager
+def interprocess_file_lock(
+    lock_path: Path,
+    timeout: float = 20.0,
+    stale_seconds: float = 30.0,
+):
+    """
+    Re-entrant, stale-safe cross-process & multi-thread file lock using atomic `O_CREAT|O_EXCL`.
+    Automatically recovers stale locks left by crashed/force-killed workers (dead PID or age > `stale_seconds`).
+    """
+    lp = Path(lock_path)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    key = str(lp.resolve()).lower()
+    tid = threading.get_ident()
+
+    with _LOCAL_LOCK_REGISTRY_GUARD:
+        local_rlock = _LOCAL_PATH_RLOCKS.get(key)
+        if local_rlock is None:
+            local_rlock = threading.RLock()
+            _LOCAL_PATH_RLOCKS[key] = local_rlock
+
+    local_rlock.acquire()
+    depth_key = (key, tid)
+    prev_depth = _LOCAL_LOCK_DEPTH.get(depth_key, 0)
+    if prev_depth > 0:
+        _LOCAL_LOCK_DEPTH[depth_key] = prev_depth + 1
+        try:
+            yield
+        finally:
+            _LOCAL_LOCK_DEPTH[depth_key] = prev_depth
+            local_rlock.release()
+        return
+
+    acquired_os_lock = False
+    deadline = time.time() + max(0.5, float(timeout))
+    token = f"{os.getpid()}|{tid}|{time.time():.6f}"
+    try:
+        while True:
+            try:
+                fd = os.open(str(lp), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, token.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                acquired_os_lock = True
+                break
+            except FileExistsError:
+                now_t = time.time()
+                should_break = False
+                try:
+                    st = lp.stat()
+                    if (now_t - st.st_mtime) > float(stale_seconds):
+                        should_break = True
+                    else:
+                        raw_meta = lp.read_text(encoding="utf-8", errors="ignore").strip()
+                        parts = raw_meta.split("|")
+                        if parts and parts[0].isdigit():
+                            holder_pid = int(parts[0])
+                            if holder_pid != os.getpid() and not _is_lock_holder_pid_alive(holder_pid):
+                                should_break = True
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    pass
+
+                if should_break:
+                    try:
+                        lp.unlink()
+                    except Exception:
+                        pass
+                    continue
+
+                if now_t >= deadline:
+                    # Break stuck lock after timeout rather than hanging worker indefinitely
+                    try:
+                        lp.unlink()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.04)
+
+        _LOCAL_LOCK_DEPTH[depth_key] = 1
+        yield
+    finally:
+        _LOCAL_LOCK_DEPTH.pop(depth_key, None)
+        if acquired_os_lock:
+            try:
+                if lp.exists():
+                    cur_tok = lp.read_text(encoding="utf-8", errors="ignore").strip()
+                    if cur_tok == token:
+                        lp.unlink()
+            except Exception:
+                pass
+        local_rlock.release()

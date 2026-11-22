@@ -66,6 +66,7 @@ from Core.config import (
     TABULAS_VENV_PYTHON,
     TCDB_STANDARD_GLOSSARY,
     TRACKING_FILE,
+    atomic_write_text,
     build_template_image_filename,
     build_template_image_filenames,
     canonical_set_key,
@@ -2478,10 +2479,7 @@ def load_dead_backs_cache() -> dict[str, float]:
 def save_dead_backs_cache(cache_dict: dict[str, float]):
     ensure_directories()
     try:
-        DEAD_BACKS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp_p = DEAD_BACKS_CACHE_FILE.with_suffix(".tmp")
-        tmp_p.write_text(json.dumps(cache_dict, indent=2), encoding="utf-8")
-        os.replace(str(tmp_p), str(DEAD_BACKS_CACHE_FILE))
+        atomic_write_text(DEAD_BACKS_CACHE_FILE, json.dumps(cache_dict, indent=2), encoding="utf-8")
     except Exception:
         pass
 

@@ -25,7 +25,13 @@ import numpy as np
 __version__ = "0.24.0-beta.42"
 __last_updated__ = "2026-11-21 02:45:00"
 
-from Core.config import COMPUTE_SETTINGS_FILE, GPU_WORKER_CLAIMS_FILE, ensure_directories
+from Core.config import (
+    COMPUTE_SETTINGS_FILE,
+    GPU_WORKER_CLAIMS_FILE,
+    atomic_write_text,
+    ensure_directories,
+    interprocess_file_lock,
+)
 
 DEFAULT_COMPUTE_SETTINGS = {
     "compute_mode": "auto",  # "auto" | "directml" | "cuda" | "cpu"
@@ -114,10 +120,7 @@ def save_compute_settings(updates: dict) -> dict:
         curr["enable_neural_embeddings"] = bool(curr.get("enable_neural_embeddings", True))
         curr["max_concurrent_gpu_workers"] = max(1, min(8, int(curr.get("max_concurrent_gpu_workers", 2))))
         try:
-            COMPUTE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = COMPUTE_SETTINGS_FILE.with_suffix(".tmp")
-            tmp_p.write_text(json.dumps(curr, indent=2), encoding="utf-8")
-            os.replace(str(tmp_p), str(COMPUTE_SETTINGS_FILE))
+            atomic_write_text(COMPUTE_SETTINGS_FILE, json.dumps(curr, indent=2), encoding="utf-8")
         except Exception:
             pass
     _PROCESS_FORCED_CPU = False
@@ -187,10 +190,7 @@ def _read_and_prune_gpu_claims() -> dict[str, dict]:
 
 def _write_gpu_claims(claims: dict[str, dict]):
     try:
-        GPU_WORKER_CLAIMS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp_p = GPU_WORKER_CLAIMS_FILE.with_name(f"{GPU_WORKER_CLAIMS_FILE.name}.{os.getpid()}.tmp")
-        tmp_p.write_text(json.dumps(claims, indent=2), encoding="utf-8")
-        os.replace(str(tmp_p), str(GPU_WORKER_CLAIMS_FILE))
+        atomic_write_text(GPU_WORKER_CLAIMS_FILE, json.dumps(claims, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -204,31 +204,35 @@ def claim_gpu_worker_slot(job_type: str = "vision") -> tuple[bool, int, int]:
     cfg = load_compute_settings()
     max_gpu = int(cfg.get("max_concurrent_gpu_workers", 2))
     my_pid = str(os.getpid())
-    claims = _read_and_prune_gpu_claims()
-    if my_pid in claims:
+    claims_lock = GPU_WORKER_CLAIMS_FILE.with_suffix(".json.lock")
+    with interprocess_file_lock(claims_lock):
+        claims = _read_and_prune_gpu_claims()
+        if my_pid in claims:
+            _PROCESS_CLAIMED_GPU = True
+            return True, len(claims), max_gpu
+        if len(claims) >= max_gpu:
+            _PROCESS_CLAIMED_GPU = False
+            return False, len(claims), max_gpu
+        claims[my_pid] = {
+            "pid": os.getpid(),
+            "job_type": str(job_type or "vision"),
+            "claimed_at": time.time(),
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _write_gpu_claims(claims)
         _PROCESS_CLAIMED_GPU = True
         return True, len(claims), max_gpu
-    if len(claims) >= max_gpu:
-        _PROCESS_CLAIMED_GPU = False
-        return False, len(claims), max_gpu
-    claims[my_pid] = {
-        "pid": os.getpid(),
-        "job_type": str(job_type or "vision"),
-        "claimed_at": time.time(),
-        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    _write_gpu_claims(claims)
-    _PROCESS_CLAIMED_GPU = True
-    return True, len(claims), max_gpu
 
 
 def release_gpu_worker_slot():
     global _PROCESS_CLAIMED_GPU
     my_pid = str(os.getpid())
-    claims = _read_and_prune_gpu_claims()
-    if my_pid in claims:
-        claims.pop(my_pid, None)
-        _write_gpu_claims(claims)
+    claims_lock = GPU_WORKER_CLAIMS_FILE.with_suffix(".json.lock")
+    with interprocess_file_lock(claims_lock):
+        claims = _read_and_prune_gpu_claims()
+        if my_pid in claims:
+            claims.pop(my_pid, None)
+            _write_gpu_claims(claims)
     _PROCESS_CLAIMED_GPU = False
 
 

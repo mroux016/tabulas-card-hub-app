@@ -16,7 +16,7 @@ from typing import Optional
 __version__ = "0.24.0-beta.5"
 __last_updated__ = "2026-11-19 18:20:00"
 
-from Core.config import LOGS_DIR, SET_LIBRARY_CACHE_DIR, ensure_directories
+from Core.config import LOGS_DIR, SET_LIBRARY_CACHE_DIR, atomic_write_text, ensure_directories
 
 RATE_LEARNER_STATE_FILE = LOGS_DIR / "adaptive_rate_learner.json"
 
@@ -197,10 +197,7 @@ class AdaptiveRateLearner:
         try:
             ensure_directories()
             self._state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = self.state_file.with_suffix(".tmp")
-            tmp_p.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
-            os.replace(str(tmp_p), str(self.state_file))
+            atomic_write_text(self.state_file, json.dumps(self._state, indent=2), encoding="utf-8")
         except Exception:
             pass
 

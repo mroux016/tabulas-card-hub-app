@@ -29,6 +29,7 @@ from Core.config import (
     NEURAL_MODELS_DIR,
     REFERENCE_TEMPLATES_DIR,
     REVIEWED_CARDS_DIR,
+    atomic_write_bytes,
     canonical_set_key,
     ensure_directories,
     norm,
@@ -77,7 +78,7 @@ _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3,
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 
 _ENGINE_LOCK = threading.Lock()
-_INDEX_LOCK = threading.Lock()
+_INDEX_LOCK = threading.RLock()
 _SINGLETON_ENGINE: Optional["NeuralEmbeddingEngine"] = None
 _MEM_EMBED_CACHE: Optional[dict] = None
 _MEM_EMBED_MTIME: float = -1.0
@@ -447,12 +448,11 @@ def save_neural_embeddings_cache(cache_obj: dict):
     global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME, _MEM_EMBED_DIRTY_COUNT
     with _INDEX_LOCK:
         try:
-            NEURAL_EMBEDDINGS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             cache_obj["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            tmp_p = NEURAL_EMBEDDINGS_CACHE_FILE.with_name(f"{NEURAL_EMBEDDINGS_CACHE_FILE.name}.{os.getpid()}.tmp")
-            with open(tmp_p, "wb") as f:
-                pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(str(tmp_p), str(NEURAL_EMBEDDINGS_CACHE_FILE))
+            def _dump_embs(tmp_p: Path):
+                with open(tmp_p, "wb") as f:
+                    pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            atomic_write_bytes(NEURAL_EMBEDDINGS_CACHE_FILE, _dump_embs)
             _MEM_EMBED_CACHE = cache_obj
             _MEM_EMBED_MTIME = NEURAL_EMBEDDINGS_CACHE_FILE.stat().st_mtime
             _MEM_EMBED_DIRTY_COUNT = 0
@@ -473,16 +473,17 @@ def get_or_compute_image_embedding(img_path: Path | str, auto_persist: bool = Tr
     if not p_obj.exists():
         return None
     k = _norm_path_key(p_obj)
-    cache = load_neural_embeddings_cache()
-    embs = cache.setdefault("embeddings", {})
-    rec = embs.get(k)
     try:
         cur_mt = p_obj.stat().st_mtime
     except Exception:
         cur_mt = 0.0
 
-    if isinstance(rec, dict) and rec.get("vec") is not None and abs(float(rec.get("mtime", 0.0)) - cur_mt) < 2.0:
-        return np.asarray(rec["vec"], dtype=np.float32)
+    with _INDEX_LOCK:
+        cache = load_neural_embeddings_cache()
+        embs = cache.setdefault("embeddings", {})
+        rec = embs.get(k)
+        if isinstance(rec, dict) and rec.get("vec") is not None and abs(float(rec.get("mtime", 0.0)) - cur_mt) < 2.0:
+            return np.asarray(rec["vec"], dtype=np.float32)
 
     eng = get_neural_embedding_engine(load_now=True)
     if eng is None or not eng.is_ready:
@@ -495,7 +496,7 @@ def get_or_compute_image_embedding(img_path: Path | str, auto_persist: bool = Tr
             return None
         parsed = parse_unified_card_filename(p_obj.name) or {}
         s_name = parsed.get("set") or p_obj.parent.name.replace("_", " ")
-        embs[k] = {
+        entry = {
             "path": str(p_obj),
             "mtime": cur_mt,
             "set_key": canonical_set_key(s_name),
@@ -505,9 +506,13 @@ def get_or_compute_image_embedding(img_path: Path | str, auto_persist: bool = Tr
             "source": "My_Collection" if str(REVIEWED_CARDS_DIR).lower() in k else "Reference_Library",
             "vec": vec.astype(np.float16),
         }
-        _MEM_EMBED_DIRTY_COUNT += 1
-        if auto_persist and _MEM_EMBED_DIRTY_COUNT >= 40:
-            save_neural_embeddings_cache(cache)
+        with _INDEX_LOCK:
+            cache = load_neural_embeddings_cache()
+            embs = cache.setdefault("embeddings", {})
+            embs[k] = entry
+            _MEM_EMBED_DIRTY_COUNT += 1
+            if auto_persist and _MEM_EMBED_DIRTY_COUNT >= 40:
+                save_neural_embeddings_cache(cache)
         return vec
     except Exception:
         return None

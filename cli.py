@@ -51,6 +51,7 @@ from Core.config import (
     SET_LIBRARY_ROOT,
     TABULAS_VENV_PYTHON,
     UNPROCESSED_CARDS_DIR,
+    atomic_write_text,
     ensure_directories,
     get_daily_log_dir,
     inspect_all_module_versions,
@@ -633,8 +634,23 @@ def start_or_queue_background_job(
         env = os.environ.copy()
         env["CARDS_BASE_DIR"] = str(BASE_DIR)
         env["TABULAS_SET_LIBRARY_DIR"] = str(SET_LIBRARY_ROOT)
+        env["TABULAS_ARCHIVE_DIR"] = str(ARCHIVE_DIR)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
+
+        launch_ep = time.time()
+        est_total = max(1, int(payload.get("estimated_total", 1)))
+        write_job_state(
+            "RUNNING",
+            job_type,
+            title,
+            current=0,
+            total=est_total,
+            current_item=f"Launching worker -> {task_log_file.name}",
+            start_epoch=launch_ep,
+            pid=0,
+            lane=target_slot,
+        )
 
         log_fh = open(task_log_file, "a", encoding="utf-8")
         try:
@@ -642,17 +658,24 @@ def start_or_queue_background_job(
         finally:
             log_fh.close()
 
-        write_job_state(
-            "RUNNING",
-            job_type,
-            title,
-            current=0,
-            total=max(1, int(payload.get("estimated_total", 1))),
-            current_item=f"Starting PID {proc.pid} -> {task_log_file.name}",
-            start_epoch=time.time(),
-            pid=proc.pid,
-            lane=target_slot,
-        )
+        # Attach child PID only if child has not already written newer progress or finished
+        cur_st = get_active_job_state(lane=target_slot)
+        if (
+            cur_st.get("status") == "RUNNING"
+            and int(cur_st.get("pid", 0)) == 0
+            and abs(float(cur_st.get("start_epoch", 0.0)) - launch_ep) < 1.0
+        ):
+            write_job_state(
+                "RUNNING",
+                job_type,
+                title,
+                current=0,
+                total=est_total,
+                current_item=f"Starting PID {proc.pid} -> {task_log_file.name}",
+                start_epoch=launch_ep,
+                pid=proc.pid,
+                lane=target_slot,
+            )
         return {
             "pid": proc.pid,
             "queued": False,
@@ -1014,20 +1037,9 @@ def _is_pid_running(pid: int) -> bool:
 
 
 def _atomic_write_json_file(target_path: Path, data: dict):
-    """Writes JSON atomically via unique `.tmp` + `os.replace()` so UI pollers never read a torn 0-byte file."""
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_p = target_path.with_name(f"{target_path.name}.{os.getpid()}.tmp")
-    raw_txt = json.dumps(data, indent=2)
-    for attempt in range(4):
-        try:
-            tmp_p.write_text(raw_txt, encoding="utf-8")
-            os.replace(str(tmp_p), str(target_path))
-            return
-        except Exception:
-            time.sleep(0.03 * (attempt + 1))
+    """Writes JSON atomically via unique PID+thread `.tmp` + retry `os.replace()` so UI pollers never read a torn 0-byte file."""
     try:
-        if tmp_p.exists():
-            tmp_p.unlink()
+        atomic_write_text(target_path, json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
 
