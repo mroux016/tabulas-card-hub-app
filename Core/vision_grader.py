@@ -5508,15 +5508,21 @@ def _locate_inventory_card_images(row: dict, sku_str: str) -> tuple[Optional[Pat
         c_p = None
 
     # Fallback lookup by exact 7-digit SKU suffix anywhere under _My_Collection
+    # Matches both unified `_[{sku}]_{F|B|C}.jpg` and legacy `_{sku}_{F|B|C}.jpg` without glob bracket wildcards
     if (f_p is None or b_p is None) and sku_str and REVIEWED_CARDS_DIR.exists():
-        for cand in REVIEWED_CARDS_DIR.rglob(f"*_{sku_str}_*.jpg"):
+        sku_up = sku_str.upper()
+        for cand in REVIEWED_CARDS_DIR.rglob("*.jpg"):
             n_up = cand.name.upper()
-            if f_p is None and n_up.endswith(f"_{sku_str}_F.JPG"):
+            if f"_[{sku_up}]_" not in n_up and f"_{sku_up}_" not in n_up:
+                continue
+            if f_p is None and (n_up.endswith(f"_[{sku_up}]_F.JPG") or n_up.endswith(f"_{sku_up}_F.JPG")):
                 f_p = cand
-            elif b_p is None and n_up.endswith(f"_{sku_str}_B.JPG"):
+            elif b_p is None and (n_up.endswith(f"_[{sku_up}]_B.JPG") or n_up.endswith(f"_{sku_up}_B.JPG")):
                 b_p = cand
-            elif c_p is None and n_up.endswith(f"_{sku_str}_C.JPG"):
+            elif c_p is None and (n_up.endswith(f"_[{sku_up}]_C.JPG") or n_up.endswith(f"_{sku_up}_C.JPG")):
                 c_p = cand
+            if f_p is not None and b_p is not None and c_p is not None:
+                break
     return f_p, b_p, c_p
 
 

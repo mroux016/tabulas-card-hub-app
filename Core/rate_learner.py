@@ -124,7 +124,7 @@ class AdaptiveRateLearner:
 
     def __init__(self, state_file: Path = RATE_LEARNER_STATE_FILE):
         self.state_file = Path(state_file)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._windows: dict[str, deque[float]] = {}
         self._last_req_ts: dict[str, float] = {}
         self._consecutive_429: dict[str, int] = {}
@@ -708,7 +708,7 @@ class AdaptiveRateLearner:
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             self._save_state(force=True)
-            return self.get_dashboard_summary()
+        return self.get_dashboard_summary()
 
     def get_dashboard_summary(self) -> dict:
         with self._lock:

@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 __version__ = "0.24.0-beta.45"
 __last_updated__ = "2026-11-21 15:05:00"
 

@@ -3014,25 +3014,73 @@ def _merge_set_checklist_into_master(set_df: pd.DataFrame, checklist_set_name: s
             set_df[col] = ""
     set_csv_path = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(checklist_set_name)}.csv"
     set_df = set_df[CHECKLIST_COLUMNS]
-    set_df.to_csv(set_csv_path, index=False, encoding="utf-8-sig")
+    tmp_set_csv = set_csv_path.with_name(f"{set_csv_path.name}.{os.getpid()}.tmp")
+    set_df.to_csv(tmp_set_csv, index=False, encoding="utf-8-sig")
+    os.replace(str(tmp_set_csv), str(set_csv_path))
 
-    if CHECKLIST_PATH.exists():
-        try:
-            master_df = pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False)
+    merged_master = None
+    if CHECKLIST_PATH.exists() and CHECKLIST_PATH.stat().st_size > 0:
+        master_df = None
+        last_read_err = None
+        for attempt in range(4):
+            try:
+                master_df = pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False)
+                break
+            except Exception as read_err:
+                last_read_err = read_err
+                time.sleep(0.08 * (attempt + 1))
+
+        if master_df is None and CHECKLIST_BACKUP_PATH.exists() and CHECKLIST_BACKUP_PATH.stat().st_size > 0:
+            try:
+                master_df = pd.read_csv(CHECKLIST_BACKUP_PATH, dtype=str, keep_default_na=False)
+                log_msg(f"  [!] Master_Checklist.csv read locked ({last_read_err}); recovered other sets from Master_Checklist_Backup.csv.")
+            except Exception:
+                master_df = None
+
+        if master_df is None:
+            # Never wipe Master_Checklist.csv with a single set on transient read/lock error.
+            # Try safe rebuild from all Set_Checklists/*.csv; abort master write if any other set CSV fails to load.
+            rebuilt_parts = []
+            rebuild_ok = True
+            for other_csv in sorted(SET_CHECKLISTS_DIR.glob("*.csv")):
+                if other_csv.resolve() == set_csv_path.resolve():
+                    continue
+                try:
+                    part_df = pd.read_csv(other_csv, dtype=str, keep_default_na=False)
+                    for col in CHECKLIST_COLUMNS:
+                        if col not in part_df.columns:
+                            part_df[col] = ""
+                    part_df["Set"] = part_df["Set"].map(canonicalize_checklist_set_title)
+                    part_df = part_df[part_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS]
+                    if not part_df.empty:
+                        rebuilt_parts.append(part_df)
+                except Exception:
+                    rebuild_ok = False
+                    break
+            if rebuild_ok:
+                rebuilt_parts.append(set_df)
+                merged_master = pd.concat(rebuilt_parts, ignore_index=True)
+                log_msg(f"  [!] Rebuilt Master_Checklist.csv safely from {len(rebuilt_parts)} set checklist CSV(s) after transient read error ({last_read_err}).")
+            else:
+                log_msg(f"  [!] Skipped Master_Checklist.csv overwrite to prevent data loss (transient read error: {last_read_err}). Set CSV saved safely: {set_csv_path.name}")
+                return
+        else:
             for col in CHECKLIST_COLUMNS:
                 if col not in master_df.columns:
                     master_df[col] = ""
             master_df["Set"] = master_df["Set"].map(canonicalize_checklist_set_title)
             other_sets_df = master_df[master_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS].copy()
             merged_master = pd.concat([other_sets_df, set_df], ignore_index=True) if not other_sets_df.empty else set_df
-        except Exception:
-            merged_master = set_df
     else:
         merged_master = set_df
 
-    merged_master[CHECKLIST_COLUMNS].to_csv(CHECKLIST_PATH, index=False, encoding="utf-8-sig")
+    tmp_master_csv = CHECKLIST_PATH.with_name(f"{CHECKLIST_PATH.name}.{os.getpid()}.tmp")
+    merged_master[CHECKLIST_COLUMNS].to_csv(tmp_master_csv, index=False, encoding="utf-8-sig")
+    os.replace(str(tmp_master_csv), str(CHECKLIST_PATH))
     try:
-        shutil.copy2(CHECKLIST_PATH, CHECKLIST_BACKUP_PATH)
+        tmp_backup_csv = CHECKLIST_BACKUP_PATH.with_name(f"{CHECKLIST_BACKUP_PATH.name}.{os.getpid()}.tmp")
+        shutil.copy2(CHECKLIST_PATH, tmp_backup_csv)
+        os.replace(str(tmp_backup_csv), str(CHECKLIST_BACKUP_PATH))
     except Exception:
         pass
 

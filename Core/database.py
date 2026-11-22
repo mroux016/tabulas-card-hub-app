@@ -634,21 +634,27 @@ def assign_missing_skus(df: pd.DataFrame) -> pd.DataFrame:
     if "SKU" not in out.columns:
         out["SKU"] = ""
 
-    existing_valid = set()
+    existing_valid: set[str] = set()
+    needs_sku_indices = []
     max_in_df = SKU_START - 1
-    for v in out["SKU"]:
+    for idx, v in out["SKU"].items():
         s = str(v).strip()
         if s.isdigit() and int(s) >= SKU_START:
             val_i = int(s)
-            existing_valid.add(s)
             max_in_df = max(max_in_df, val_i)
+            if s in existing_valid:
+                needs_sku_indices.append(idx)
+            else:
+                existing_valid.add(s)
+                out.at[idx, "SKU"] = s
+        else:
+            needs_sku_indices.append(idx)
 
-    needs_sku_mask = ~out["SKU"].astype(str).str.strip().isin(existing_valid)
-    if not needs_sku_mask.any():
+    if not needs_sku_indices:
         return out
 
     next_val = max(get_next_sku_int(), max_in_df + 1)
-    for idx in out[needs_sku_mask].index:
+    for idx in needs_sku_indices:
         while f"{next_val:07d}" in existing_valid:
             next_val += 1
         sku_str = f"{next_val:07d}"
@@ -1512,10 +1518,16 @@ def remove_cards_from_batch(
                             deleted_files += 1
                         except Exception:
                             pass
-            # Also catch any orphaned _{SKU}_{F|B|C}.jpg matching the removed SKU
+            # Also catch any orphaned _[{SKU}]_{F|B|C}.jpg or legacy _{SKU}_{F|B|C}.jpg matching the removed SKU
             sk_s = str(r.get("SKU") or "").strip()
             if sk_s:
-                for cand_f in batch_dir.glob(f"*_{sk_s}_*.jpg"):
+                sk_up = sk_s.upper()
+                for cand_f in batch_dir.glob("*.jpg"):
+                    if not cand_f.is_file():
+                        continue
+                    n_up = cand_f.name.upper()
+                    if f"_[{sk_up}]_" not in n_up and f"_{sk_up}_" not in n_up:
+                        continue
                     try:
                         cand_f.unlink()
                         deleted_files += 1
@@ -1663,7 +1675,7 @@ def commit_batch_to_inventory_v2(
             "Copy_Number": str(r.get("Copy_Number") or "1").strip(),
             "Status": str(r.get("Status") or "In Stock").strip() or "In Stock",
             "Hold_Tag": str(r.get("Hold_Tag") or "For Sale").strip() or "For Sale",
-            "Label_Printed": "False",
+            "Label_Printed": str(r.get("Label_Printed") or "False").strip() or "False",
             "Needs_Review": str(r.get("Needs_Review") or "False").strip() or "False",
             "Source_Batch": batch_name,
             "Date_Added": today_str,
@@ -1673,9 +1685,8 @@ def commit_batch_to_inventory_v2(
             "Matched_Template_Front": str(r.get("Matched_Template_Front") or "").strip(),
             "Matched_Template_Back": str(r.get("Matched_Template_Back") or "").strip(),
             "OCR_Confidence": str(r.get("OCR_Confidence") or "").strip(),
-            "OCR_Signals": str(r.get("OCR_Signals") or "").strip(),
             "Template_Similarity": str(r.get("Template_Similarity") or "").strip(),
-            "Top_3_Template_Candidates": str(r.get("Top_3_Template_Candidates") or "").strip(),
+            "Est_Grade": str(r.get("Est_Grade") or "").strip(),
             "Est_PSA": str(r.get("Est_PSA") or "").strip(),
             "Est_BGS": str(r.get("Est_BGS") or "").strip(),
             "Centering_LR": str(r.get("Centering_LR") or "").strip(),
@@ -1688,6 +1699,9 @@ def commit_batch_to_inventory_v2(
             "Raw_Price": str(r.get("Raw_Price") or "1.00").strip(),
             "Min_Sale_Price": str(r.get("Min_Sale_Price") or "").strip(),
             "Rec_Sale_Price": str(r.get("Rec_Sale_Price") or r.get("Raw_Price") or "1.49").strip(),
+            "PSA_9_Price": str(r.get("PSA_9_Price") or "").strip(),
+            "BGS_9_5_Price": str(r.get("BGS_9_5_Price") or "").strip(),
+            "PSA_10_Price": str(r.get("PSA_10_Price") or "").strip(),
             "Est_Graded_PSA": str(r.get("Est_Graded_PSA") or "").strip(),
             "Est_Graded_BGS": str(r.get("Est_Graded_BGS") or "").strip(),
             "EV_PSA": str(r.get("EV_PSA") or "").strip(),
