@@ -2221,10 +2221,12 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 if res_geom.get("success"):
                     gb = res_geom.get("gradesBefore") or {}
                     ga = res_geom.get("gradesAfter") or {}
+                    skew_info = f" | skew={payload.get('skew_deg')}°" if payload.get("skew_deg") is not None else ""
+                    fmt_info = f" | fmt={payload.get('card_format')}" if payload.get("card_format") else ""
                     _log_ui_action_to_file(
                         "Grading",
                         f"Manual Geometry ({payload.get('side', 'Front')}) — SKU {sku_v}",
-                        f"PSA {gb.get('Est_PSA', '?')}->{ga.get('Est_PSA', '?')} | BGS {gb.get('Est_BGS', '?')}->{ga.get('Est_BGS', '?')}",
+                        f"PSA {gb.get('Est_PSA', '?')}->{ga.get('Est_PSA', '?')} | BGS {gb.get('Est_BGS', '?')}->{ga.get('Est_BGS', '?')}{skew_info}{fmt_info}",
                     )
                     self._send_json(res_geom, status=200)
                 else:

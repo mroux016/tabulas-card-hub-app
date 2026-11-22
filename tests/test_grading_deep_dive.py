@@ -326,6 +326,53 @@ class TestGradingDeepDive(unittest.TestCase):
         self.assertFalse(cent_pat.get("borderless_detected"), f"Patterned neutral border falsely flagged borderless: {cent_pat}")
         self.assertNotEqual(cent_pat["lr"], "50/50")
 
+    def test_skewed_drop_shadow_detection_and_gauge_update(self):
+        import cv2
+        import numpy as np
+        w, h = 800, 1120
+        canvas = np.full((h, w, 3), 240, dtype=np.uint8)
+        cx1, cy1, cx2, cy2 = 60, 60, w - 60, h - 60
+        # Thin gray drop-shadow bevel around physical card on white scanner bed
+        cv2.rectangle(canvas, (cx1 - 2, cy1 - 2), (cx2 + 2, cy2 + 2), (175, 175, 178), 3)
+        # White card border
+        cv2.rectangle(canvas, (cx1, cy1), (cx2, cy2), (242, 242, 240), -1)
+        # Inner printed frame
+        cv2.rectangle(canvas, (cx1 + 48, cy1 + 52), (cx2 - 48, cy2 - 52), (45, 78, 128), -1)
+
+        # Rotate clockwise by +2.0° (OpenCV getRotationMatrix2D uses -2.0 for CW)
+        M = cv2.getRotationMatrix2D((w * 0.5, h * 0.5), -2.0, 1.0)
+        skewed_arr = cv2.warpAffine(canvas, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=(240, 240, 240))
+        skewed_im = Image.fromarray(skewed_arr)
+
+        box = self.vg.detect_physical_card_box(skewed_im)
+        # Physical box should stay outside inner printed frame (x1 <= 85, x2 >= w - 85)
+        self.assertLessEqual(box[0], 85, f"Outer box collapsed inward: {box}")
+        self.assertGreaterEqual(box[2], w - 85, f"Outer box collapsed inward: {box}")
+
+        skew_est = self.vg.estimate_card_skew_deg(skewed_im, box)
+        self.assertAlmostEqual(skew_est, 2.0, delta=0.65, msg=f"Expected ~+2.0° skew, got {skew_est}°")
+
+        # Persist manual gauge update (skew_deg + card_format + nudged outer_card_rect) via update_card_grading_geometry
+        res_upd = self.vg.update_card_grading_geometry(
+            target_type="inventory",
+            sku=self.sku,
+            payload={
+                "side": "Front",
+                "source": "centering_gauge",
+                "skew_deg": 2.0,
+                "card_format": "standard",
+                "outer_card_rect": [0.055, 0.04, 0.89, 0.92],
+            },
+        )
+        self.assertTrue(res_upd["success"], res_upd)
+        diag_after = res_upd["diagnostics"]
+        self.assertEqual(diag_after["centering"]["front"]["skew_deg"], 2.0)
+        self.assertEqual(diag_after["centering"]["front"]["card_format"], "standard")
+        self.assertEqual(diag_after["overrides"]["manual_geometry"]["front"]["skew_deg"], 2.0)
+        self.assertEqual(res_upd["card"]["Valuation_Source"], "Uncomped")
+        self.assertEqual(str(res_upd["card"]["Raw_Price"] or ""), "")
+        self.assertTrue(self.vg.GRADING_FEEDBACK_LOG_FILE.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

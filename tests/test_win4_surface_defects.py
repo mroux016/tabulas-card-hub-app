@@ -253,6 +253,48 @@ def test_nms_clustering_and_edge_dent():
     assert edge_dents[0]["category"] == "edges" and edge_dents[0]["marker_style"] == "arrow", edge_dents[0]
 
 
+def test_white_border_pinstripes_no_glare_or_streak_explosion():
+    # White-bordered card (L* ~244) with subtle vertical pinstripes must NOT trigger >15% glare or >3 streaks
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(244, 244, 242), interior_rgb=(238, 240, 242))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    for px in range(x1 + 45, x2 - 45, 22):
+        cv2.line(arr, (px, y1 + 36), (px, y2 - 36), (205, 208, 215), 2)
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    streaks = [a for a in res["superficial_artifacts"] if a["type"] == "scanner_streak"]
+    assert res["glare_pct_front"] <= 15.0, f"White border misclassified as glare: {res['glare_pct_front']}%"
+    assert len(streaks) <= 3, f"Pinstripes triggered runaway scanner streaks: {len(streaks)}"
+
+
+def test_corner_softness_and_scratch_lower_grade():
+    # Real corner blunting/ding + surface scratch on a light-bordered card (with dark margin)
+    # must be caught by _detect_corner_softness & scratch detector and lower grade below PSA 10
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(240, 240, 238), interior_rgb=(120, 145, 175))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    # Darken outer margin slightly so white card border has clean edge contrast
+    arr[:y1, :] = (40, 44, 52)
+    arr[y2:, :] = (40, 44, 52)
+    arr[:, :x1] = (40, 44, 52)
+    arr[:, x2:] = (40, 44, 52)
+    # Blunt/round the Top-Left corner by painting outer background color over the sharp tip
+    pts = np.array([[x1 - 2, y1 - 2], [x1 + 18, y1 - 2], [x1 - 2, y1 + 18]], dtype=np.int32)
+    cv2.fillPoly(arr, [pts], (40, 44, 52))
+    # Plus a genuine surface scratch
+    cv2.line(arr, (250, 380), (420, 470), (242, 242, 242), 2)
+
+    card_im = Image.fromarray(arr)
+    res = inspect_card_surface_through_sleeve(card_im, f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types = [d["type"] for d in res["confirmed_defects"]]
+    assert "corner_softness" in types, f"Expected corner_softness, got: {types}"
+    assert "surface_scratch" in types, f"Expected surface_scratch, got: {types}"
+    assert res["sub_corners"] < 9.5, res
+    assert res["sub_surface"] < 9.5, res
+
+    pg = estimate_card_pregrade(card_im, f_im, front_box=f_box, back_box=f_box)
+    assert float(pg["Est_PSA"]) < 10.0, pg
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")
@@ -272,4 +314,8 @@ if __name__ == "__main__":
     print("[PASS] test_scanner_streaks_vs_true_defects")
     test_nms_clustering_and_edge_dent()
     print("[PASS] test_nms_clustering_and_edge_dent")
+    test_white_border_pinstripes_no_glare_or_streak_explosion()
+    print("[PASS] test_white_border_pinstripes_no_glare_or_streak_explosion")
+    test_corner_softness_and_scratch_lower_grade()
+    print("[PASS] test_corner_softness_and_scratch_lower_grade")
     print("ALL WIN #4 TESTS PASSED")

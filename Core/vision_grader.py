@@ -420,6 +420,359 @@ def expand_flatbed_pdfs_in_batch_folder(
 # ==============================================================================
 # 2. PHYSICAL CARD BOUNDARY DETECTOR & 8-CORNER INSPECTION SHEET BUILDER
 # ==============================================================================
+def _detect_light_bed_shadow_edges(
+    lab: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    best_comp: tuple[int, int, int, int],
+    bg_lab: np.ndarray,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    On light/white scanner beds (bg_lab[0] >= 150), scans inward from the outer
+    margin along 5 strips per side to detect the thin dark-gray drop-shadow bevel
+    at the physical card-stock boundary so white-bordered cards never collapse onto
+    their inner printed frame.
+    """
+    if float(bg_lab[0]) < 150.0:
+        return None
+    sh, sw = lab.shape[:2]
+    bx1, by1, bx2, by2 = best_comp
+    bw_c = max(40, bx2 - bx1)
+    bh_c = max(40, by2 - by1)
+    l_ch = lab[:, :, 0]
+
+    def _find_side_shadow(side: str) -> Optional[int]:
+        n_strips = 7
+        if side in ("left", "right"):
+            span_lo = max(4, int(by1 + bh_c * 0.22))
+            span_hi = min(sh - 4, int(by2 - bh_c * 0.22))
+            if span_hi - span_lo < 25:
+                return None
+            step = (span_hi - span_lo) / float(n_strips)
+            limit_in = min(int(sw * 0.24), bx1 + 1) if side == "left" else max(int(sw * 0.76), bx2 - 1)
+        else:
+            span_lo = max(4, int(bx1 + bw_c * 0.22))
+            span_hi = min(sw - 4, int(bx2 - bw_c * 0.22))
+            if span_hi - span_lo < 25:
+                return None
+            step = (span_hi - span_lo) / float(n_strips)
+            limit_in = min(int(sh * 0.24), by1 + 1) if side == "top" else max(int(sh * 0.76), by2 - 1)
+
+        hits: list[tuple[int, int]] = []
+        for s_i in range(n_strips):
+            s_mid = int(round(span_lo + (s_i + 0.5) * step))
+            s0 = max(0, s_mid - 2)
+            s1 = min((sh if side in ("left", "right") else sw), s_mid + 3)
+            if side in ("left", "right"):
+                prof = np.median(l_ch[s0:s1, :], axis=0)
+                g_prof = np.mean(gx[s0:s1, :], axis=0)
+                dim = sw
+            else:
+                prof = np.median(l_ch[:, s0:s1], axis=1)
+                g_prof = np.mean(gy[:, s0:s1], axis=1)
+                dim = sh
+
+            best_pos = None
+            best_score = 0.0
+            if side in ("left", "top"):
+                lo = 2
+                hi = min(dim - 16, limit_in)
+                if hi <= lo + 4:
+                    continue
+                for idx in range(lo + 2, hi):
+                    val = float(prof[idx])
+                    # Local minimum check
+                    if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
+                        continue
+                    out_seg = prof[max(0, idx - 12):max(1, idx - 2)]
+                    in_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 14)]
+                    if out_seg.size < 2 or in_seg.size < 2:
+                        continue
+                    l_out = float(np.median(out_seg))
+                    l_in = float(np.median(in_seg))
+                    if l_out < 175.0:
+                        continue
+                    dip_out = l_out - val
+                    dip_in = l_in - val
+                    is_shadow_valley = (l_in >= 175.0 and dip_out >= 7.0 and dip_in >= 7.0)
+                    is_dark_edge = (l_in < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
+                    if not (is_shadow_valley or is_dark_edge):
+                        continue
+                    depth = min(dip_out, dip_in) if is_shadow_valley else dip_out * 0.75
+                    # Prefer physical card-edge shadow over faint sleeve rim near extreme edge
+                    score = depth + (4.0 if l_in >= 200.0 else 0.0) - (6.0 if idx < int(dim * 0.022) and depth < 12.0 else 0.0)
+                    if score > best_score:
+                        best_score = score
+                        best_pos = idx
+            else:
+                lo = max(16, limit_in)
+                hi = dim - 2
+                if hi <= lo + 4:
+                    continue
+                for idx in range(hi - 3, lo, -1):
+                    val = float(prof[idx])
+                    if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
+                        continue
+                    out_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 12)]
+                    in_seg = prof[max(0, idx - 14):max(1, idx - 2)]
+                    if out_seg.size < 2 or in_seg.size < 2:
+                        continue
+                    l_out = float(np.median(out_seg))
+                    l_in = float(np.median(in_seg))
+                    if l_out < 175.0:
+                        continue
+                    dip_out = l_out - val
+                    dip_in = l_in - val
+                    is_shadow_valley = (l_in >= 175.0 and dip_out >= 7.0 and dip_in >= 7.0)
+                    is_dark_edge = (l_in < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
+                    if not (is_shadow_valley or is_dark_edge):
+                        continue
+                    depth = min(dip_out, dip_in) if is_shadow_valley else dip_out * 0.75
+                    score = depth + (4.0 if l_in >= 200.0 else 0.0) - (6.0 if (dim - idx) < int(dim * 0.022) and depth < 12.0 else 0.0)
+                    if score > best_score:
+                        best_score = score
+                        best_pos = idx
+
+            if best_pos is not None and best_score >= 7.0:
+                hits.append((s_i, best_pos))
+
+        if len(hits) < 3:
+            return None
+        xs_h = np.array([h[0] for h in hits], dtype=np.float32)
+        ys_h = np.array([h[1] for h in hits], dtype=np.float32)
+        if len(hits) >= 3:
+            slope, intercept = np.polyfit(xs_h, ys_h, 1)
+            residuals = np.abs(ys_h - (slope * xs_h + intercept))
+            inliers = ys_h[residuals < 4.5]
+            if inliers.size < 3:
+                return None
+            return int(round(float(np.median(inliers))))
+        return int(round(float(np.median(ys_h))))
+
+    nx1 = _find_side_shadow("left")
+    nx2 = _find_side_shadow("right")
+    ny1 = _find_side_shadow("top")
+    ny2 = _find_side_shadow("bottom")
+
+    # Never collapse inward onto the printed frame: only expand or refine within 2px of best_comp
+    rx1 = nx1 if (nx1 is not None and nx1 <= bx1 + 2) else bx1
+    rx2 = nx2 if (nx2 is not None and nx2 >= bx2 - 2) else bx2
+    ry1 = ny1 if (ny1 is not None and ny1 <= by1 + 2) else by1
+    ry2 = ny2 if (ny2 is not None and ny2 >= by2 - 2) else by2
+
+    rw = max(40, rx2 - rx1)
+    rh = max(40, ry2 - ry1)
+    ar = rw / float(rh)
+    valid_ar = (
+        (0.65 <= ar <= 0.79)
+        or (1.26 <= ar <= 1.54)
+        or (0.51 <= ar <= 0.63)
+        or (1.58 <= ar <= 1.92)
+    )
+    if not valid_ar:
+        return None
+    if (rx1, ry1, rx2, ry2) == (bx1, by1, bx2, by2):
+        return None
+    return (rx1, ry1, rx2, ry2)
+
+
+def estimate_card_skew_deg(img: Image.Image, card_box: tuple[int, int, int, int]) -> float:
+    """
+    Estimates physical card rotation in degrees (clamped to [-6.0, +6.0]).
+    Positive = clockwise tilt (matching SVG rotate(+deg)).
+    """
+    w, h = img.size
+    if w < 60 or h < 60:
+        return 0.0
+    scale = 800.0 / max(w, h)
+    sw, sh = max(80, int(round(w * scale))), max(80, int(round(h * scale)))
+    small = cv2.resize(np.array(img.convert("RGB")), (sw, sh), interpolation=cv2.INTER_AREA)
+    lab = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    l_ch = lab[:, :, 0]
+    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+
+    cs_x, cs_y = max(6, int(sw * 0.04)), max(6, int(sh * 0.04))
+    bg_l = float(np.median(np.concatenate([
+        l_ch[:cs_y, :cs_x].ravel(), l_ch[:cs_y, -cs_x:].ravel(),
+        l_ch[-cs_y:, :cs_x].ravel(), l_ch[-cs_y:, -cs_x:].ravel(),
+    ])))
+    light_bed = bg_l >= 150.0
+
+    x1 = int(round(card_box[0] * scale))
+    y1 = int(round(card_box[1] * scale))
+    x2 = int(round(card_box[2] * scale))
+    y2 = int(round(card_box[3] * scale))
+    cw = max(40, x2 - x1)
+    ch = max(40, y2 - y1)
+
+    angles: list[float] = []
+
+    def _fit_edge_angle(side: str) -> Optional[float]:
+        n_strips = 9
+        pts_u: list[float] = []
+        pts_v: list[float] = []
+        band = 18
+        if side in ("top", "bottom"):
+            u0, u1 = max(4, int(x1 + cw * 0.20)), min(sw - 4, int(x2 - cw * 0.20))
+            v_ref = y1 if side == "top" else y2
+        else:
+            u0, u1 = max(4, int(y1 + ch * 0.20)), min(sh - 4, int(y2 - ch * 0.20))
+            v_ref = x1 if side == "left" else x2
+        if u1 - u0 < 36:
+            return None
+        step = (u1 - u0) / float(n_strips)
+        for i in range(n_strips):
+            a = int(round(u0 + i * step))
+            b = max(a + 2, int(round(u0 + (i + 1) * step)))
+            u_mid = 0.5 * (a + b)
+            if side in ("top", "bottom"):
+                v_lo, v_hi = max(1, v_ref - band), min(sh - 2, v_ref + band)
+                if v_hi <= v_lo + 3:
+                    continue
+                l_seg = np.median(l_ch[v_lo:v_hi, a:b], axis=1)
+                g_seg = np.mean(gy[v_lo:v_hi, a:b], axis=1)
+            else:
+                v_lo, v_hi = max(1, v_ref - band), min(sw - 2, v_ref + band)
+                if v_hi <= v_lo + 3:
+                    continue
+                l_seg = np.median(l_ch[a:b, v_lo:v_hi], axis=0)
+                g_seg = np.mean(gx[a:b, v_lo:v_hi], axis=0)
+            pos = None
+            if light_bed and l_seg.size >= 5:
+                # Prefer local L* minimum (drop-shadow valley) if deep enough
+                min_i = int(np.argmin(l_seg))
+                if 1 <= min_i < len(l_seg) - 1:
+                    edge_ref = max(float(np.max(l_seg[:min_i])), float(np.max(l_seg[min_i + 1:])))
+                    if edge_ref - float(l_seg[min_i]) >= 6.0:
+                        pos = v_lo + min_i
+            if pos is None and float(np.max(g_seg)) >= 6.0:
+                pos = v_lo + int(np.argmax(g_seg))
+            if pos is not None:
+                pts_u.append(u_mid)
+                pts_v.append(float(pos))
+
+        if len(pts_u) < 5:
+            return None
+        u_arr = np.array(pts_u, dtype=np.float64)
+        v_arr = np.array(pts_v, dtype=np.float64)
+        # Drop 2 worst residuals iteratively
+        for _ in range(min(2, len(u_arr) - 5)):
+            m, c = np.polyfit(u_arr, v_arr, 1)
+            res = np.abs(v_arr - (m * u_arr + c))
+            worst = int(np.argmax(res))
+            u_arr = np.delete(u_arr, worst)
+            v_arr = np.delete(v_arr, worst)
+        m, c = np.polyfit(u_arr, v_arr, 1)
+        res = np.abs(v_arr - (m * u_arr + c))
+        if float(np.median(res)) > 2.2:
+            return None
+        # Positive slope dv/du on top/bottom means clockwise (+deg); on left/right dx/dy>0 means counter-clockwise (-deg)
+        deg = float(np.degrees(np.arctan(m)))
+        if side in ("left", "right"):
+            deg = -deg
+        if abs(deg) > 6.5:
+            return None
+        return deg
+
+    for s in ("top", "bottom", "left", "right"):
+        d = _fit_edge_angle(s)
+        if d is not None:
+            angles.append(d)
+
+    # HoughLinesP corroboration if fewer than 2 clean edge fits
+    if len(angles) < 2:
+        edges = cv2.Canny(gray.astype(np.uint8), 30, 100)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 720.0, threshold=60, minLineLength=int(min(cw, ch) * 0.30), maxLineGap=12)
+        if lines is not None:
+            for ln in lines[:80]:
+                lx1, ly1, lx2, ly2 = [float(v) for v in ln[0]]
+                dx, dy = lx2 - lx1, ly2 - ly1
+                if abs(dx) > abs(dy) * 4.0:
+                    deg = float(np.degrees(np.arctan2(dy, dx)))
+                    if deg > 90:
+                        deg -= 180
+                    elif deg < -90:
+                        deg += 180
+                    if abs(deg) <= 6.5 and (abs(ly1 - y1) <= 22 or abs(ly1 - y2) <= 22):
+                        angles.append(deg)
+                elif abs(dy) > abs(dx) * 4.0:
+                    deg = -float(np.degrees(np.arctan2(dx, dy)))
+                    if deg > 90:
+                        deg -= 180
+                    elif deg < -90:
+                        deg += 180
+                    if abs(deg) <= 6.5 and (abs(lx1 - x1) <= 22 or abs(lx1 - x2) <= 22):
+                        angles.append(deg)
+
+    if len(angles) < 2:
+        return 0.0
+    arr_a = np.array(angles, dtype=np.float64)
+    if float(np.std(arr_a)) > 1.8:
+        return 0.0
+    med = float(np.median(arr_a))
+    if abs(med) < 0.15:
+        return 0.0
+    return round(float(np.clip(med, -6.0, 6.0)), 2)
+
+
+def _deskew_image_and_box(
+    img: Image.Image,
+    card_box: tuple[int, int, int, int],
+    skew_deg: float,
+) -> tuple[Image.Image, tuple[int, int, int, int], Optional[np.ndarray]]:
+    """
+    Rotates a working copy around the card center by `-skew_deg` (using OpenCV positive
+    CCW angle = +skew_deg) when abs(skew_deg) >= 0.35°, returning `(deskewed_img, box, M_inv)`.
+    """
+    if abs(float(skew_deg)) < 0.35:
+        return img, card_box, None
+    arr = np.array(img.convert("RGB"))
+    ih, iw = arr.shape[:2]
+    x1, y1, x2, y2 = card_box
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    M = cv2.getRotationMatrix2D((cx, cy), float(skew_deg), 1.0)
+    M_inv = cv2.invertAffineTransform(M)
+    warped = cv2.warpAffine(arr, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(warped), card_box, M_inv
+
+
+def _map_point_norm_inverse(pt_norm: list[float], iw: int, ih: int, M_inv: np.ndarray) -> list[float]:
+    px = float(pt_norm[0]) * float(iw)
+    py = float(pt_norm[1]) * float(ih)
+    ox = float(M_inv[0, 0] * px + M_inv[0, 1] * py + M_inv[0, 2])
+    oy = float(M_inv[1, 0] * px + M_inv[1, 1] * py + M_inv[1, 2])
+    return [
+        round(float(np.clip(ox / float(max(1, iw)), 0.0, 1.0)), 4),
+        round(float(np.clip(oy / float(max(1, ih)), 0.0, 1.0)), 4),
+    ]
+
+
+def _map_bbox_norm_inverse(bbox_norm: list[float], iw: int, ih: int, M_inv: np.ndarray) -> list[float]:
+    bx, by, bw, bh = [float(v) for v in bbox_norm]
+    corners = np.array([
+        [bx * iw, by * ih, 1.0],
+        [(bx + bw) * iw, by * ih, 1.0],
+        [bx * iw, (by + bh) * ih, 1.0],
+        [(bx + bw) * iw, (by + bh) * ih, 1.0],
+    ], dtype=np.float64)
+    mapped = corners @ M_inv.T
+    xs = mapped[:, 0] / float(max(1, iw))
+    ys = mapped[:, 1] / float(max(1, ih))
+    nx1 = float(np.clip(np.min(xs), 0.0, 1.0))
+    ny1 = float(np.clip(np.min(ys), 0.0, 1.0))
+    nx2 = float(np.clip(np.max(xs), 0.0, 1.0))
+    ny2 = float(np.clip(np.max(ys), 0.0, 1.0))
+    return [
+        round(nx1, 4),
+        round(ny1, 4),
+        round(max(0.002, nx2 - nx1), 4),
+        round(max(0.002, ny2 - ny1), 4),
+    ]
+
+
 def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     """
     Two-stage multi-format physical card-stock boundary detector (Standard 2.5"x3.5",
@@ -512,13 +865,19 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
             by1, by2 = by1 + int(valid_rows[0]), by1 + int(valid_rows[-1]) + 1
             bh_c = max(40, by2 - by1)
 
+        shadow_box = _detect_light_bed_shadow_edges(lab, gx, gy, (bx1, by1, bx2, by2), bg_lab)
+        if shadow_box is not None:
+            bx1, by1, bx2, by2 = shadow_box
+            bw_c = max(40, bx2 - bx1)
+            bh_c = max(40, by2 - by1)
+
         mid_y1, mid_y2 = int(by1 + bh_c * 0.2), int(by2 - bh_c * 0.2)
         mid_x1, mid_x2 = int(bx1 + bw_c * 0.2), int(bx2 - bw_c * 0.2)
         prof_x = np.mean(gx[max(0, mid_y1):max(1, mid_y2), :], axis=0)
         prof_y = np.mean(gy[:, max(0, mid_x1):max(1, mid_x2)], axis=1)
 
-        pad_x = max(4, int(sw * 0.02))
-        pad_y = max(4, int(sh * 0.02))
+        pad_x = 3 if shadow_box is not None else max(4, int(sw * 0.02))
+        pad_y = 3 if shadow_box is not None else max(4, int(sh * 0.02))
 
         def _snap_local(prof: np.ndarray, approx: int, pad: int) -> int:
             lo = max(0, approx - pad)
@@ -4595,6 +4954,9 @@ def _measure_side_centering(
     manual_outer_rect: Optional[list[float]] = None,
     manual_inner_rect: Optional[list[float]] = None,
     manual_corners: Optional[dict] = None,
+    skew_deg: float = 0.0,
+    manual_card_format: Optional[str] = None,
+    inv_matrix: Optional[np.ndarray] = None,
 ) -> dict:
     """
     Measures outer card boundary & inner design frame centering on a single side,
@@ -4836,6 +5198,9 @@ def _measure_side_centering(
         "bl": [ox, round(oy + oh, 4)],
         "br": [round(ox + ow, 4), round(oy + oh, 4)],
     }
+    if inv_matrix is not None and not isinstance(manual_corners, dict):
+        for ck in ("tl", "tr", "bl", "br"):
+            default_corners[ck] = _map_point_norm_inverse(default_corners[ck], iw, ih, inv_matrix)
     if isinstance(manual_corners, dict):
         for ck in ("tl", "tr", "bl", "br"):
             pt = manual_corners.get(ck)
@@ -4845,7 +5210,9 @@ def _measure_side_centering(
     sleeve_det = bool(has_holder_margin or x1 >= 8 or y1 >= 8 or (iw - x2) >= 8 or (ih - y2) >= 8)
 
     card_ar = cw / float(max(1, ch))
-    if (0.64 <= card_ar <= 0.79) or (1.26 <= card_ar <= 1.54):
+    if manual_card_format in ("standard", "mini", "non_standard"):
+        card_fmt = manual_card_format
+    elif (0.64 <= card_ar <= 0.79) or (1.26 <= card_ar <= 1.54):
         card_fmt = "standard"
     elif (0.49 <= card_ar <= 0.64) or (1.56 <= card_ar <= 1.94):
         card_fmt = "mini"
@@ -4858,6 +5225,7 @@ def _measure_side_centering(
         "corners": default_corners,
         "orientation": "landscape" if cw > ch else "portrait",
         "card_format": card_fmt,
+        "skew_deg": round(float(np.clip(float(skew_deg or 0.0), -6.0, 6.0)), 2),
         "lr_left": lr_l,
         "lr_right": lr_r,
         "lr": f"{lr_l}/{lr_r}",
@@ -5125,15 +5493,28 @@ def estimate_card_pregrade(
     if back_box is None:
         back_box = _box_from_norm(bg.get("outer_card_rect"), back_img) or detect_physical_card_box(back_img)
 
+    if fg.get("skew_deg") is not None:
+        front_skew = round(float(np.clip(float(fg.get("skew_deg")), -6.0, 6.0)), 2)
+    else:
+        front_skew = estimate_card_skew_deg(front_img, front_box)
+
+    if bg.get("skew_deg") is not None:
+        back_skew = round(float(np.clip(float(bg.get("skew_deg")), -6.0, 6.0)), 2)
+    else:
+        back_skew = estimate_card_skew_deg(back_img, back_box)
+
+    front_work_img, front_work_box, front_M_inv = _deskew_image_and_box(front_img, front_box, front_skew)
+    back_work_img, back_work_box, back_M_inv = _deskew_image_and_box(back_img, back_box, back_skew)
+
     win4_res = None
     try:
         if bool(load_compute_settings().get("enable_defect_ai", True)):
             from Core.surface_defect_engine import inspect_card_surface_through_sleeve
             win4_res = inspect_card_surface_through_sleeve(
-                front_img=front_img,
-                back_img=back_img,
-                front_box=front_box,
-                back_box=back_box,
+                front_img=front_work_img,
+                back_img=back_work_img,
+                front_box=front_work_box,
+                back_box=back_work_box,
                 front_patch_tokens=front_patch_tokens,
                 back_patch_tokens=back_patch_tokens,
                 enable_onnx_anomaly=True,
@@ -5147,22 +5528,28 @@ def estimate_card_pregrade(
     has_margin_b = bool(win4_res.get("has_holder_margin_back")) if isinstance(win4_res, dict) else False
 
     f_cent = _measure_side_centering(
-        front_img,
-        front_box,
+        front_work_img,
+        front_work_box,
         sleeve_inset_pct=sleeve_inset,
         has_holder_margin=has_margin_f,
         manual_outer_rect=fg.get("outer_card_rect"),
         manual_inner_rect=fg.get("inner_frame_rect"),
         manual_corners=fg.get("corners"),
+        skew_deg=front_skew,
+        manual_card_format=fg.get("card_format"),
+        inv_matrix=front_M_inv,
     )
     b_cent = _measure_side_centering(
-        back_img,
-        back_box,
+        back_work_img,
+        back_work_box,
         sleeve_inset_pct=sleeve_inset,
         has_holder_margin=has_margin_b,
         manual_outer_rect=bg.get("outer_card_rect"),
         manual_inner_rect=bg.get("inner_frame_rect"),
         manual_corners=bg.get("corners"),
+        skew_deg=back_skew,
+        manual_card_format=bg.get("card_format"),
+        inv_matrix=back_M_inv,
     )
 
     used_fallback = False
@@ -5170,6 +5557,19 @@ def estimate_card_pregrade(
     if isinstance(win4_res, dict):
         raw_confirmed = list(win4_res.get("raw_confirmed_defects") or win4_res.get("confirmed_defects") or [])
         superficial_artifacts = list(win4_res.get("superficial_artifacts") or [])
+        if front_M_inv is not None or back_M_inv is not None:
+            fw, fh = front_img.size
+            bw_im, bh_im = back_img.size
+            for d_list in (raw_confirmed, superficial_artifacts):
+                for d_item in d_list:
+                    bb_n = d_item.get("bbox_norm")
+                    if not (isinstance(bb_n, list) and len(bb_n) == 4):
+                        continue
+                    is_back = str(d_item.get("side") or "Front").strip().lower() == "back"
+                    m_inv = back_M_inv if is_back else front_M_inv
+                    if m_inv is not None:
+                        iw_s, ih_s = (bw_im, bh_im) if is_back else (fw, fh)
+                        d_item["bbox_norm"] = _map_bbox_norm_inverse(bb_n, iw_s, ih_s, m_inv)
         artifact_warning = str(win4_res.get("artifact_warning") or "").strip()
     else:
         used_fallback = True
@@ -5770,6 +6170,22 @@ def update_card_grading_geometry(
         side_geom["outer_card_rect"] = outer_r
     if inner_r is not None:
         side_geom["inner_frame_rect"] = inner_r
+    elif str(p.get("source") or "").strip().lower() == "centering_gauge":
+        side_geom.pop("inner_frame_rect", None)
+
+    if "skew_deg" in p and p.get("skew_deg") is not None:
+        try:
+            skew_val = round(float(np.clip(float(p.get("skew_deg")), -6.0, 6.0)), 2)
+            side_geom["skew_deg"] = skew_val
+        except Exception:
+            pass
+
+    if "card_format" in p and p.get("card_format") is not None:
+        fmt_val = str(p.get("card_format") or "").strip().lower()
+        if fmt_val in ("standard", "mini", "non_standard"):
+            side_geom["card_format"] = fmt_val
+        elif fmt_val == "auto":
+            side_geom.pop("card_format", None)
 
     man_geom[side_key] = side_geom
     ov["manual_geometry"] = man_geom

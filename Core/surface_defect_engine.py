@@ -37,6 +37,7 @@ _DEFECT_LABEL_MAP = {
     "dimple_dent": "dimple/dent",
     "print_spot_fisheye": "print spot/fisheye",
     "corner_whitening": "corner whitening",
+    "corner_softness": "corner softness/blunting",
     "edge_chipping": "edge chipping",
     "specular_glare": "specular glare",
     "loose_dust_speck": "loose dust speck",
@@ -53,6 +54,7 @@ _MARKER_STYLE_MAP = {
     "print_spot_fisheye": "circle",
     "dimple_dent": "circle",
     "corner_whitening": "circle",
+    "corner_softness": "circle",
     "edge_chipping": "arrow",
     "edge_dent": "arrow",
 }
@@ -204,25 +206,50 @@ def _detect_specular_glare_mask(
     hsv: np.ndarray,
     lap_abs: np.ndarray,
     local_box: tuple[int, int, int, int],
+    border_l_med: float = 180.0,
 ) -> tuple[np.ndarray, float]:
-    """Detects broad plastic sleeve/toploader specular glare bands so they are masked & warned."""
+    """
+    Detects localized plastic sleeve/toploader specular glare bands so they are masked & warned,
+    without misclassifying matte white paper borders as glare.
+    """
     cx1, cy1, cx2, cy2 = local_box
     l_ch = lab[:, :, 0]
     s_ch = hsv[:, :, 1]
     smooth_lap = cv2.GaussianBlur(lap_abs.astype(np.float32), (9, 9), 2.0)
 
-    raw_glare = ((l_ch > 235) & (s_ch < 24) & (smooth_lap < 22.0)).astype(np.uint8)
+    l_thresh = min(253.0, max(242.0, float(border_l_med) + 12.0))
+    raw_glare = ((l_ch > l_thresh) & (s_ch < 22) & (smooth_lap < 20.0)).astype(np.uint8)
     num_lbls, lbls, stats, _ = cv2.connectedComponentsWithStats(raw_glare, connectivity=8)
 
-    glare_mask = np.zeros(l_ch.shape, dtype=np.uint8)
+    card_area = max(1, (cx2 - cx1) * (cy2 - cy1))
+    comps: list[tuple[float, int, int]] = []
     for idx in range(1, num_lbls):
         area = int(stats[idx, cv2.CC_STAT_AREA])
-        if area >= 120:
-            glare_mask[lbls == idx] = 255
+        if area < 140:
+            continue
+        comp_mask = (lbls == idx)
+        mean_l = float(np.mean(l_ch[comp_mask]))
+        # Reject broad matte-white paper borders that are not true specular hot-spots
+        if area > 0.12 * card_area and mean_l < 251.0:
+            continue
+        in_card_area = int(np.count_nonzero(comp_mask[cy1:cy2, cx1:cx2]))
+        comps.append((mean_l, idx, in_card_area))
 
-    card_area = max(1, (cx2 - cx1) * (cy2 - cy1))
+    # Sort brightest specular blobs first and enforce < 18% card-face cap
+    comps.sort(key=lambda t: t[0], reverse=True)
+    glare_mask = np.zeros(l_ch.shape, dtype=np.uint8)
+    cum_card_glare = 0
+    cap_pixels = int(0.175 * card_area)
+    for _, idx, in_card_area in comps:
+        if cum_card_glare + in_card_area > cap_pixels and cum_card_glare > 0:
+            continue
+        if in_card_area > cap_pixels:
+            continue
+        glare_mask[lbls == idx] = 255
+        cum_card_glare += in_card_area
+
     glare_in_card = int(np.count_nonzero(glare_mask[cy1:cy2, cx1:cx2]))
-    glare_pct = round(100.0 * glare_in_card / float(card_area), 1)
+    glare_pct = round(min(17.9, 100.0 * glare_in_card / float(card_area)), 1)
     glare_dilated = cv2.dilate(glare_mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
     return glare_dilated > 0, glare_pct
 
@@ -322,11 +349,12 @@ def _detect_scanner_streaks(
     side_label: str,
 ) -> tuple[list[tuple[dict, tuple[int, int, int, int]]], np.ndarray]:
     """
-    Detects duplex ADF / CIS scanner glass & sensor streaks:
-      - Strictly vertical or horizontal (zero lateral wobble < 0.8 px, 1-4 px wide)
-      - Continuous edge-to-edge (>= 92% of full ROI) OR crosses past `card_box` into `margin_ring`
-      - Uniform intensity offset or single-channel RGB/CIS color cast independent of artwork.
-    Returns `(list_of_(artifact_dict, roi_bbox), boolean_mask_to_suppress)`.
+    Detects genuine isolated duplex ADF / CIS scanner glass & sensor streaks:
+      - Strictly vertical or horizontal (wobble < 0.65 px, strictly 1-3 px wide)
+      - Continuous edge-to-edge (>= 95% of full ROI) OR crosses past `card_box` into `margin_ring`
+        with matching signed intensity delta
+      - Capped at <= 5 streaks per side; if > 8 parallel lines fire, treats them as printed
+        pinstripes/border texture and suppresses the streak mask completely.
     """
     h, w = roi_rgb.shape[:2]
     cx1, cy1, cx2, cy2 = local_box
@@ -339,27 +367,25 @@ def _detect_scanner_streaks(
         return found, streak_mask
 
     f_rgb = roi_rgb.astype(np.float32)
+    cand_streaks: list[tuple[tuple[bool, float, float], dict, tuple[int, int, int, int], str, int, int]] = []
 
-    # Helper to scan 1 axis: vertical streaks (axis='v') or horizontal streaks (axis='h')
     def _scan_axis(axis: str):
         if axis == "v":
             if w < 16:
                 return
             ref = 0.5 * (f_rgb[:, :-8, :] + f_rgb[:, 8:, :])
-            diff = np.abs(f_rgb[:, 4:-4, :] - ref)
+            signed_diff = f_rgb[:, 4:-4, :] - ref
+            diff = np.abs(signed_diff)
             max_ch = np.max(diff, axis=2)
-            # 1D fraction along full ROI height & inside card height
-            hit_full = (max_ch > 15.0)
+            hit_full = (max_ch > 18.0)
             col_frac_full = np.mean(hit_full, axis=0)
             col_frac_card = np.mean(hit_full[cy1:cy2, :], axis=0)
-            # Single-channel color cast (CIS RGB offset)
-            med_ch_diff = np.median(diff, axis=0)  # (W-8, 3)
+            med_ch_diff = np.median(diff, axis=0)
             cast_strength = np.max(med_ch_diff, axis=1) - np.min(med_ch_diff, axis=1)
 
-            cand_idx = np.where((col_frac_card >= 0.72) & ((col_frac_full >= 0.90) | (np.mean(hit_full, axis=0) >= 0.72)))[0]
+            cand_idx = np.where((col_frac_card >= 0.78) & ((col_frac_full >= 0.94) | (np.mean(hit_full, axis=0) >= 0.78)))[0]
             if cand_idx.size == 0:
                 return
-            # Group contiguous columns (within 1 px)
             groups: list[list[int]] = []
             for idx in cand_idx.tolist():
                 if not groups or idx - groups[-1][-1] > 1:
@@ -369,11 +395,10 @@ def _detect_scanner_streaks(
 
             for grp in groups:
                 width_px = len(grp)
-                if width_px < 1 or width_px > 5:
+                if width_px < 1 or width_px > 3:
                     continue
                 x0 = grp[0] + 4
                 x1 = grp[-1] + 4
-                # Check straightness / wobble: peak column inside [x0-1 .. x1+1] across 8 vertical slices
                 band_l = max(0, x0 - 1)
                 band_r = min(w, x1 + 2)
                 slice_peaks = []
@@ -386,31 +411,34 @@ def _detect_scanner_streaks(
                     if prof.size > 0:
                         slice_peaks.append(band_l + float(np.argmax(prof)))
                 wobble = float(np.std(slice_peaks)) if len(slice_peaks) >= 4 else 0.0
-                if wobble >= 0.8:
+                if wobble >= 0.65:
                     continue
 
-                # Check margin continuity OR >= 92% edge-to-edge continuity
                 full_span_frac = float(np.max(col_frac_full[grp]))
+                card_sign = float(np.median(signed_diff[cy1:cy2, grp, :]))
                 crosses_margin = False
                 if margin_avail.get("top") and cy1 >= 4:
-                    m_top = hit_full[:cy1, [g for g in grp]]
-                    if m_top.size > 0 and float(np.mean(np.max(m_top, axis=1))) >= 0.50:
-                        crosses_margin = True
+                    m_top_sd = signed_diff[:cy1, grp, :]
+                    if m_top_sd.size > 0:
+                        m_sign = float(np.median(m_top_sd))
+                        m_hit = float(np.mean(np.max(np.abs(m_top_sd), axis=2) >= 6.0))
+                        if card_sign * m_sign > 0 and abs(m_sign) >= 5.0 and m_hit >= 0.65:
+                            crosses_margin = True
                 if margin_avail.get("bottom") and cy2 <= h - 4:
-                    m_bot = hit_full[cy2:, [g for g in grp]]
-                    if m_bot.size > 0 and float(np.mean(np.max(m_bot, axis=1))) >= 0.50:
-                        crosses_margin = True
+                    m_bot_sd = signed_diff[cy2:, grp, :]
+                    if m_bot_sd.size > 0:
+                        m_sign = float(np.median(m_bot_sd))
+                        m_hit = float(np.mean(np.max(np.abs(m_bot_sd), axis=2) >= 6.0))
+                        if card_sign * m_sign > 0 and abs(m_sign) >= 5.0 and m_hit >= 0.65:
+                            crosses_margin = True
 
-                if not (crosses_margin or full_span_frac >= 0.92):
+                if not (crosses_margin or full_span_frac >= 0.95):
                     continue
 
                 max_cast = float(np.max(cast_strength[grp]))
                 conf = round(min(0.97, 0.86 + (0.05 if crosses_margin else 0.0) + (0.04 if max_cast >= 12.0 else 0.0)), 3)
-                pad_l = max(0, x0 - 3)
-                pad_r = min(w, x1 + 4)
-                streak_mask[:, pad_l:pad_r] = True
                 z_lbl = _zone_label((x0 + x1) * 0.5 - cx1, ch * 0.5, cw, ch)
-                found.append(({
+                item = {
                     "type": "scanner_streak",
                     "is_true_defect": False,
                     "confidence": conf,
@@ -418,20 +446,23 @@ def _detect_scanner_streaks(
                     "zone": z_lbl,
                     "severity": 0.0,
                     "detail": "Scanner glass/sensor streak — clean scanner glass & rescan",
-                }, (int(x0), 0, max(2, int(x1 - x0 + 1)), int(h))))
+                }
+                bbox = (int(x0), 0, max(2, int(x1 - x0 + 1)), int(h))
+                cand_streaks.append(((crosses_margin, full_span_frac, max_cast), item, bbox, "v", x0, x1))
         else:
             if h < 16:
                 return
             ref = 0.5 * (f_rgb[:-8, :, :] + f_rgb[8:, :, :])
-            diff = np.abs(f_rgb[4:-4, :, :] - ref)
+            signed_diff = f_rgb[4:-4, :, :] - ref
+            diff = np.abs(signed_diff)
             max_ch = np.max(diff, axis=2)
-            hit_full = (max_ch > 15.0)
+            hit_full = (max_ch > 18.0)
             row_frac_full = np.mean(hit_full, axis=1)
             row_frac_card = np.mean(hit_full[:, cx1:cx2], axis=1)
             med_ch_diff = np.median(diff, axis=1)
             cast_strength = np.max(med_ch_diff, axis=1) - np.min(med_ch_diff, axis=1)
 
-            cand_idx = np.where((row_frac_card >= 0.72) & ((row_frac_full >= 0.90) | (np.mean(hit_full, axis=1) >= 0.72)))[0]
+            cand_idx = np.where((row_frac_card >= 0.78) & ((row_frac_full >= 0.94) | (np.mean(hit_full, axis=1) >= 0.78)))[0]
             if cand_idx.size == 0:
                 return
             groups = []
@@ -443,7 +474,7 @@ def _detect_scanner_streaks(
 
             for grp in groups:
                 height_px = len(grp)
-                if height_px < 1 or height_px > 5:
+                if height_px < 1 or height_px > 3:
                     continue
                 y0 = grp[0] + 4
                 y1 = grp[-1] + 4
@@ -459,30 +490,34 @@ def _detect_scanner_streaks(
                     if prof.size > 0:
                         slice_peaks.append(band_t + float(np.argmax(prof)))
                 wobble = float(np.std(slice_peaks)) if len(slice_peaks) >= 4 else 0.0
-                if wobble >= 0.8:
+                if wobble >= 0.65:
                     continue
 
                 full_span_frac = float(np.max(row_frac_full[grp]))
+                card_sign = float(np.median(signed_diff[grp, cx1:cx2, :]))
                 crosses_margin = False
                 if margin_avail.get("left") and cx1 >= 4:
-                    m_left = hit_full[[g for g in grp], :cx1]
-                    if m_left.size > 0 and float(np.mean(np.max(m_left, axis=0))) >= 0.50:
-                        crosses_margin = True
+                    m_left_sd = signed_diff[grp, :cx1, :]
+                    if m_left_sd.size > 0:
+                        m_sign = float(np.median(m_left_sd))
+                        m_hit = float(np.mean(np.max(np.abs(m_left_sd), axis=2) >= 6.0))
+                        if card_sign * m_sign > 0 and abs(m_sign) >= 5.0 and m_hit >= 0.65:
+                            crosses_margin = True
                 if margin_avail.get("right") and cx2 <= w - 4:
-                    m_right = hit_full[[g for g in grp], cx2:]
-                    if m_right.size > 0 and float(np.mean(np.max(m_right, axis=0))) >= 0.50:
-                        crosses_margin = True
+                    m_right_sd = signed_diff[grp, cx2:, :]
+                    if m_right_sd.size > 0:
+                        m_sign = float(np.median(m_right_sd))
+                        m_hit = float(np.mean(np.max(np.abs(m_right_sd), axis=2) >= 6.0))
+                        if card_sign * m_sign > 0 and abs(m_sign) >= 5.0 and m_hit >= 0.65:
+                            crosses_margin = True
 
-                if not (crosses_margin or full_span_frac >= 0.92):
+                if not (crosses_margin or full_span_frac >= 0.95):
                     continue
 
                 max_cast = float(np.max(cast_strength[grp]))
                 conf = round(min(0.97, 0.86 + (0.05 if crosses_margin else 0.0) + (0.04 if max_cast >= 12.0 else 0.0)), 3)
-                pad_t = max(0, y0 - 3)
-                pad_b = min(h, y1 + 4)
-                streak_mask[pad_t:pad_b, :] = True
                 z_lbl = _zone_label(cw * 0.5, (y0 + y1) * 0.5 - cy1, cw, ch)
-                found.append(({
+                item = {
                     "type": "scanner_streak",
                     "is_true_defect": False,
                     "confidence": conf,
@@ -490,11 +525,164 @@ def _detect_scanner_streaks(
                     "zone": z_lbl,
                     "severity": 0.0,
                     "detail": "Scanner glass/sensor streak — clean scanner glass & rescan",
-                }, (0, int(y0), int(w), max(2, int(y1 - y0 + 1)))))
+                }
+                bbox = (0, int(y0), int(w), max(2, int(y1 - y0 + 1)))
+                cand_streaks.append(((crosses_margin, full_span_frac, max_cast), item, bbox, "h", y0, y1))
 
     _scan_axis("v")
     _scan_axis("h")
+
+    # > 8 parallel lines = printed pinstripes / border texture -> suppress streak mask completely
+    if len(cand_streaks) > 8:
+        return [], np.zeros((h, w), dtype=bool)
+
+    # Cap at <= 5 streaks per side
+    if len(cand_streaks) > 5:
+        cand_streaks.sort(key=lambda t: t[0], reverse=True)
+        cand_streaks = cand_streaks[:5]
+
+    for _, item, bbox, ax, p0, p1 in cand_streaks:
+        if ax == "v":
+            streak_mask[:, max(0, p0 - 2):min(w, p1 + 3)] = True
+        else:
+            streak_mask[max(0, p0 - 2):min(h, p1 + 3), :] = True
+        found.append((item, bbox))
+
     return found, streak_mask
+
+
+def _detect_corner_softness(
+    lab: np.ndarray,
+    local_box: tuple[int, int, int, int],
+    margin_avail: dict[str, bool],
+    glare_mask: np.ndarray,
+    streak_mask: np.ndarray,
+    side_label: str,
+) -> list[tuple[dict, tuple[int, int, int, int]]]:
+    """
+    Measures physical corner-tip rounding / blunting by extrapolating the two straight
+    card edges approaching each corner to their theoretical 90-degree intersection and
+    measuring the contour tip recession distance (requires >= 6px outer margin).
+    """
+    results: list[tuple[dict, tuple[int, int, int, int]]] = []
+    h, w = lab.shape[:2]
+    cx1, cy1, cx2, cy2 = local_box
+    cw = max(40, cx2 - cx1)
+    ch = max(40, cy2 - cy1)
+
+    if not (margin_avail.get("left") and margin_avail.get("right") and margin_avail.get("top") and margin_avail.get("bottom")):
+        return results
+
+    tip_sz = max(26, int(min(cw, ch) * 0.055))
+    pad_out = 10
+    if cx1 < 6 or cy1 < 6 or (w - cx2) < 6 or (h - cy2) < 6:
+        return results
+
+    corners = [
+        ("Top-Left", cx1, cy1, 1, 1),
+        ("Top-Right", cx2, cy1, -1, 1),
+        ("Bot-Left", cx1, cy2, 1, -1),
+        ("Bot-Right", cx2, cy2, -1, -1),
+    ]
+
+    for c_name, vx, vy, sx, sy in corners:
+        rx1 = max(0, vx - (pad_out if sx > 0 else tip_sz))
+        rx2 = min(w, vx + (tip_sz if sx > 0 else pad_out))
+        ry1 = max(0, vy - (pad_out if sy > 0 else tip_sz))
+        ry2 = min(h, vy + (tip_sz if sy > 0 else pad_out))
+        if rx2 - rx1 < 24 or ry2 - ry1 < 24:
+            continue
+
+        if np.mean(glare_mask[ry1:ry2, rx1:rx2] | streak_mask[ry1:ry2, rx1:rx2]) > 0.35:
+            continue
+
+        patch_lab = lab[ry1:ry2, rx1:rx2]
+        ph, pw = patch_lab.shape[:2]
+
+        # Sample outer background corner of this ROI (pure margin outside card)
+        bg_x = slice(0, 5) if sx > 0 else slice(pw - 5, pw)
+        bg_y = slice(0, 5) if sy > 0 else slice(ph - 5, ph)
+        bg_ref = np.median(patch_lab[bg_y, bg_x].reshape(-1, 3), axis=0)
+
+        # Sample inner card corner area
+        in_x = slice(pw - 8, pw) if sx > 0 else slice(0, 8)
+        in_y = slice(ph - 8, ph) if sy > 0 else slice(0, 8)
+        in_ref = np.median(patch_lab[in_y, in_x].reshape(-1, 3), axis=0)
+
+        # Need clear separation between card corner and outer margin
+        if float(np.linalg.norm(in_ref - bg_ref)) < 16.0:
+            continue
+
+        dist_bg = np.linalg.norm(patch_lab - bg_ref, axis=2)
+        dist_in = np.linalg.norm(patch_lab - in_ref, axis=2)
+        card_fg = ((dist_bg > 15.0) & (dist_bg >= dist_in * 0.75)).astype(np.uint8) * 255
+        card_fg = cv2.morphologyEx(card_fg, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8), iterations=1)
+
+        cnts, _ = cv2.findContours(card_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not cnts:
+            continue
+        main_cnt = max(cnts, key=cv2.contourArea)
+        if cv2.contourArea(main_cnt) < 0.25 * (ph * pw):
+            continue
+
+        # Fit horizontal edge (x in [25%..80%] from corner toward card interior) and vertical edge
+        pts = main_cnt.reshape(-1, 2).astype(np.float64)
+        # Local coordinates relative to ROI
+        lx = vx - rx1
+        ly = vy - ry1
+
+        # Points along horizontal edge: distance from lx along sx is in [0.28*tip_sz .. 0.85*tip_sz]
+        dx_from_corner = (pts[:, 0] - lx) * sx
+        dy_from_corner = (pts[:, 1] - ly) * sy
+
+        h_mask = (dx_from_corner >= tip_sz * 0.28) & (dx_from_corner <= tip_sz * 0.85) & (np.abs(dy_from_corner) <= 8.0)
+        v_mask = (dy_from_corner >= tip_sz * 0.28) & (dy_from_corner <= tip_sz * 0.85) & (np.abs(dx_from_corner) <= 8.0)
+
+        if np.count_nonzero(h_mask) < 6 or np.count_nonzero(v_mask) < 6:
+            continue
+
+        hx, hy = pts[h_mask, 0], pts[h_mask, 1]
+        vx_pts, vy_pts = pts[v_mask, 0], pts[v_mask, 1]
+
+        # Fit y = mh * x + ch_line and x = mv * y + cv_line
+        mh, ch_line = np.polyfit(hx, hy, 1)
+        mv, cv_line = np.polyfit(vy_pts, vx_pts, 1)
+        if float(np.median(np.abs(hy - (mh * hx + ch_line)))) > 1.8:
+            continue
+        if float(np.median(np.abs(vx_pts - (mv * vy_pts + cv_line)))) > 1.8:
+            continue
+
+        denom = 1.0 - mh * mv
+        if abs(denom) < 0.5:
+            continue
+        p_y = (mh * cv_line + ch_line) / denom
+        p_x = mv * p_y + cv_line
+
+        if not (-2.0 <= p_x <= pw + 2.0 and -2.0 <= p_y <= ph + 2.0):
+            continue
+
+        dists = np.hypot(pts[:, 0] - p_x, pts[:, 1] - p_y)
+        tip_recession = float(np.min(dists))
+        recession_ratio = tip_recession / float(min(cw, ch))
+
+        if tip_recession >= 5.0 and recession_ratio >= 0.0065:
+            # Verify missing tip area matches background rather than internal art
+            box_sz = max(14, int(round(tip_recession * 2.4)))
+            bx = max(0, min(w - box_sz, int(round(rx1 + p_x - (box_sz * 0.25 if sx > 0 else box_sz * 0.75)))))
+            by = max(0, min(h - box_sz, int(round(ry1 + p_y - (box_sz * 0.25 if sy > 0 else box_sz * 0.75)))))
+            sev = 1.0 if recession_ratio >= 0.011 else 0.5
+            conf = round(min(0.90, 0.74 + min(0.14, (recession_ratio - 0.0065) * 18.0)), 3)
+            results.append(({
+                "type": "corner_softness",
+                "is_true_defect": True,
+                "confidence": conf,
+                "side": side_label,
+                "zone": c_name,
+                "severity": sev,
+                "target": "corners",
+            }, (bx, by, box_sz, box_sz)))
+
+    return results
 
 
 def _inspect_single_side(
@@ -526,7 +714,18 @@ def _inspect_single_side(
     cw = max(40, cx2 - cx1)
     ch = max(40, cy2 - cy1)
 
-    glare_mask, glare_pct = _detect_specular_glare_mask(lab, hsv, lap_abs, local_box)
+    c_span = max(12, int(min(cw, ch) * 0.042))
+    edge_strip = max(6, int(min(cw, ch) * 0.015))
+    border_band_l = np.concatenate([
+        lab[cy1:cy1 + edge_strip, cx1:cx2, 0].ravel(),
+        lab[cy2 - edge_strip:cy2, cx1:cx2, 0].ravel(),
+        lab[cy1:cy2, cx1:cx1 + edge_strip, 0].ravel(),
+        lab[cy1:cy2, cx2 - edge_strip:cx2, 0].ravel(),
+    ])
+    border_l_med = float(np.median(border_band_l)) if border_band_l.size else 180.0
+    border_l_std = float(np.std(border_band_l)) if border_band_l.size else 0.0
+
+    glare_mask, glare_pct = _detect_specular_glare_mask(lab, hsv, lap_abs, local_box, border_l_med=border_l_med)
     margin_dust_density = _estimate_margin_dust_density(tophat, blackhat, local_box, margin_avail)
     scanner_streaks, streak_mask = _detect_scanner_streaks(roi_rgb, local_box, margin_avail, side_label)
 
@@ -611,7 +810,7 @@ def _inspect_single_side(
     int_glare = glare_mask[iy1:iy2, ix1:ix2] | streak_mask[iy1:iy2, ix1:ix2]
     int_resp[int_glare] = 0
 
-    thr_surf = max(32, int(np.percentile(int_resp, 99.3)))
+    thr_surf = max(26, int(np.percentile(int_resp, 99.1)))
     cand_bin = (int_resp > thr_surf).astype(np.uint8)
     cnts, _ = cv2.findContours(cand_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -641,7 +840,7 @@ def _inspect_single_side(
         aspect = major / minor
 
         # A. Linear candidates (Scratches, Print Lines, Sleeve Scratches, Hairs/Fibers)
-        if major >= 18.0 and aspect >= 3.2:
+        if major >= 18.0 and aspect >= 3.4:
             # Printed-artwork texture/stripe guard: skip dense halftone/text or wide chromatic printed stripes
             nb_lap = lap_abs[max(iy1, rcy - 9):min(iy2, rcy + 10), max(ix1, rcx - 9):min(ix2, rcx + 10)]
             edge_density = float(np.mean(nb_lap > 30.0)) if nb_lap.size else 0.0
@@ -698,7 +897,7 @@ def _inspect_single_side(
                     "severity": 0.5,
                     "target": "surface",
                 }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
-            elif minor <= 9.0 and major >= 22.0:
+            elif minor <= 8.5 and major >= 18.0:
                 conf = min(0.95, 0.72 + min(0.18, major / 250.0) + _anom_boost(cx_c, cy_c))
                 sev = 1.0 if major >= 75.0 else 0.5
                 confirmed.append(_attach_meta({
@@ -855,21 +1054,10 @@ def _inspect_single_side(
                     break
 
     # E. Edge Chipping (4 edge strips) & Corner Whitening (4 corners)
-    c_span = max(12, int(min(cw, ch) * 0.042))
-    edge_strip = max(6, int(min(cw, ch) * 0.015))
-    border_band_l = np.concatenate([
-        lab[cy1:cy1 + edge_strip, cx1:cx2, 0].ravel(),
-        lab[cy2 - edge_strip:cy2, cx1:cx2, 0].ravel(),
-        lab[cy1:cy2, cx1:cx1 + edge_strip, 0].ravel(),
-        lab[cy1:cy2, cx2 - edge_strip:cx2, 0].ravel(),
-    ])
-    border_l_med = float(np.median(border_band_l)) if border_band_l.size else 180.0
-    border_l_std = float(np.std(border_band_l)) if border_band_l.size else 0.0
-
     # White paper-core exposure (chipping/whitening) requires a uniform dark/colored border contrast
     # (border_l_med < 162 and border_l_std < 38); on white/light borders or high-contrast filigree
     # patterned borders (border_l_std >= 38), bright spots are just printed pattern or paper.
-    white_thr_edge = max(195.0, border_l_med + (62.0 if light_border_mode else 38.0))
+    white_thr_edge = max(190.0, border_l_med + (58.0 if light_border_mode else 34.0))
     skip_light_border = (border_l_med >= 162.0) or (border_l_std >= 38.0) or (light_border_mode and border_l_med >= 145.0)
 
     edge_zones = [
@@ -933,7 +1121,7 @@ def _inspect_single_side(
                     max(6, bw_c),
                     max(6, bh_c),
                 )
-        if max_chip_a >= 14 and chip_frac < 0.28:
+        if max_chip_a >= 12 and chip_frac < 0.28:
             sev = 1.0 if max_chip_a >= 65 else 0.5
             confirmed.append(_attach_meta({
                 "type": "edge_chipping",
@@ -1019,6 +1207,9 @@ def _inspect_single_side(
                 "severity": sev,
                 "target": "corners",
             }, best_wh_box))
+
+    for cs_item, cs_bbox in _detect_corner_softness(lab, local_box, margin_avail, glare_mask, streak_mask, side_label):
+        confirmed.append(_attach_meta(cs_item, cs_bbox))
 
     # Optional dedicated card_defect_v1.onnx patch refinement when installed
     defect_model = get_local_defect_model(load_now=False, claim_slot=False)
@@ -1133,6 +1324,7 @@ def inspect_card_surface_through_sleeve(
         "dimple_dent": "dimple/dent",
         "print_spot_fisheye": "print spot/fisheye",
         "corner_whitening": "corner whitening",
+        "corner_softness": "corner softness/blunting",
         "edge_chipping": "edge chipping",
         "edge_dent": "edge dent/ding",
     }

@@ -2117,9 +2117,15 @@ function GradingDeepDiveStudio({
     setEditMode('none');
     setMainZoom(1.0);
     setMainPan({ x: 0, y: 0 });
-    setGaugeRotate(0.0);
+    const sKey = activeSide === 'Back' ? 'back' : 'front';
+    const sc = diagnostics?.centering?.[sKey];
+    const mg = diagnostics?.overrides?.manual_geometry?.[sKey];
+    const initSkew = Number(sc?.skew_deg ?? mg?.skew_deg ?? 0);
+    setGaugeRotate(Number.isFinite(initSkew) ? Math.max(-6.0, Math.min(6.0, Number(initSkew.toFixed(2)))) : 0.0);
     setGaugeNudge({ x: 0, y: 0 });
-  }, [activeSide]);
+    const initFmt = String(mg?.card_format || 'auto');
+    setGaugeFormatOverride(['standard', 'mini', 'non_standard'].includes(initFmt) ? initFmt : 'auto');
+  }, [activeSide, diagnostics?.updated_at, diagnostics?.sku]);
 
   useEffect(() => {
     const srcSizes = diagnostics?.source_images || {};
@@ -2315,6 +2321,54 @@ function GradingDeepDiveStudio({
         }
       })
       .catch((e) => setDiagError(e.message || 'Network error saving geometry.'))
+      .finally(() => setSavingGeom(false));
+  };
+
+  const applyGaugeAndReevaluate = () => {
+    if (!sku || savingGeom) return;
+    setSavingGeom(true);
+    setDiagError('');
+    const body = {
+      targetType,
+      sku,
+      batchName: effectiveBatch,
+      side: activeSide,
+      source: 'centering_gauge',
+      skew_deg: Number(Math.max(-6.0, Math.min(6.0, Number(gaugeRotate) || 0)).toFixed(2)),
+      card_format: gaugeFormatOverride,
+      outer_card_rect: [
+        Number(gaugeGeometry.ox.toFixed(4)),
+        Number(gaugeGeometry.oy.toFixed(4)),
+        Number(gaugeGeometry.ow.toFixed(4)),
+        Number(gaugeGeometry.oh.toFixed(4)),
+      ],
+    };
+    fetch(`${NODE_API_BASE}/grading/update-geometry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res?.success) {
+          if (res.diagnostics) setDiagnostics(res.diagnostics);
+          if (onCardUpdated) onCardUpdated(res);
+          setGaugeNudge({ x: 0, y: 0 });
+          const gb = res.gradesBefore || {};
+          const ga = res.gradesAfter || {};
+          if (pushNotification) {
+            pushNotification(
+              `Gauge Applied & Re-Evaluated (${activeSide}) — SKU ${sku}`,
+              `PSA ${gb.Est_PSA || '?'} → ${ga.Est_PSA || '?'} | BGS ${gb.Est_BGS || '?'} → ${ga.Est_BGS || '?'}`,
+              'Grading',
+              'success'
+            );
+          }
+        } else {
+          setDiagError(res?.error || 'Failed to apply centering gauge.');
+        }
+      })
+      .catch((e) => setDiagError(e.message || 'Network error applying centering gauge.'))
       .finally(() => setSavingGeom(false));
   };
 
@@ -2629,10 +2683,10 @@ function GradingDeepDiveStudio({
       const dy = (sideCent.corners.tr[1] - sideCent.corners.tl[1]) * (naturalSize.h || 2100);
       if (Math.abs(dx) > 20) {
         const calcDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
-        if (Math.abs(calcDeg) <= 4.5) baseSkew = Number(calcDeg.toFixed(2));
+        if (Math.abs(calcDeg) <= 6.0) baseSkew = Number(calcDeg.toFixed(2));
       }
     }
-    const totalAngle = Number((baseSkew + gaugeRotate).toFixed(2));
+    const totalAngle = Number(Math.max(-6.0, Math.min(6.0, Number(gaugeRotate) || 0)).toFixed(2));
 
     // Physical dimensions in inches
     const physShortIn = isMini ? 1.5 : 2.5;
@@ -2867,20 +2921,20 @@ function GradingDeepDiveStudio({
                   <span className="font-mono text-cyan-300 w-7 text-right">{gaugeOpacity}%</span>
                 </label>
 
-                {/* ROTATE (-3° TO +3°) */}
-                <div className="flex items-center gap-1 text-slate-300" title="Align Virtual Centering Card to skewed scans (-3° to +3°)">
+                {/* ROTATE (-6° TO +6°) */}
+                <div className="flex items-center gap-1 text-slate-300" title="Align Virtual Centering Card to skewed scans (-6° to +6°)">
                   <span className="text-slate-400">Rotate</span>
                   <button
                     type="button"
-                    onClick={() => setGaugeRotate((r) => Math.max(-3.0, Number((r - 0.25).toFixed(2))))}
+                    onClick={() => setGaugeRotate((r) => Math.max(-6.0, Number((r - 0.25).toFixed(2))))}
                     className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
                   >
                     −
                   </button>
                   <input
                     type="range"
-                    min={-3}
-                    max={3}
+                    min={-6}
+                    max={6}
                     step={0.1}
                     value={gaugeRotate}
                     onChange={(e) => setGaugeRotate(Number(e.target.value))}
@@ -2888,7 +2942,7 @@ function GradingDeepDiveStudio({
                   />
                   <button
                     type="button"
-                    onClick={() => setGaugeRotate((r) => Math.min(3.0, Number((r + 0.25).toFixed(2))))}
+                    onClick={() => setGaugeRotate((r) => Math.min(6.0, Number((r + 0.25).toFixed(2))))}
                     className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
                   >
                     +
@@ -2898,22 +2952,40 @@ function GradingDeepDiveStudio({
                   </span>
                 </div>
 
-                {/* NUDGE X/Y & RESET */}
-                <div className="flex items-center gap-0.5" title="Fine-nudge Virtual Centering Gauge position">
-                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.max(-0.08, p.x - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">◀</button>
-                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.max(-0.08, p.y - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▲</button>
-                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.min(0.08, p.y + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▼</button>
-                  <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.min(0.08, p.x + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▶</button>
-                  {(gaugeRotate !== 0 || gaugeNudge.x !== 0 || gaugeNudge.y !== 0 || gaugeFormatOverride !== 'auto') && (
-                    <button
-                      type="button"
-                      onClick={() => { setGaugeRotate(0.0); setGaugeNudge({ x: 0, y: 0 }); setGaugeFormatOverride('auto'); }}
-                      className="ml-1 px-1.5 py-0.5 rounded bg-amber-950/90 hover:bg-amber-800 border border-amber-600/60 text-amber-200 font-bold"
-                    >
-                      Reset
-                    </button>
-                  )}
-                </div>
+                {/* NUDGE X/Y, APPLY GAUGE & RESET */}
+                {(() => {
+                  const sKey = activeSide === 'Back' ? 'back' : 'front';
+                  const savedSkew = Number(sideCent?.skew_deg ?? diagnostics?.overrides?.manual_geometry?.[sKey]?.skew_deg ?? 0);
+                  const savedFmtRaw = String(diagnostics?.overrides?.manual_geometry?.[sKey]?.card_format || 'auto');
+                  const savedFmt = ['standard', 'mini', 'non_standard'].includes(savedFmtRaw) ? savedFmtRaw : 'auto';
+                  const gaugeDirty = Math.abs(gaugeRotate - savedSkew) >= 0.05 || gaugeNudge.x !== 0 || gaugeNudge.y !== 0 || gaugeFormatOverride !== savedFmt;
+                  return (
+                    <div className="flex items-center gap-0.5" title="Fine-nudge Virtual Centering Gauge position">
+                      <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.max(-0.08, p.x - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">◀</button>
+                      <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.max(-0.08, p.y - 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▲</button>
+                      <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, y: Number(Math.min(0.08, p.y + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▼</button>
+                      <button type="button" onClick={() => setGaugeNudge((p) => ({ ...p, x: Number(Math.min(0.08, p.x + 0.0025).toFixed(4)) }))} className="px-1 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200">▶</button>
+                      <button
+                        type="button"
+                        disabled={!gaugeDirty || savingGeom}
+                        onClick={applyGaugeAndReevaluate}
+                        title="Persist gauge skew, nudge & format and re-run deskewed grading"
+                        className="ml-1 px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold"
+                      >
+                        {savingGeom ? '⏳ Applying...' : '💾 Apply Gauge & Re-Evaluate'}
+                      </button>
+                      {gaugeDirty && (
+                        <button
+                          type="button"
+                          onClick={() => { setGaugeRotate(Number.isFinite(savedSkew) ? savedSkew : 0.0); setGaugeNudge({ x: 0, y: 0 }); setGaugeFormatOverride(savedFmt); }}
+                          className="ml-0.5 px-1.5 py-0.5 rounded bg-amber-950/90 hover:bg-amber-800 border border-amber-600/60 text-amber-200 font-bold"
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           )}
