@@ -422,13 +422,13 @@ def expand_flatbed_pdfs_in_batch_folder(
 # ==============================================================================
 def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     """
-    Orientation-agnostic center-out / aspect-ratio-targeted card outer boundary detector:
-      1. Detects orientation independently per side from scan dimensions & printed ink bounds.
-      2. Locates printed ink/artwork centroid & rough inner bounds (ignoring outer sleeve margins).
-      3. Projects outward using standard 2.5"x3.5" aspect (0.7143 portrait / 1.400 landscape)
-         within a +/-14% search band and picks the innermost strong card-stock edge.
-      4. Enforces +/-3% aspect-ratio consistency to reject penny-sleeve overhangs, while
-         gracefully relaxing for non-standard formats (mini ~0.55, square, tallboy).
+    Two-stage multi-format physical card-stock boundary detector (Standard 2.5"x3.5",
+    Tobacco / A&G Mini 1.5"x2.625", and Non-Standard formats):
+      1. Separates solid opaque card paper from empty scanner/sleeve margin via Lab/warmth/chroma
+         + morphological closing/opening (erasing thin 1-4px penny-sleeve rims & reflections).
+      2. Refines each of the 4 physical edges within a tight +/-3.5% band around the opaque
+         component using 1D Sobel gradients so outer edges never collapse onto the inner frame.
+      3. Applies a gentle multi-format aspect guard (never clipping an A&G Mini ~0.571 to 0.714).
     """
     w, h = img.size
     if w < 60 or h < 60:
@@ -443,130 +443,109 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    # Outer scanner/sleeve background reference from 3% border strips
-    b_px = max(3, int(min(sw, sh) * 0.03))
-    bg_samples = np.concatenate([
-        lab[:b_px, :, :].reshape(-1, 3),
-        lab[-b_px:, :, :].reshape(-1, 3),
-        lab[:, :b_px, :].reshape(-1, 3),
-        lab[:, -b_px:, :].reshape(-1, 3),
+    # Outer scanner/sleeve background reference from 4 corner patches (4% x 4%)
+    cs_x = max(8, int(sw * 0.04))
+    cs_y = max(8, int(sh * 0.04))
+    bg_lab_samples = np.concatenate([
+        lab[:cs_y, :cs_x, :].reshape(-1, 3),
+        lab[:cs_y, -cs_x:, :].reshape(-1, 3),
+        lab[-cs_y:, :cs_x, :].reshape(-1, 3),
+        lab[-cs_y:, -cs_x:, :].reshape(-1, 3),
     ], axis=0)
-    bg_lab = np.median(bg_samples, axis=0)
-    lab_dist = np.linalg.norm(lab - bg_lab[None, None, :], axis=2)
+    bg_lab = np.median(bg_lab_samples, axis=0)
+
+    l_abs_diff = np.abs(lab[:, :, 0] - bg_lab[0])
+    b_warm_diff = lab[:, :, 2] - bg_lab[2]
 
     gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
     gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
-    grad_mag = np.maximum(gx, gy)
 
-    # Printed ink/artwork mask restricted to central 90% so outer sleeve rim is ignored
-    ink_mask = ((hsv[:, :, 1] > 26) | (grad_mag > 22.0) | (lab_dist > 22.0))
-    m_pad_x = max(4, int(sw * 0.05))
-    m_pad_y = max(4, int(sh * 0.05))
-    ink_mask[:m_pad_y, :] = False
-    ink_mask[-m_pad_y:, :] = False
-    ink_mask[:, :m_pad_x] = False
-    ink_mask[:, -m_pad_x:] = False
+    # Opaque card-stock mask: avoids cool blue-gray empty sleeve (HSV S~29, B>R) while
+    # capturing warm/neutral card paper (Lab-b +6.5), high luminance delta (>22), or rich ink (S>42)
+    opaque = ((b_warm_diff > 8.5) | (l_abs_diff > 24.0) | ((hsv[:, :, 1] > 42) & (hsv[:, :, 2] > 45))).astype(np.uint8) * 255
+    # Erase thin 1-4px sleeve rims/glare first, then bridge printed interior details
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    opened = cv2.morphologyEx(opaque, cv2.MORPH_OPEN, k_open, iterations=1)
+    cleaned = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, k_close, iterations=1)
 
-    ys_ink, xs_ink = np.where(ink_mask)
-    if xs_ink.size >= 120 and ys_ink.size >= 120:
-        ax1 = int(np.percentile(xs_ink, 2))
-        ax2 = int(np.percentile(xs_ink, 98))
-        ay1 = int(np.percentile(ys_ink, 2))
-        ay2 = int(np.percentile(ys_ink, 98))
-        art_w = max(20, ax2 - ax1)
-        art_h = max(20, ay2 - ay1)
-        art_ar = art_w / float(art_h)
+    n_lbl, _, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    best_comp = None
+    best_area = 0
+    total_area = float(sw * sh)
+    for idx in range(1, n_lbl):
+        a = int(stats[idx, cv2.CC_STAT_AREA])
+        if a >= 0.16 * total_area and a > best_area:
+            bx = int(stats[idx, cv2.CC_STAT_LEFT])
+            by = int(stats[idx, cv2.CC_STAT_TOP])
+            bw = int(stats[idx, cv2.CC_STAT_WIDTH])
+            bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            if bw >= 40 and bh >= 40:
+                best_area = a
+                best_comp = (bx, by, bx + bw, by + bh)
 
-        is_landscape = (sw > sh * 1.05) or (art_ar > 1.15)
-        target_ar = 1.400 if is_landscape else (2.5 / 3.5)
-        enforce_std_ar = (1.18 <= art_ar <= 1.62) if is_landscape else (0.60 <= art_ar <= 0.84)
+    if best_comp is not None:
+        bx1, by1, bx2, by2 = best_comp
+        bw_c = max(40, bx2 - bx1)
+        bh_c = max(40, by2 - by1)
+        mid_y1, mid_y2 = int(by1 + bh_c * 0.2), int(by2 - bh_c * 0.2)
+        mid_x1, mid_x2 = int(bx1 + bw_c * 0.2), int(bx2 - bw_c * 0.2)
+        prof_x = np.mean(gx[max(0, mid_y1):max(1, mid_y2), :], axis=0)
+        prof_y = np.mean(gy[:, max(0, mid_x1):max(1, mid_x2)], axis=1)
 
-        mid_y1, mid_y2 = max(0, int(ay1 + art_h * 0.2)), min(sh, int(ay2 - art_h * 0.2))
-        mid_x1, mid_x2 = max(0, int(ax1 + art_w * 0.2)), min(sw, int(ax2 - art_w * 0.2))
-        if mid_y2 <= mid_y1 + 8:
-            mid_y1, mid_y2 = int(sh * 0.25), int(sh * 0.75)
-        if mid_x2 <= mid_x1 + 8:
-            mid_x1, mid_x2 = int(sw * 0.25), int(sw * 0.75)
+        pad_x = max(4, int(sw * 0.02))
+        pad_y = max(4, int(sh * 0.02))
 
-        prof_x = np.mean(gx[mid_y1:mid_y2, :], axis=0)
-        prof_y = np.mean(gy[:, mid_x1:mid_x2], axis=1)
+        def _snap_local(prof: np.ndarray, approx: int, pad: int) -> int:
+            lo = max(0, approx - pad)
+            hi = min(len(prof) - 1, approx + pad)
+            if hi <= lo:
+                return approx
+            seg = prof[lo:hi + 1]
+            if float(np.max(seg)) < 6.0:
+                return approx
+            return lo + int(np.argmax(seg))
 
-        def _innermost_edge(prof: np.ndarray, start: int, end: int, step: int) -> Optional[int]:
-            """Scans outward from `start` toward `end` and picks the innermost strong card-stock edge."""
-            if step > 0:
-                lo, hi = max(0, start), min(len(prof) - 1, end)
-                if hi <= lo + 2:
-                    return None
-                seg = prof[lo:hi + 1]
-                pk = float(np.max(seg))
-                if pk < 8.0:
-                    return None
-                thr = max(10.0, pk * 0.42)
-                for off in range(len(seg)):
-                    if seg[off] >= thr:
-                        # Step to local peak within +/-3 px
-                        p_hi = min(len(seg), off + 4)
-                        return lo + off + int(np.argmax(seg[off:p_hi]))
+        x1 = _snap_local(prof_x, bx1, pad_x)
+        x2 = _snap_local(prof_x, bx2, pad_x)
+        y1 = _snap_local(prof_y, by1, pad_y)
+        y2 = _snap_local(prof_y, by2, pad_y)
+
+        cw_c = max(40, x2 - x1)
+        ch_c = max(40, y2 - y1)
+        cand_ar = cw_c / float(ch_c)
+
+        # Multi-format prior: Standard (0.714 / 1.400) vs. Tobacco/A&G Mini (0.571 / 1.750)
+        target_ar = None
+        if 0.65 <= cand_ar <= 0.78:
+            target_ar = 2.5 / 3.5
+        elif 1.28 <= cand_ar <= 1.52:
+            target_ar = 1.400
+        elif 0.50 <= cand_ar <= 0.63:
+            target_ar = 1.5 / 2.625
+        elif 1.58 <= cand_ar <= 1.92:
+            target_ar = 2.625 / 1.5
+
+        if target_ar is not None and abs(cand_ar - target_ar) / target_ar > 0.04:
+            if cand_ar < target_ar:
+                exp_h = int(round(cw_c / target_ar))
+                excess = ch_c - exp_h
+                if excess > 2:
+                    y1 += excess // 2
+                    y2 = min(sh, y1 + exp_h)
             else:
-                lo, hi = max(0, end), min(len(prof) - 1, start)
-                if hi <= lo + 2:
-                    return None
-                seg = prof[lo:hi + 1]
-                pk = float(np.max(seg))
-                if pk < 8.0:
-                    return None
-                thr = max(10.0, pk * 0.42)
-                for off in range(len(seg) - 1, -1, -1):
-                    if seg[off] >= thr:
-                        p_lo = max(0, off - 3)
-                        return lo + p_lo + int(np.argmax(seg[p_lo:off + 1]))
-            return None
+                exp_w = int(round(ch_c * target_ar))
+                excess = cw_c - exp_w
+                if excess > 2:
+                    x1 += excess // 2
+                    x2 = min(sw, x1 + exp_w)
 
-        # Scan outward from rough artwork bounds (innermost card-stock edge before outer sleeve)
-        cand_l = _innermost_edge(prof_x, ax1, max(0, ax1 - int(sw * 0.18)), -1)
-        cand_r = _innermost_edge(prof_x, ax2, min(sw - 1, ax2 + int(sw * 0.18)), 1)
-        cand_t = _innermost_edge(prof_y, ay1, max(0, ay1 - int(sh * 0.18)), -1)
-        cand_b = _innermost_edge(prof_y, ay2, min(sh - 1, ay2 + int(sh * 0.18)), 1)
-
-        # If artwork already sits near outer border (borderless card), scan inward from 0..ax1+6
-        x1 = cand_l if cand_l is not None else max(0, ax1 - int(art_w * 0.05))
-        x2 = cand_r if cand_r is not None else min(sw, ax2 + int(art_w * 0.05))
-        y1 = cand_t if cand_t is not None else max(0, ay1 - int(art_h * 0.05))
-        y2 = cand_b if cand_b is not None else min(sh, ay2 + int(art_h * 0.05))
-
-        cw_c = max(20, x2 - x1)
-        ch_c = max(20, y2 - y1)
-        if enforce_std_ar:
-            cand_ar = cw_c / float(ch_c)
-            if abs(cand_ar - target_ar) / target_ar > 0.03:
-                if cand_ar < target_ar:
-                    # Too tall (e.g. sleeve top/bottom overhang) -> trim overhanging top/bottom
-                    exp_h = int(round(cw_c / target_ar))
-                    excess = ch_c - exp_h
-                    if excess > 2:
-                        top_gap = max(0, ay1 - y1)
-                        bot_gap = max(0, y2 - ay2)
-                        tot_g = max(1, top_gap + bot_gap)
-                        y1 += int(round(excess * (top_gap / float(tot_g))))
-                        y2 = min(sh, y1 + exp_h)
-                else:
-                    # Too wide (e.g. sleeve side overhang) -> trim overhanging left/right
-                    exp_w = int(round(ch_c * target_ar))
-                    excess = cw_c - exp_w
-                    if excess > 2:
-                        l_gap = max(0, ax1 - x1)
-                        r_gap = max(0, x2 - ax2)
-                        tot_g = max(1, l_gap + r_gap)
-                        x1 += int(round(excess * (l_gap / float(tot_g))))
-                        x2 = min(sw, x1 + exp_w)
-
-        if (x2 - x1) * (y2 - y1) >= 0.28 * sw * sh:
-            return (
-                max(0, int(round(x1 / scale))),
-                max(0, int(round(y1 / scale))),
-                min(w, int(round(x2 / scale))),
-                min(h, int(round(y2 / scale))),
-            )
+        return (
+            max(0, int(round(x1 / scale))),
+            max(0, int(round(y1 / scale))),
+            min(w, int(round(x2 / scale))),
+            min(h, int(round(y2 / scale))),
+        )
 
     # Fallback contour detector
     blur = cv2.GaussianBlur(gray.astype(np.uint8), (5, 5), 0)
@@ -580,7 +559,7 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     for c in cnts:
         x, y, cw, ch = cv2.boundingRect(c)
         a = float(cw * ch)
-        if 0.35 * total_s_area <= a <= 0.98 * total_s_area and a > best_area:
+        if 0.25 * total_s_area <= a <= 0.98 * total_s_area and a > best_area:
             best_area = a
             best_box = (
                 max(0, int(x / scale)),
@@ -4591,24 +4570,26 @@ def _measure_side_centering(
         grad_x = np.abs(cv2.Sobel(gray[mid_y1:mid_y2, :], cv2.CV_32F, 1, 0, ksize=3)).mean(axis=0)
         grad_y = np.abs(cv2.Sobel(gray[:, mid_x1:mid_x2], cv2.CV_32F, 0, 1, ksize=3)).mean(axis=1)
 
-        left_span = max(4, int(cw * 0.18))
-        top_span = max(4, int(ch * 0.18))
+        left_span = max(8, int(cw * 0.18))
+        top_span = max(8, int(ch * 0.18))
+        min_in_x = max(6, int(cw * 0.018))
+        min_in_y = max(6, int(ch * 0.018))
 
-        def _outermost_frame_edge(prof_seg: np.ndarray, default_val: int) -> int:
+        def _outermost_frame_edge(prof_seg: np.ndarray, min_in: int, default_val: int) -> int:
             if prof_seg.size <= 2:
                 return default_val
             pk = float(np.max(prof_seg))
-            thr = max(10.0, pk * 0.40)
+            thr = max(12.0, pk * 0.38)
             for idx_p in range(len(prof_seg)):
                 if prof_seg[idx_p] >= thr:
-                    win_hi = min(len(prof_seg), idx_p + 4)
-                    return 3 + idx_p + int(np.argmax(prof_seg[idx_p:win_hi]))
-            return 3 + int(np.argmax(prof_seg))
+                    win_hi = min(len(prof_seg), idx_p + 5)
+                    return min_in + idx_p + int(np.argmax(prof_seg[idx_p:win_hi]))
+            return min_in + int(np.argmax(prof_seg))
 
-        l_idx = _outermost_frame_edge(grad_x[3:left_span], int(cw * 0.05))
-        r_idx = _outermost_frame_edge(grad_x[::-1][3:left_span], int(cw * 0.05))
-        t_idx = _outermost_frame_edge(grad_y[3:top_span], int(ch * 0.05))
-        b_idx = _outermost_frame_edge(grad_y[::-1][3:top_span], int(ch * 0.05))
+        l_idx = _outermost_frame_edge(grad_x[min_in_x:left_span], min_in_x, int(cw * 0.05))
+        r_idx = _outermost_frame_edge(grad_x[::-1][min_in_x:left_span], min_in_x, int(cw * 0.05))
+        t_idx = _outermost_frame_edge(grad_y[min_in_y:top_span], min_in_y, int(ch * 0.05))
+        b_idx = _outermost_frame_edge(grad_y[::-1][min_in_y:top_span], min_in_y, int(ch * 0.05))
         in_x1 = x1 + l_idx
         in_y1 = y1 + t_idx
         in_x2 = max(in_x1 + 10, x2 - r_idx)
@@ -4664,11 +4645,20 @@ def _measure_side_centering(
 
     sleeve_det = bool(has_holder_margin or x1 >= 8 or y1 >= 8 or (iw - x2) >= 8 or (ih - y2) >= 8)
 
+    card_ar = cw / float(max(1, ch))
+    if (0.64 <= card_ar <= 0.79) or (1.26 <= card_ar <= 1.54):
+        card_fmt = "standard"
+    elif (0.49 <= card_ar <= 0.64) or (1.56 <= card_ar <= 1.94):
+        card_fmt = "mini"
+    else:
+        card_fmt = "non_standard"
+
     return {
         "outer_card_rect": outer_rect,
         "inner_frame_rect": inner_rect,
         "corners": default_corners,
-        "orientation": "landscape" if iw > ih else "portrait",
+        "orientation": "landscape" if cw > ch else "portrait",
+        "card_format": card_fmt,
         "lr_left": lr_l,
         "lr_right": lr_r,
         "lr": f"{lr_l}/{lr_r}",
@@ -5339,7 +5329,7 @@ def flag_grading_error_and_reevaluate(
                 break
 
     needs_full_image_rescan = False
-    if err_type in ("false_positive_artifact", "scanner_streak"):
+    if err_type in ("false_positive_artifact", "scanner_streak", "not_a_defect_artwork"):
         dismissed = list(ov.get("dismissed_defect_ids") or [])
         if target_item_id and target_item_id not in dismissed:
             dismissed.append(target_item_id)

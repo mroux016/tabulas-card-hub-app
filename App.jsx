@@ -1801,7 +1801,7 @@ function FlagGradingErrorModal({
   onClose,
   onSubmitted,
 }) {
-  const [errorType, setErrorType] = useState(initialTargetItemId ? 'false_positive_artifact' : 'centering_sleeve_rim');
+  const [errorType, setErrorType] = useState(initialTargetItemId ? 'not_a_defect_artwork' : 'centering_sleeve_rim');
   const [side, setSide] = useState(initialSide || 'Front');
   const [targetItemId, setTargetItemId] = useState(initialTargetItemId || '');
   const [manualCat, setManualCat] = useState('surface');
@@ -1886,6 +1886,7 @@ function FlagGradingErrorModal({
           <div className="md:col-span-2">
             <label className="block text-[11px] font-bold text-slate-300 mb-1">Error Category</label>
             <select value={errorType} onChange={(e) => setErrorType(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
+              <option value="not_a_defect_artwork">Not a defect — part of card artwork / photo (e.g., uniform stripe, text, pattern)</option>
               <option value="centering_sleeve_rim">Centering measured from penny sleeve / holder rim</option>
               <option value="false_positive_artifact">Hair / dust / glare misclassified as real defect</option>
               <option value="scanner_streak">Scanner glass / sensor streak misclassified as scratch / print line</option>
@@ -1904,7 +1905,7 @@ function FlagGradingErrorModal({
             </select>
           </div>
 
-          {(errorType === 'false_positive_artifact' || errorType === 'false_light_border' || errorType === 'scanner_streak') && (
+          {(errorType === 'not_a_defect_artwork' || errorType === 'false_positive_artifact' || errorType === 'false_light_border' || errorType === 'scanner_streak') && (
             <div>
               <label className="block text-[11px] font-bold text-slate-300 mb-1">Target Detected Item</label>
               <select value={targetItemId} onChange={(e) => setTargetItemId(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white">
@@ -2338,20 +2339,35 @@ function GradingDeepDiveStudio({
     panDragRef.current = null;
   };
 
-  const handleCanvasWheel = (e) => {
-    if (e.ctrlKey || Math.abs(e.deltaY) > 0) {
+  // Non-passive wheel zoom listener so wheel zooming never scrolls the page
+  useEffect(() => {
+    const el = canvasWrapRef.current;
+    if (!el) return;
+    const onWheel = (e) => {
       e.preventDefault();
-      const delta = e.deltaY < 0 ? 0.2 : -0.2;
+      e.stopPropagation();
+      const delta = e.deltaY < 0 ? 0.25 : -0.25;
       setMainZoom((z) => {
         const nz = Number(Math.max(1.0, Math.min(4.0, z + delta)).toFixed(2));
         if (nz <= 1.0) setMainPan({ x: 0, y: 0 });
         return nz;
       });
-    }
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const clampPan = (px, py, z = mainZoom) => {
+    const maxX = Math.max(0, fittedBox.w * Math.max(0, z - 1.0) * 0.55);
+    const maxY = Math.max(0, fittedBox.h * Math.max(0, z - 1.0) * 0.55);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, px)),
+      y: Math.max(-maxY, Math.min(maxY, py)),
+    };
   };
 
   const handleCanvasPointerDown = (e) => {
-    if (editMode !== 'none' || mainZoom <= 1.0 || geomDragRef.current) return;
+    if (mainZoom <= 1.0 || geomDragRef.current) return;
     panDragRef.current = { startX: e.clientX, startY: e.clientY, origX: mainPan.x, origY: mainPan.y };
   };
 
@@ -2362,7 +2378,7 @@ function GradingDeepDiveStudio({
     }
     const pd = panDragRef.current;
     if (!pd) return;
-    setMainPan({ x: pd.origX + (e.clientX - pd.startX), y: pd.origY + (e.clientY - pd.startY) });
+    setMainPan(clampPan(pd.origX + (e.clientX - pd.startX), pd.origY + (e.clientY - pd.startY)));
   };
 
   // Live centering calculation during Edit Centering
@@ -2427,40 +2443,65 @@ function GradingDeepDiveStudio({
   const subDisp = card?.Subset || card?.Subset_Parallel || 'Base';
   const anyFilteredOrIsolated = Boolean(isolatedDefectId) || !activeLayers.centering || !activeLayers.corners || !activeLayers.edges || !activeLayers.surface;
 
-  // Authentic PSA Card (Red & White, Non-Toggle)
+  // Authentic PSA Slab Label (Red Frame + White Interior + Security Watermark + Logo)
   const renderPsaCard = () => {
     const subs = psaInfo?.subgrades || {};
-    const items = [
-      { label: 'Centering', val: subs.centering },
-      { label: 'Corners', val: subs.corners },
-      { label: 'Edges', val: subs.edges },
-      { label: 'Surface', val: subs.surface },
-    ];
+    const psaNum = parseFloat(psaInfo?.overall);
+    const psaTier = !isNaN(psaNum)
+      ? (psaNum >= 10 ? 'GEM MT' : psaNum >= 9 ? 'MINT' : psaNum >= 8 ? 'NM-MT' : psaNum >= 7 ? 'NM' : 'EX-MT')
+      : String(psaInfo?.tier || '').toUpperCase();
     return (
-      <div className="rounded-2xl overflow-hidden border-2 border-red-600 bg-white text-slate-900 shadow-lg">
-        <div className="bg-red-600 text-white px-3 py-1.5 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="font-black tracking-widest text-xs uppercase bg-white text-red-600 px-1.5 py-0.5 rounded">PSA</span>
-            <span className="text-[11px] font-bold uppercase tracking-wide">Estimated Grade</span>
-          </div>
-          <div className="flex items-baseline gap-1.5">
-            {psaInfo?.tier && <span className="text-[10px] font-bold uppercase opacity-90">{psaInfo.tier}</span>}
-            <span className="text-xl font-black font-mono leading-none">{psaInfo?.overall ?? '—'}</span>
-          </div>
-        </div>
-        <div className="p-2 grid grid-cols-4 gap-1.5 bg-slate-50">
-          {items.map((it) => (
-            <div key={it.label} className="bg-white border border-red-200 rounded-xl px-1.5 py-1 text-center">
-              <div className="text-[9px] font-bold uppercase text-red-700 truncate">{it.label}</div>
-              <div className="text-xs font-black font-mono text-slate-900">{it.val ?? '—'}</div>
+      <div className="rounded-xl border-[3px] border-red-600 bg-red-600 p-0.5 shadow-lg select-none">
+        <div
+          className="rounded-lg bg-white text-slate-900 px-2.5 py-2 relative overflow-hidden flex items-stretch justify-between gap-2 min-h-[104px]"
+          style={{
+            backgroundImage: 'repeating-linear-gradient(135deg, rgba(226,232,240,0.42) 0px, rgba(226,232,240,0.42) 2px, rgba(255,255,255,0.92) 2px, rgba(255,255,255,0.92) 8px)',
+          }}
+        >
+          {/* Left: Set, Player, Subset, Barcode & Compact Subgrades */}
+          <div className="flex-1 min-w-0 flex flex-col justify-between">
+            <div>
+              <div className="text-[9.5px] font-extrabold uppercase tracking-tight text-slate-700 truncate">{card?.Set || 'CARD SET'}</div>
+              <div className="text-[11.5px] font-black uppercase tracking-tight text-slate-950 truncate">{card?.Player || 'PLAYER'}</div>
+              <div className="text-[9px] font-bold uppercase text-slate-600 truncate">{subDisp}</div>
             </div>
-          ))}
+            <div className="flex items-center gap-2 mt-1">
+              <div
+                className="h-3 w-16 rounded-xs opacity-75 shrink-0"
+                style={{ backgroundImage: 'repeating-linear-gradient(90deg, #0f172a 0px, #0f172a 1.5px, transparent 1.5px, transparent 3px, #0f172a 3px, #0f172a 4px, transparent 4px, transparent 6.5px)' }}
+              />
+              <div className="text-[8.5px] font-mono font-bold text-slate-700 truncate">
+                CTR {subs.centering ?? '—'} • CRN {subs.corners ?? '—'} • EDG {subs.edges ?? '—'} • SRF {subs.surface ?? '—'}
+              </div>
+            </div>
+          </div>
+
+          {/* Center-Bottom PSA Lighthouse Logo */}
+          <div className="flex flex-col items-center justify-end shrink-0 pb-0.5">
+            <img
+              src={`${API_ORIGIN}/api/assets/logos/psa_logo.png`}
+              alt="PSA"
+              className="h-6 w-auto object-contain"
+              onError={(e) => { e.currentTarget.style.display = 'none'; }}
+            />
+            <span className="text-[8px] font-black tracking-widest text-red-600 leading-none mt-0.5">PSA</span>
+          </div>
+
+          {/* Right: Card #, Tier, Large Grade & Cert SKU */}
+          <div className="text-right flex flex-col justify-between shrink-0 min-w-[58px]">
+            <div className="text-[9.5px] font-black font-mono text-slate-800">#{cnumDisp || '—'}</div>
+            <div>
+              <div className="text-[9px] font-black uppercase tracking-wider text-red-700 leading-none">{psaTier}</div>
+              <div className="text-2xl font-black font-mono text-slate-950 leading-none mt-0.5">{psaInfo?.overall ?? '—'}</div>
+            </div>
+            <div className="text-[8.5px] font-mono font-bold text-slate-500">#{sku}</div>
+          </div>
         </div>
       </div>
     );
   };
 
-  // Authentic Beckett (BGS) Card (Dynamic Silver / Gold / Black Label 10, Non-Toggle)
+  // Authentic Beckett (BGS) Slab Label (Brushed Metallic Silver / Gold / Black Label 10)
   const renderBgsCard = () => {
     const subs = bgsInfo?.subgrades || {};
     const ovNum = parseFloat(bgsInfo?.overall);
@@ -2471,46 +2512,70 @@ function GradingDeepDiveStudio({
     const isBlackLabel = !isNaN(ovNum) && ovNum >= 10.0 && cNum >= 10.0 && coNum >= 10.0 && eNum >= 10.0 && sNum >= 10.0;
     const isGoldLabel = !isBlackLabel && !isNaN(ovNum) && ovNum >= 9.5;
 
-    const wrapCls = isBlackLabel
-      ? 'bg-gradient-to-br from-neutral-950 via-black to-neutral-900 border-2 border-amber-400 text-amber-300 shadow-lg'
+    const bgStyle = isBlackLabel
+      ? {
+          background: 'linear-gradient(180deg, #141418 0%, #0a0a0c 50%, #16161b 100%)',
+          color: '#E5C158',
+          borderColor: '#D4AF37',
+        }
       : isGoldLabel
-      ? 'bg-gradient-to-br from-amber-300 via-yellow-400 to-amber-500 border-2 border-amber-200 text-slate-950 shadow-lg'
-      : 'bg-gradient-to-br from-slate-200 via-slate-300 to-slate-400 border-2 border-slate-100 text-slate-950 shadow-lg';
+      ? {
+          background: 'repeating-linear-gradient(0deg, rgba(255,255,255,0.08) 0px, rgba(255,255,255,0.08) 1px, transparent 1px, transparent 3px), linear-gradient(135deg, #E6C86E 0%, #D4AF37 42%, #F3DC8A 62%, #C5A028 100%)',
+          color: '#0f172a',
+          borderColor: '#fef08a',
+        }
+      : {
+          background: 'repeating-linear-gradient(0deg, rgba(255,255,255,0.14) 0px, rgba(255,255,255,0.14) 1px, transparent 1px, transparent 3px), linear-gradient(135deg, #E2E8F0 0%, #CBD5E1 45%, #F1F5F9 65%, #94A3B8 100%)',
+          color: '#0f172a',
+          borderColor: '#f8fafc',
+        };
 
-    const hdrCls = isBlackLabel
-      ? 'border-b border-amber-400/40 text-amber-300'
-      : 'border-b border-black/15 text-slate-950';
+    const bgsTier = isBlackLabel
+      ? 'PRISTINE'
+      : !isNaN(ovNum) && ovNum >= 10.0
+      ? 'PRISTINE'
+      : !isNaN(ovNum) && ovNum >= 9.5
+      ? 'GEM MINT'
+      : !isNaN(ovNum) && ovNum >= 9.0
+      ? 'MINT'
+      : 'NM-MT';
 
-    const boxCls = isBlackLabel
-      ? 'bg-neutral-900/95 border border-amber-400/60 text-amber-300'
-      : 'bg-white/75 border border-black/15 text-slate-950';
-
-    const labelBadge = isBlackLabel ? 'BLACK LABEL 10' : isGoldLabel ? 'GOLD LABEL' : 'SILVER LABEL';
-    const items = [
-      { label: 'Centering', val: subs.centering },
-      { label: 'Corners', val: subs.corners },
-      { label: 'Edges', val: subs.edges },
-      { label: 'Surface', val: subs.surface },
-    ];
     return (
-      <div className={`rounded-2xl overflow-hidden ${wrapCls}`}>
-        <div className={`px-3 py-1.5 flex items-center justify-between ${hdrCls}`}>
-          <div className="flex items-center gap-1.5">
-            <span className={`font-black tracking-wider text-[11px] px-1.5 py-0.5 rounded ${isBlackLabel ? 'bg-amber-400 text-black' : 'bg-slate-900 text-white'}`}>BGS</span>
-            <span className="text-[10px] font-extrabold uppercase tracking-wide">{labelBadge}</span>
+      <div
+        className="rounded-xl border-2 px-2.5 py-2 shadow-lg select-none flex items-stretch justify-between gap-2 min-h-[104px]"
+        style={bgStyle}
+      >
+        {/* Left Edge BGS Laurel Logo */}
+        <div className="flex flex-col items-center justify-center shrink-0">
+          <img
+            src={`${API_ORIGIN}/api/assets/logos/bgs_logo.png`}
+            alt="BGS"
+            className="h-9 w-auto object-contain"
+            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+          />
+          <span className={`text-[8px] font-black tracking-widest mt-0.5 ${isBlackLabel ? 'text-amber-300' : 'text-slate-900'}`}>BGS</span>
+        </div>
+
+        {/* Center: Metadata + Authentic 2x2 Subgrade Grid */}
+        <div className="flex-1 min-w-0 flex flex-col justify-between">
+          <div>
+            <div className="text-[9px] font-extrabold uppercase tracking-tight opacity-85 truncate">{card?.Set || 'CARD SET'}</div>
+            <div className="text-[11px] font-black uppercase tracking-tight truncate">#{cnumDisp} {card?.Player || 'PLAYER'}</div>
+            <div className="text-[8.5px] font-bold uppercase opacity-75 truncate">{subDisp}</div>
           </div>
-          <div className="flex items-baseline gap-1.5">
-            {bgsInfo?.tier && <span className="text-[10px] font-bold uppercase opacity-80">{bgsInfo.tier}</span>}
-            <span className="text-xl font-black font-mono leading-none">{bgsInfo?.overall ?? '—'}</span>
+          <div className="grid grid-cols-2 gap-x-2.5 gap-y-0.5 text-[9px] font-mono font-black uppercase mt-1">
+            <div className="flex justify-between"><span>CENTERING</span><span>{subs.centering ?? '—'}</span></div>
+            <div className="flex justify-between"><span>CORNERS</span><span>{subs.corners ?? '—'}</span></div>
+            <div className="flex justify-between"><span>EDGES</span><span>{subs.edges ?? '—'}</span></div>
+            <div className="flex justify-between"><span>SURFACE</span><span>{subs.surface ?? '—'}</span></div>
           </div>
         </div>
-        <div className="p-2 grid grid-cols-4 gap-1.5">
-          {items.map((it) => (
-            <div key={it.label} className={`rounded-xl px-1.5 py-1 text-center ${boxCls}`}>
-              <div className="text-[9px] font-bold uppercase opacity-80 truncate">{it.label}</div>
-              <div className="text-xs font-black font-mono">{it.val ?? '—'}</div>
-            </div>
-          ))}
+
+        {/* Right: Huge Bold Grade + Tier + Cert SKU */}
+        <div className={`text-right flex flex-col justify-between shrink-0 pl-2 border-l ${isBlackLabel ? 'border-amber-400/35' : 'border-black/20'} min-w-[62px]`}>
+          <div className="text-[8.5px] font-black uppercase tracking-wider leading-none">{isBlackLabel ? 'BLACK 10' : bgsTier}</div>
+          <div className="text-3xl font-black font-mono leading-none my-auto">{bgsInfo?.overall ?? '—'}</div>
+          <div className="text-[8.5px] font-mono font-bold opacity-80">#{sku}</div>
         </div>
       </div>
     );
@@ -2524,7 +2589,7 @@ function GradingDeepDiveStudio({
   ];
 
   return (
-    <div className="flex flex-col gap-3 h-[calc(100vh-5.5rem)] min-h-[680px]">
+    <div className="flex flex-col gap-2.5 h-[calc(100vh-56px)] overflow-hidden">
       {/* TOP BAR */}
       <div className={`${skin.cardBg} border ${skin.border} rounded-2xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0`}>
         <div className="flex flex-wrap items-center gap-2 min-w-0">
@@ -2572,7 +2637,7 @@ function GradingDeepDiveStudio({
       </div>
 
       {/* MAIN SPLIT PANE */}
-      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-3">
+      <div className="flex-1 min-h-0 overflow-hidden grid grid-cols-1 lg:grid-cols-12 gap-3">
         {/* LEFT PANE: FULL-HEIGHT SINGLE-SIDE IMAGE + ZOOM/PAN + EDIT CENTERING/CORNERS */}
         <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0`}>
           {/* LEFT TOOLBAR */}
@@ -2652,12 +2717,11 @@ function GradingDeepDiveStudio({
           {/* CARD CANVAS */}
           <div
             ref={canvasWrapRef}
-            onWheel={handleCanvasWheel}
             onPointerDown={handleCanvasPointerDown}
             onPointerMove={handleCanvasPointerMove}
             onPointerUp={handleSvgPointerUp}
             onPointerLeave={handleSvgPointerUp}
-            className={`flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative ${mainZoom > 1.0 && editMode === 'none' ? 'cursor-grab active:cursor-grabbing' : ''}`}
+            className={`flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative ${mainZoom > 1.0 ? 'cursor-grab active:cursor-grabbing' : ''}`}
           >
             {!activeImgUrl ? (
               <div className="text-xs text-slate-500">No {activeSide} scan image available.</div>
@@ -2804,7 +2868,7 @@ function GradingDeepDiveStudio({
         </div>
 
         {/* RIGHT PANE: PSA/BGS CARDS + CLICKABLE NOTES TOGGLES + COMPACT DEFECT GRID + ENLARGED LOUPE OVERLAY */}
-        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2.5 min-h-0 overflow-y-auto relative`}>
+        <div className={`lg:col-span-6 ${skin.cardBg} border ${skin.border} rounded-2xl p-3 flex flex-col gap-2 min-h-0 overflow-hidden relative`}>
           {/* TOP: AUTHENTIC PSA & BECKETT SUMMARY CARDS (NON-TOGGLE) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 shrink-0">
             {renderPsaCard()}
@@ -2850,8 +2914,8 @@ function GradingDeepDiveStudio({
             </div>
           )}
 
-          {/* BOTTOM: COMPACT ACTIVE-SIDE DEFECT GRID (NO CLEAN CORNERS, ACTIVE-FIRST SORTING + GRAYING) */}
-          <div className="flex-1 min-h-[180px] bg-slate-950/85 border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2">
+          {/* BOTTOM: COMPACT ACTIVE-SIDE DEFECT GRID (FIXED TILE PROPORTIONS, INTERNAL SCROLL ONLY) */}
+          <div className="flex-1 min-h-0 bg-slate-950/85 border border-slate-800 rounded-2xl p-2.5 flex flex-col gap-2 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] shrink-0">
               <span className="font-bold text-white uppercase tracking-wider">
                 🔍 {activeSide} Detected Issues ({activeSideDefectsAll.length})
@@ -2871,7 +2935,7 @@ function GradingDeepDiveStudio({
                 ✨ Clean {activeSide} — no permanent corner, edge, or surface defects detected.
               </div>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 overflow-y-auto pr-1">
+              <div className="flex-1 min-h-0 grid grid-cols-3 xl:grid-cols-4 gap-2.5 auto-rows-max content-start overflow-y-auto pr-1">
                 {activeSideDefectsAll.map((d, di) => {
                   const isCatActive = Boolean(activeLayers[String(d.category || 'surface')]);
                   const isIso = isolatedDefectId === d.id;
@@ -2892,7 +2956,7 @@ function GradingDeepDiveStudio({
                           : 'border-slate-800 bg-slate-900/60 opacity-35 grayscale hover:opacity-70'
                       }`}
                     >
-                      <div className="relative w-full aspect-[4/3] bg-slate-950">
+                      <div className="relative w-full aspect-square bg-slate-950">
                         {cropUrl && <img src={cropUrl} alt={d.label || d.type} className="w-full h-full object-cover" />}
                         <svg viewBox="0 0 100 100" className="absolute inset-0 w-full h-full pointer-events-none">
                           {d.marker_style === 'box' ? (
@@ -2969,17 +3033,58 @@ function GradingDeepDiveStudio({
                 </div>
               </div>
 
-              <div className="flex items-center justify-between gap-2 shrink-0">
+              <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
                 <button type="button" onClick={showAllMarkers} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-sky-300">
                   👁️ Show All Markers
                 </button>
-                <button
-                  type="button"
-                  onClick={() => { setFlagPresetId(isolatedDefect.id); setShowFlagModal(true); }}
-                  className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow"
-                >
-                  🚩 Flag / Report Error
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      fetch(`${NODE_API_BASE}/grading/flag-error`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          targetType,
+                          sku,
+                          batchName: effectiveBatch,
+                          errorType: 'not_a_defect_artwork',
+                          side: isolatedDefect.side || activeSide,
+                          targetItemId: isolatedDefect.id,
+                          notes: '1-click artwork/photo dismissal from loupe',
+                        }),
+                      })
+                        .then((r) => r.json())
+                        .then((res) => {
+                          if (res?.success) {
+                            if (res.diagnostics) setDiagnostics(res.diagnostics);
+                            if (onCardUpdated) onCardUpdated(res);
+                            setIsolatedDefectId('');
+                            const gb = res.gradesBefore || {};
+                            const ga = res.gradesAfter || {};
+                            if (pushNotification) {
+                              pushNotification(
+                                `Dismissed Artwork False Positive — SKU ${sku}`,
+                                `PSA ${gb.Est_PSA || '?'} → ${ga.Est_PSA || '?'} | BGS ${gb.Est_BGS || '?'} → ${ga.Est_BGS || '?'}`,
+                                'Grading',
+                                'success'
+                              );
+                            }
+                          }
+                        });
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow"
+                  >
+                    ✓ Not a Defect
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setFlagPresetId(isolatedDefect.id); setShowFlagModal(true); }}
+                    className="px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow"
+                  >
+                    🚩 Flag / Report Error
+                  </button>
+                </div>
               </div>
             </div>
           )}

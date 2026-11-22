@@ -236,8 +236,28 @@ class TestGradingDeepDive(unittest.TestCase):
             self.assertAlmostEqual(a, b, places=2)
         self.assertEqual(f_cent["corners"]["tl"], [0.05, 0.04])
 
+        # 7. Flag Error with errorType="not_a_defect_artwork" -> resets first, then dismisses & logs
+        self.vg.flag_grading_error_and_reevaluate(
+            target_type="inventory",
+            sku=self.sku,
+            payload={"errorType": "reset_overrides", "resetOverrides": True},
+        )
+        art_res = self.vg.flag_grading_error_and_reevaluate(
+            target_type="inventory",
+            sku=self.sku,
+            payload={
+                "errorType": "not_a_defect_artwork",
+                "side": "Front",
+                "targetItemId": scratch["id"],
+                "notes": "Printed pinstripe",
+            },
+        )
+        self.assertTrue(art_res["success"])
+        self.assertEqual(float(art_res["card"]["Sub_Surface"]), 9.5)
+        self.assertIn(scratch["id"], art_res["diagnostics"]["overrides"]["dismissed_defect_ids"])
+
     def test_center_out_edge_detection_portrait_landscape_and_mini(self):
-        # Test portrait & landscape cards with a bright outer penny-sleeve rim (20px outside card_box)
+        # Test portrait & landscape cards with a bright outer penny-sleeve rim + verify non-collapsed outer/inner
         for w, h, label in [(800, 1120, "portrait"), (1120, 800, "landscape")]:
             img = Image.new("RGB", (w, h), (18, 22, 28))
             d = ImageDraw.Draw(img)
@@ -253,16 +273,22 @@ class TestGradingDeepDive(unittest.TestCase):
             self.assertLessEqual(box[2], w - 35, f"{label} right snapped to sleeve: {box}")
             self.assertGreaterEqual(box[1], 35, f"{label} top snapped to sleeve: {box}")
             self.assertLessEqual(box[3], h - 35, f"{label} bottom snapped to sleeve: {box}")
+            cent = self.vg._measure_side_centering(img, box)
+            oc, ic = cent["outer_card_rect"], cent["inner_frame_rect"]
+            self.assertGreater(ic[0] - oc[0], 0.015, f"{label} outer/inner collapsed on left: {oc} vs {ic}")
+            self.assertGreater((oc[0] + oc[2]) - (ic[0] + ic[2]), 0.015, f"{label} outer/inner collapsed on right: {oc} vs {ic}")
 
-        # Non-standard mini card (~0.55 aspect) must not be clipped to 2.5:3.5
-        mw, mh = 600, 1080
-        mini = Image.new("RGB", (mw, mh), (18, 22, 28))
-        dm = ImageDraw.Draw(mini)
-        dm.rectangle([60, 40, mw - 60, mh - 40], fill=(230, 230, 232))
-        dm.rectangle([90, 80, mw - 90, mh - 80], fill=(70, 110, 85))
-        mbox = self.vg.detect_physical_card_box(mini)
+        # Allen & Ginter Mini (~0.571) sitting off-center inside a larger cool-gray standard sleeve
+        sw, sh = 790, 1080
+        mini_in_sleeve = Image.new("RGB", (sw, sh), (180, 190, 204))
+        dm = ImageDraw.Draw(mini_in_sleeve)
+        # Off-center mini card on right side (width=440, height=770 -> ar=0.571)
+        dm.rectangle([280, 150, 720, 920], fill=(225, 226, 214))
+        dm.rectangle([315, 195, 685, 875], fill=(64, 105, 82))
+        mbox = self.vg.detect_physical_card_box(mini_in_sleeve)
         m_ar = (mbox[2] - mbox[0]) / max(1.0, float(mbox[3] - mbox[1]))
-        self.assertLess(m_ar, 0.62, f"Mini card aspect clipped to standard: {mbox} (ar={m_ar:.3f})")
+        self.assertGreaterEqual(mbox[0], 220, f"Mini snapped to empty left sleeve: {mbox}")
+        self.assertLess(m_ar, 0.63, f"Mini card aspect clipped to standard: {mbox} (ar={m_ar:.3f})")
 
 
 if __name__ == "__main__":

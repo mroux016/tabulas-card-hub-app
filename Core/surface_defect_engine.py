@@ -642,6 +642,15 @@ def _inspect_single_side(
 
         # A. Linear candidates (Scratches, Print Lines, Sleeve Scratches, Hairs/Fibers)
         if major >= 18.0 and aspect >= 3.2:
+            # Printed-artwork texture/stripe guard: skip dense halftone/text or wide chromatic printed stripes
+            nb_lap = lap_abs[max(iy1, rcy - 9):min(iy2, rcy + 10), max(ix1, rcx - 9):min(ix2, rcx + 10)]
+            edge_density = float(np.mean(nb_lap > 30.0)) if nb_lap.size else 0.0
+            cand_roi_mask = cand_bin[by:by + bh, bx:bx + bw] > 0
+            cand_sat_patch = hsv[iy1 + by:iy1 + by + bh, ix1 + bx:ix1 + bx + bw, 1]
+            cand_med_sat = float(np.median(cand_sat_patch[cand_roi_mask])) if np.any(cand_roi_mask) and cand_sat_patch.shape == cand_roi_mask.shape else 0.0
+            if edge_density > 0.42 or (cand_med_sat > 75.0 and minor >= 3.5):
+                continue
+
             arc_half = cv2.arcLength(cnt, True) * 0.5
             tortuosity = arc_half / max(1.0, major)
             fill_ratio = area / max(1.0, float(bw * bh))
@@ -765,7 +774,8 @@ def _inspect_single_side(
                 mx = int(ix1 + (pc[0] + nc[0]) * 0.5)
                 my = int(iy1 + (pc[1] + nc[1]) * 0.5)
                 ab_patch = lab[max(iy1, my - 12):min(iy2, my + 12), max(ix1, mx - 12):min(ix2, mx + 12), 1:3]
-                if ab_patch.size > 0 and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 14.0:
+                lap_patch = lap_abs[max(iy1, my - 10):min(iy2, my + 10), max(ix1, mx - 10):min(ix2, mx + 10)]
+                if ab_patch.size > 0 and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 10.5 and (lap_patch.size == 0 or float(np.median(lap_patch)) <= 26.0):
                     used_neg.add(j)
                     # Check if dent lies inside the outer 3.5% edge strip (outside corner tips) -> edge_dent
                     edge_band_x = max(8, int(cw * 0.035))

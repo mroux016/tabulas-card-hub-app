@@ -16,3 +16,6 @@ Core/downloaded_files/
 *.bak
 Thumbs.db
 .DS_Store
+
+# Real-card calibration scan fixtures
+tests/fixtures/real_cards/

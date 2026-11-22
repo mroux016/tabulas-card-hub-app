@@ -1132,6 +1132,33 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw_bytes)
             return
 
+        if route.startswith("/api/assets/logos/"):
+            fname = route[len("/api/assets/logos/"):].strip("/\\")
+            if not fname or ".." in fname or "/" in fname or "\\" in fname:
+                self._send_json({"success": False, "error": "Invalid logo filename."}, status=400)
+                return
+            logos_root = (Path(__file__).resolve().parent / "assets" / "logos").resolve()
+            logo_p = (logos_root / fname).resolve()
+            if not str(logo_p).startswith(str(logos_root)) or not logo_p.is_file():
+                self._send_json({"success": False, "error": "Logo not found."}, status=404)
+                return
+            ext = logo_p.suffix.lower()
+            ctype = {
+                ".png": "image/png",
+                ".svg": "image/svg+xml",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }.get(ext, "application/octet-stream")
+            raw_bytes = logo_p.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(raw_bytes)))
+            self.end_headers()
+            self.wfile.write(raw_bytes)
+            return
+
         if route == "/api/grading/crop":
             import io
             from PIL import Image
