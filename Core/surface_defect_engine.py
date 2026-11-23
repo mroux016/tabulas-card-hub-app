@@ -1066,7 +1066,7 @@ def _detect_edge_foil_peel_or_tear(
     side_label: str,
 ) -> list[tuple[dict, tuple[int, int, int, int]]]:
     """
-    Detects foil peeling / paper-core tears along the outer 0.5%-5.0% band of
+    Detects foil peeling / paper-core tears along the outer 0.3%-6.5% band of
     colored or foil card borders where bright neutral stock breaks into the border.
     """
     results: list[tuple[dict, tuple[int, int, int, int]]] = []
@@ -1074,9 +1074,9 @@ def _detect_edge_foil_peel_or_tear(
     cw = max(40, cx2 - cx1)
     ch = max(40, cy2 - cy1)
     c_span = max(16, int(min(cw, ch) * 0.06))
-    band_d = max(14, int(min(cw, ch) * 0.05))
-    out_skip = max(2, int(min(cw, ch) * 0.005))
-    min_area = max(180, int(cw * ch * 0.00012))
+    band_d = max(14, int(min(cw, ch) * 0.065))
+    out_skip = max(2, int(min(cw, ch) * 0.003))
+    min_area = max(200, int(cw * ch * 0.00010))
     touch_tol = max(6, int(min(cw, ch) * 0.012))
     excl = glare_mask | streak_mask
 
@@ -1100,21 +1100,22 @@ def _detect_edge_foil_peel_or_tear(
         border_chroma = float(np.hypot(med_a - 128.0, med_b - 128.0))
 
         # Only run on colored/foil/non-white borders
-        if med_l >= 215.0 or (med_s < 28.0 and border_chroma < 10.0 and med_l >= 165.0):
+        if med_l >= 215.0 or (med_s < 20.0 and border_chroma < 8.0 and med_l >= 135.0) or (med_s < 28.0 and border_chroma < 10.0 and med_l >= 165.0):
             continue
 
         lab_dist = np.linalg.norm(e_lab - med_lab[None, None, :], axis=2)
         e_l = e_lab[:, :, 0]
         tear_m = (
-            ((e_l > 210.0) & (e_s < 28) & (lab_dist >= 32.0))
-            | ((e_l > 195.0) & (e_s < 32) & (lab_dist >= 38.0))
+            (e_l > 192.0)
+            & (e_s < 35)
+            & (((e_l - med_l) >= 32.0) | (lab_dist >= 34.0))
         ) & (~e_gl)
         tear_u8 = tear_m.astype(np.uint8)
         tear_frac = float(np.count_nonzero(tear_u8)) / float(max(1, tear_u8.size))
         if tear_frac <= 0.0 or tear_frac >= 0.25:
             continue
 
-        n_t, _, st_t, cen_t = cv2.connectedComponentsWithStats(tear_u8, connectivity=8)
+        n_t, lbl_t, st_t, cen_t = cv2.connectedComponentsWithStats(tear_u8, connectivity=8)
         sig_idx = [i_t for i_t in range(1, n_t) if int(st_t[i_t, cv2.CC_STAT_AREA]) >= min_area]
         if len(sig_idx) >= 8:
             continue
@@ -1136,22 +1137,27 @@ def _detect_edge_foil_peel_or_tear(
             )
             if not touches_outer or min(bw_t, bh_t) < 5:
                 continue
-            # Reject border-crossing sleeve scratches that continue into the outer margin
+            comp_m = (lbl_t == i_t)
+            if float(np.median(e_l[comp_m])) < 218.0 or float(np.median(e_s[comp_m])) > 16.0:
+                continue
+            # Reject narrow border-crossing sleeve scratches that continue beyond the drop-shadow bevel
             ccx = int(ex1 + cen_t[i_t][0])
             ccy = int(ey1 + cen_t[i_t][1])
+            span_along = bw_t if e_name in ("Top edge", "Bottom edge") else bh_t
             crosses_out = False
-            if e_name == "Left edge" and margin_avail.get("left"):
-                ext = surf_resp[max(0, ccy - 4):min(surf_resp.shape[0], ccy + 5), max(0, cx1 - 16):max(0, cx1 - 2)]
-                crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
-            elif e_name == "Right edge" and margin_avail.get("right"):
-                ext = surf_resp[max(0, ccy - 4):min(surf_resp.shape[0], ccy + 5), min(surf_resp.shape[1], cx2 + 2):min(surf_resp.shape[1], cx2 + 16)]
-                crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
-            elif e_name == "Top edge" and margin_avail.get("top"):
-                ext = surf_resp[max(0, cy1 - 16):max(0, cy1 - 2), max(0, ccx - 4):min(surf_resp.shape[1], ccx + 5)]
-                crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
-            elif e_name == "Bottom edge" and margin_avail.get("bottom"):
-                ext = surf_resp[min(surf_resp.shape[0], cy2 + 2):min(surf_resp.shape[0], cy2 + 16), max(0, ccx - 4):min(surf_resp.shape[1], ccx + 5)]
-                crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
+            if span_along <= 20:
+                if e_name == "Left edge" and margin_avail.get("left"):
+                    ext = surf_resp[max(0, ccy - 4):min(surf_resp.shape[0], ccy + 5), max(0, cx1 - 20):max(0, cx1 - 6)]
+                    crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
+                elif e_name == "Right edge" and margin_avail.get("right"):
+                    ext = surf_resp[max(0, ccy - 4):min(surf_resp.shape[0], ccy + 5), min(surf_resp.shape[1], cx2 + 6):min(surf_resp.shape[1], cx2 + 20)]
+                    crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
+                elif e_name == "Top edge" and margin_avail.get("top"):
+                    ext = surf_resp[max(0, cy1 - 20):max(0, cy1 - 6), max(0, ccx - 4):min(surf_resp.shape[1], ccx + 5)]
+                    crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
+                elif e_name == "Bottom edge" and margin_avail.get("bottom"):
+                    ext = surf_resp[min(surf_resp.shape[0], cy2 + 6):min(surf_resp.shape[0], cy2 + 20), max(0, ccx - 4):min(surf_resp.shape[1], ccx + 5)]
+                    crosses_out = ext.size > 0 and int(np.count_nonzero(ext > 14)) >= 4
             if crosses_out:
                 continue
             if a_t > best_a:
@@ -1189,7 +1195,7 @@ def _detect_ink_spots(
     cx1, cy1, cx2, cy2 = local_box
     cw = max(40, cx2 - cx1)
     ch = max(40, cy2 - cy1)
-    pad = 4
+    pad = max(8, int(min(cw, ch) * 0.015))
     ix1, iy1 = cx1 + pad, cy1 + pad
     ix2, iy2 = max(ix1 + 16, cx2 - pad), max(iy1 + 16, cy2 - pad)
 
@@ -1199,7 +1205,7 @@ def _detect_ink_spots(
         lab[iy1:iy2, ix1:ix2, 2].astype(np.float32) - 128.0,
     )
     sub_excl = glare_mask[iy1:iy2, ix1:ix2] | streak_mask[iy1:iy2, ix1:ix2]
-    dark_bin = ((sub_l < 24.0) & (ab_chroma < 22.0) & (~sub_excl)).astype(np.uint8)
+    dark_bin = ((sub_l < 48.0) & (ab_chroma < 22.0) & (~sub_excl)).astype(np.uint8)
 
     cnts, _ = cv2.findContours(dark_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cands: list[tuple[float, float, int, int, int, int, float]] = []
@@ -1209,6 +1215,8 @@ def _detect_ink_spots(
         if not (25.0 <= area <= 1400.0):
             continue
         bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bx <= 2 or by <= 2 or (bx + bw) >= (sw_i - 2) or (by + bh) >= (sh_i - 2):
+            continue
         aspect = max(bw, bh) / float(max(1, min(bw, bh)))
         if aspect > 2.8:
             continue
@@ -1220,22 +1228,26 @@ def _detect_ink_spots(
         if solidity < 0.72 or circularity < 0.45:
             continue
 
-        # Local annular ring check
-        px1, py1 = max(0, bx - 8), max(0, by - 8)
-        px2, py2 = min(sw_i, bx + bw + 8), min(sh_i, by + bh + 8)
+        # Local annular ring check (3-8 px outside blob to avoid anti-aliased ink feathering)
+        px1, py1 = max(0, bx - 12), max(0, by - 12)
+        px2, py2 = min(sw_i, bx + bw + 12), min(sh_i, by + bh + 12)
         mask_p = np.zeros((py2 - py1, px2 - px1), dtype=np.uint8)
         cv2.drawContours(mask_p, [cnt - np.array([px1, py1])], -1, 255, -1)
-        dil_in = cv2.dilate(mask_p, np.ones((3, 3), dtype=np.uint8), iterations=1)
-        dil_out = cv2.dilate(mask_p, np.ones((11, 11), dtype=np.uint8), iterations=1)
+        dil_in = cv2.dilate(mask_p, np.ones((7, 7), dtype=np.uint8), iterations=1)
+        dil_out = cv2.dilate(mask_p, np.ones((17, 17), dtype=np.uint8), iterations=1)
         ring_m = (dil_out > 0) & (dil_in == 0)
         blob_m = mask_p > 0
         if np.count_nonzero(ring_m) < 16 or np.count_nonzero(blob_m) < 12:
             continue
         patch_l = sub_l[py1:py2, px1:px2]
         blob_l_med = float(np.median(patch_l[blob_m]))
-        ring_l_med = float(np.median(patch_l[ring_m]))
-        ring_l_std = float(np.std(patch_l[ring_m]))
-        if (ring_l_med - blob_l_med) < 60.0 or ring_l_std > 14.0:
+        if blob_l_med >= 48.0 or float(np.mean(patch_l[blob_m] < 55.0)) < 0.70:
+            continue
+        ring_vals = patch_l[ring_m]
+        ring_l_med = float(np.median(ring_vals))
+        ring_l_std = float(np.std(ring_vals))
+        ring_l_iqr = float(np.percentile(ring_vals, 75) - np.percentile(ring_vals, 25))
+        if (ring_l_med - blob_l_med) < 55.0 or ring_l_std > 16.0 or ring_l_iqr > 18.0:
             continue
 
         cands.append((bx + bw * 0.5, by + bh * 0.5, bx, by, bw, bh, area))
@@ -1277,8 +1289,9 @@ def _detect_margin_ink_bleed(
     side_label: str,
 ) -> list[tuple[dict, tuple[int, int, int, int]]]:
     """
-    On neutral white margins (border_l_med >= 210, |a*| < 4, |b*| < 4.5), detects localized
-    smooth chromatic stain/ink bleed patches (|a*| or |b*| shift >= 6.5 over >= 150 px^2).
+    On neutral white margins (border_l_med >= 210, |a*| < 4.5, |b*| < 7.5), detects localized
+    smooth chromatic stain/ink bleed patches (dev >= 8.0 over < 25% of margin length),
+    rejecting warm parchment cardstock and painted inner-frame/ribbon shadows.
     """
     results: list[tuple[dict, tuple[int, int, int, int]]] = []
     if border_l_med < 210.0:
@@ -1288,7 +1301,7 @@ def _detect_margin_ink_bleed(
     cw = max(40, cx2 - cx1)
     ch = max(40, cy2 - cy1)
     b_in = max(10, int(min(cw, ch) * 0.032))
-    b_out = max(4, int(min(cw, ch) * 0.01))
+    b_out = max(3, int(min(cw, ch) * 0.005))
     c_span = max(16, int(min(cw, ch) * 0.06))
 
     # Sample neutral border baseline a*, b*
@@ -1307,7 +1320,7 @@ def _detect_margin_ink_bleed(
     ]).astype(np.float32) - 128.0
     med_a = float(np.median(b_a)) if b_a.size else 0.0
     med_b = float(np.median(b_b)) if b_b.size else 0.0
-    if abs(med_a) >= 4.0 or abs(med_b) >= 4.5:
+    if abs(med_a) >= 4.5 or abs(med_b) >= 7.5:
         return results
 
     excl = glare_mask | streak_mask
@@ -1318,34 +1331,84 @@ def _detect_margin_ink_bleed(
         ("Right margin", (cx2 - b_in, cy1 + c_span, cx2 - b_out, cy2 - c_span)),
     ]
 
+    h_roi, w_roi = lab.shape[:2]
     for z_name, (sx1, sy1, sx2, sy2) in strips:
         if sx2 <= sx1 + 10 or sy2 <= sy1 + 10:
             continue
         p_l = lab[sy1:sy2, sx1:sx2, 0].astype(np.float32)
-        if float(np.median(p_l)) < 210.0:
+        if float(np.median(p_l)) < 230.0:
             continue
-        p_a = cv2.GaussianBlur(lab[sy1:sy2, sx1:sx2, 1].astype(np.float32) - 128.0, (9, 9), 0)
-        p_b = cv2.GaussianBlur(lab[sy1:sy2, sx1:sx2, 2].astype(np.float32) - 128.0, (9, 9), 0)
+        p_a = cv2.GaussianBlur(lab[sy1:sy2, sx1:sx2, 1].astype(np.float32) - 128.0, (5, 5), 0)
+        p_b = cv2.GaussianBlur(lab[sy1:sy2, sx1:sx2, 2].astype(np.float32) - 128.0, (5, 5), 0)
         p_lap = cv2.GaussianBlur(lap_abs[sy1:sy2, sx1:sx2].astype(np.float32), (9, 9), 0)
         p_ex = excl[sy1:sy2, sx1:sx2]
 
         paper_ok = (p_l >= 185.0) & (p_lap < 55.0) & (~p_ex)
         if np.count_nonzero(paper_ok) < 150 or float(np.std(p_l[paper_ok])) >= 14.0:
             continue
-        stain_m = (paper_ok & ((np.abs(p_a - med_a) >= 6.5) | (np.abs(p_b - med_b) >= 6.5))).astype(np.uint8)
-        paper_cnt = max(1, int(np.count_nonzero(paper_ok)))
-        if float(np.count_nonzero(stain_m)) / float(paper_cnt) >= 0.35:
+        strip_a = float(np.median(p_a[paper_ok]))
+        strip_b = float(np.median(p_b[paper_ok]))
+        if abs(strip_a) >= 4.5 or abs(strip_b) >= 7.5:
             continue
 
-        n_st, _, st_st, _ = cv2.connectedComponentsWithStats(stain_m, connectivity=8)
+        dev = np.maximum(np.abs(p_a - strip_a), np.abs(p_b - strip_b))
+        stain_m = (paper_ok & (dev >= 6.0)).astype(np.uint8)
+        paper_cnt = max(1, int(np.count_nonzero(paper_ok)))
+        if float(np.count_nonzero(stain_m)) / float(paper_cnt) >= 0.25:
+            continue
+
+        sh_m, sw_m = stain_m.shape
+        n_st, lbl_st, st_st, _ = cv2.connectedComponentsWithStats(stain_m, connectivity=8)
         for i_s in range(1, n_st):
             a_s = int(st_st[i_s, cv2.CC_STAT_AREA])
-            if a_s < 150:
+            if a_s < 90:
                 continue
             bx_s = int(st_st[i_s, cv2.CC_STAT_LEFT])
             by_s = int(st_st[i_s, cv2.CC_STAT_TOP])
             bw_s = int(st_st[i_s, cv2.CC_STAT_WIDTH])
             bh_s = int(st_st[i_s, cv2.CC_STAT_HEIGHT])
+            if z_name in ("Top margin", "Bottom margin") and bw_s >= 0.25 * sw_m:
+                continue
+            if z_name in ("Left margin", "Right margin") and bh_s >= 0.25 * sh_m:
+                continue
+
+            comp_dev = dev[lbl_st == i_s]
+            if float(np.max(comp_dev)) < 8.0 or int(np.count_nonzero(comp_dev >= 8.0)) < 25:
+                continue
+
+            # Outer-margin-only guard: if component touches inner boundary AND inner adjacent band
+            # has dark/high-edge printed frame/ribbon artwork, reject as painted frame shadow.
+            touches_inner = (
+                (z_name == "Top margin" and (by_s + bh_s) >= sh_m - 2)
+                or (z_name == "Bottom margin" and by_s <= 2)
+                or (z_name == "Left margin" and (bx_s + bw_s) >= sw_m - 2)
+                or (z_name == "Right margin" and bx_s <= 2)
+            )
+            reaches_outer_half = (
+                (z_name == "Top margin" and by_s < sh_m * 0.5)
+                or (z_name == "Bottom margin" and (by_s + bh_s) > sh_m * 0.5)
+                or (z_name == "Left margin" and bx_s < sw_m * 0.5)
+                or (z_name == "Right margin" and (bx_s + bw_s) > sw_m * 0.5)
+            )
+            if touches_inner and not reaches_outer_half:
+                if z_name == "Top margin":
+                    iy_a, iy_b = sy2, min(h_roi, sy2 + 4)
+                    ix_a, ix_b = sx1 + bx_s, sx1 + bx_s + bw_s
+                elif z_name == "Bottom margin":
+                    iy_a, iy_b = max(0, sy1 - 4), sy1
+                    ix_a, ix_b = sx1 + bx_s, sx1 + bx_s + bw_s
+                elif z_name == "Left margin":
+                    iy_a, iy_b = sy1 + by_s, sy1 + by_s + bh_s
+                    ix_a, ix_b = sx2, min(w_roi, sx2 + 4)
+                else:
+                    iy_a, iy_b = sy1 + by_s, sy1 + by_s + bh_s
+                    ix_a, ix_b = max(0, sx1 - 4), sx1
+                if iy_b > iy_a and ix_b > ix_a:
+                    adj_l = lab[iy_a:iy_b, ix_a:ix_b, 0]
+                    adj_lap = lap_abs[iy_a:iy_b, ix_a:ix_b]
+                    if float(np.median(adj_l)) < 195.0 or float(np.mean(adj_lap > 35.0)) > 0.20:
+                        continue
+
             results.append(({
                 "type": "surface_stain",
                 "is_true_defect": True,
@@ -1489,6 +1552,26 @@ def _inspect_single_side(
     cand_bin = (int_resp > thr_linear).astype(np.uint8)
     cnts, _ = cv2.findContours(cand_bin, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Pre-collect elongated linear strokes for parallel-family / periodic-line suppression
+    # (jersey pinstripes, stacked book-page borders, hatched artwork)
+    cand_bin_wide = (int_resp > max(18, int(thr_linear * 0.72))).astype(np.uint8)
+    cnts_wide, _ = cv2.findContours(cand_bin_wide, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    linear_strokes: list[tuple[float, float, float, float, float]] = []
+    for cnt_w in cnts_wide:
+        if len(cnt_w) < 4:
+            continue
+        rw_w, rh_w = cv2.minAreaRect(cnt_w)[1]
+        maj_w = max(float(rw_w), float(rh_w))
+        min_w = max(1.0, min(float(rw_w), float(rh_w)))
+        if maj_w >= 12.0 and (maj_w / min_w) >= 2.5:
+            vx_w, vy_w, _, _ = cv2.fitLine(cnt_w.reshape(-1, 2).astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+            th_w = float(np.degrees(np.arctan2(vy_w, vx_w))) % 180.0
+            bx_w, by_w, bw_w, bh_w = cv2.boundingRect(cnt_w)
+            rmask_w = cand_bin_wide[by_w:by_w + bh_w, bx_w:bx_w + bw_w] > 0
+            rpatch_w = int_resp[by_w:by_w + bh_w, bx_w:bx_w + bw_w]
+            resp_w = float(np.median(rpatch_w[rmask_w])) if np.any(rmask_w) and rpatch_w.shape == rmask_w.shape else 0.0
+            linear_strokes.append((bx_w + bw_w * 0.5, by_w + bh_w * 0.5, th_w, maj_w, resp_w))
+
     for cnt in cnts:
         area = float(cv2.contourArea(cnt))
         bx, by, bw, bh = cv2.boundingRect(cnt)
@@ -1559,6 +1642,38 @@ def _inspect_single_side(
                     "severity": 0.0,
                 }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
                 continue
+
+            # Parallel-family / periodic-line guard: suppress jersey pinstripes, stacked
+            # book-page borders, and hatched artwork (>= 2 parallel neighbors within +-45 px)
+            if len(cnt) >= 4 and len(linear_strokes) >= 3:
+                vx_c, vy_c, _, _ = cv2.fitLine(cnt.reshape(-1, 2).astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+                norm_c = float(np.hypot(vx_c, vy_c))
+                if norm_c > 1e-6:
+                    vx_c /= norm_c
+                    vy_c /= norm_c
+                    nx_c, ny_c = -vy_c, vx_c
+                    theta_c = float(np.degrees(np.arctan2(vy_c, vx_c))) % 180.0
+                    cx_loc, cy_loc = bx + bw * 0.5, by + bh * 0.5
+                    cand_med_resp = float(np.median(cand_resp_patch[cand_roi_mask])) if np.any(cand_roi_mask) and cand_resp_patch.shape == cand_roi_mask.shape else 0.0
+                    par_nbrs = 0
+                    for cx_o, cy_o, th_o, maj_o, resp_o in linear_strokes:
+                        d_ang = abs(theta_c - th_o)
+                        d_ang = min(d_ang, 180.0 - d_ang)
+                        if d_ang > 12.0:
+                            continue
+                        dx_o, dy_o = cx_o - cx_loc, cy_o - cy_loc
+                        d_perp = abs(dx_o * nx_c + dy_o * ny_c)
+                        if not (3.0 <= d_perp <= 45.0):
+                            continue
+                        d_par = abs(dx_o * vx_c + dy_o * vy_c)
+                        if d_par > max(major, maj_o) * 0.75 + 25.0:
+                            continue
+                        if min(cand_med_resp, resp_o) / max(1.0, max(cand_med_resp, resp_o)) >= 0.28:
+                            par_nbrs += 1
+                            if par_nbrs >= 2:
+                                break
+                    if par_nbrs >= 2:
+                        continue
 
             # Check axis alignment for factory print lines (horizontal or vertical)
             ang = abs(float(rect[2])) % 90.0
@@ -1664,7 +1779,7 @@ def _inspect_single_side(
                 if (
                     ab_patch.size > 0
                     and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 7.5
-                    and (lap_patch.size == 0 or float(np.median(lap_patch)) <= 22.0)
+                    and (lap_patch.size == 0 or (float(np.median(lap_patch)) <= 22.0 and float(np.percentile(lap_patch, 85)) <= 45.0))
                 ):
                     used_neg.add(j)
                     # Check if dent lies inside the outer 3.5% edge strip (outside corner tips) -> edge_dent

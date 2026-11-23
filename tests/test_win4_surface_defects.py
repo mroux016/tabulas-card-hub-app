@@ -397,6 +397,24 @@ def test_white_margin_pink_bleed():
     assert len(stains) >= 1, res["confirmed_defects"]
 
 
+def test_parallel_pinstripes_suppressed_isolated_scratch_kept():
+    # 1. Six parallel slightly-angled pinstripes spaced 18 px apart -> suppressed (0 scratches/print lines)
+    f_im, f_box = _make_clean_card_in_sleeve()
+    arr = np.array(f_im)
+    for k in range(6):
+        px = 210 + k * 18
+        cv2.line(arr, (px, 260), (px + 10, 460), (235, 235, 235), 2)
+    res_pin = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    lin_pin = [d for d in res_pin["confirmed_defects"] if d["type"] in ("surface_scratch", "print_line")]
+    assert len(lin_pin) == 0, f"Parallel pinstripes should be suppressed, got: {lin_pin}"
+
+    # 2. Add an isolated single diagonal scratch in a clear region -> still caught
+    cv2.line(arr, (460, 620), (590, 740), (245, 245, 245), 2)
+    res_mix = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    scratches = [d for d in res_mix["confirmed_defects"] if d["type"] == "surface_scratch"]
+    assert len(scratches) >= 1, f"Isolated scratch should still be caught, got: {res_mix['confirmed_defects']}"
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")
