@@ -529,7 +529,13 @@ def load_inventory_df() -> pd.DataFrame:
     ensure_directories()
     if not INVENTORY_FILE.exists():
         empty_df = pd.DataFrame(columns=INVENTORY_COLUMNS)
-        empty_df.to_csv(INVENTORY_FILE, index=False, encoding="utf-8-sig")
+        inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+        with interprocess_file_lock(inv_lock):
+            if not INVENTORY_FILE.exists():
+                atomic_write_bytes(
+                    INVENTORY_FILE,
+                    lambda tmp_p: empty_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+                )
         return empty_df
 
     try:
@@ -603,6 +609,85 @@ def save_inventory_df(df: pd.DataFrame) -> pd.DataFrame:
             lambda tmp_p: out.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
         )
     return out
+
+
+def update_inventory_df_atomic(
+    mutator_fn: Callable[[pd.DataFrame], pd.DataFrame],
+    timeout: float = 30.0,
+) -> pd.DataFrame:
+    """
+    Executes a read-modify-write on Inventory.csv under an interprocess file lock so concurrent
+    HTTP requests and background workers never overwrite each other's commits or edits.
+    """
+    ensure_directories()
+    inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+    with interprocess_file_lock(inv_lock, timeout=timeout):
+        current_df = load_inventory_df()
+        updated_df = mutator_fn(current_df.copy())
+        return save_inventory_df(current_df if updated_df is None else updated_df)
+
+
+def merge_inventory_updates_by_sku(
+    updated_rows_df: pd.DataFrame,
+    baseline_df: Optional[pd.DataFrame] = None,
+    columns_to_merge: Optional[list[str]] = None,
+    timeout: float = 30.0,
+) -> pd.DataFrame:
+    """
+    Re-reads Inventory.csv under lock and merges only mutated cells/columns keyed by SKU.
+    When `baseline_df` is provided, only cells whose values changed relative to `baseline_df`
+    are applied onto the fresh DataFrame, preserving concurrent edits and newly committed SKUs.
+    """
+    if updated_rows_df is None or updated_rows_df.empty or "SKU" not in updated_rows_df.columns:
+        return load_inventory_df()
+
+    upd = updated_rows_df.copy()
+    upd["SKU"] = upd["SKU"].astype(str).str.strip()
+    upd = upd[upd["SKU"] != ""]
+    if upd.empty:
+        return load_inventory_df()
+
+    base_lookup: dict[str, dict] = {}
+    if baseline_df is not None and not baseline_df.empty and "SKU" in baseline_df.columns:
+        for _, b_row in baseline_df.iterrows():
+            b_sku = str(b_row.get("SKU") or "").strip()
+            if b_sku:
+                base_lookup[b_sku] = b_row.to_dict()
+
+    allowed_cols = (
+        [c for c in columns_to_merge if c != "SKU" and c in upd.columns]
+        if columns_to_merge is not None
+        else [c for c in upd.columns if c != "SKU"]
+    )
+
+    def _apply_merge(fresh_df: pd.DataFrame) -> pd.DataFrame:
+        if fresh_df.empty or "SKU" not in fresh_df.columns or not allowed_cols:
+            return fresh_df
+        fresh_df = fresh_df.copy()
+        fresh_df["SKU"] = fresh_df["SKU"].astype(str).str.strip()
+        sku_to_idx: dict[str, int] = {}
+        for f_idx, f_sku in zip(fresh_df.index, fresh_df["SKU"]):
+            if f_sku:
+                sku_to_idx[f_sku] = f_idx
+
+        for _, u_row in upd.iterrows():
+            u_sku = str(u_row.get("SKU") or "").strip()
+            target_idx = sku_to_idx.get(u_sku)
+            if target_idx is None:
+                continue
+            b_rec = base_lookup.get(u_sku)
+            for col in allowed_cols:
+                new_val = u_row.get(col)
+                if b_rec is not None:
+                    old_val = b_rec.get(col, "")
+                    if str(new_val) == str(old_val):
+                        continue
+                if col not in fresh_df.columns:
+                    fresh_df[col] = ""
+                fresh_df.at[target_idx, col] = new_val
+        return fresh_df
+
+    return update_inventory_df_atomic(_apply_merge, timeout=timeout)
 
 
 def get_next_sku_int() -> int:
@@ -1306,7 +1391,11 @@ def apply_manifest_overrides_and_rename(
     else:
         df["Manual_Override"] = ""
 
-    df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    with interprocess_file_lock(manifest_path.with_suffix(".csv.lock")):
+        atomic_write_bytes(
+            manifest_path,
+            lambda tmp_p: df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+        )
     return df, override_applied_count, renamed_count
 
 
@@ -1421,7 +1510,12 @@ def commit_batch_to_inventory(
         inv_df = new_rows_df if inv_df.empty else pd.concat([inv_df, new_rows_df], ignore_index=True)
 
     save_inventory_df(inv_df)
-    df.to_csv(batch_dir / "Batch_Inventory_Manifest.csv", index=False, encoding="utf-8-sig")
+    man_p = batch_dir / "Batch_Inventory_Manifest.csv"
+    with interprocess_file_lock(man_p.with_suffix(".csv.lock")):
+        atomic_write_bytes(
+            man_p,
+            lambda tmp_p: df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+        )
 
     if recalculate_sales_strategy:
         try:

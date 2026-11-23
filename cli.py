@@ -55,6 +55,7 @@ from Core.config import (
     ensure_directories,
     get_daily_log_dir,
     inspect_all_module_versions,
+    interprocess_file_lock,
     sanitize_filename_part,
 )
 from Core.rate_learner import get_rate_learner
@@ -64,6 +65,7 @@ from Core.database import (
     find_unarchived_scan_batches,
     load_inventory_df,
     load_master_checklist,
+    merge_inventory_updates_by_sku,
     save_inventory_df,
 )
 from Core.market_engine import (
@@ -296,22 +298,37 @@ def base_lane_from_slot(lane_or_slot: str) -> str:
 def _is_slot_currently_busy(slot_key: str) -> tuple[bool, dict]:
     """
     Checks whether `slot_key` is busy by trusting `get_active_job_state()` (which already
-    enforces Win32 PID liveness + startup grace + 18s heartbeat grace) AND checking any pending queue.
+    enforces Win32 PID liveness + startup grace + 18s heartbeat grace) or a live tracked PID.
+    Does not treat an orphaned queue file on a stopped/dead slot as permanently busy.
     """
     st = get_active_job_state(lane=slot_key)
     if st.get("status") == "RUNNING":
         return True, st
-    if len(load_lane_job_queue(slot_key)) > 0:
+    pid = int(st.get("pid", 0) or 0)
+    if pid > 0 and _is_pid_running(pid):
         return True, st
     return False, st
 
 
-def _find_running_heavy_tcdb_slot() -> tuple[Optional[str], int]:
-    """Returns `(slot_key, pid)` if any worker slot is currently running a TCDB rate-limited scraper."""
+def _find_running_heavy_tcdb_slot(exclude_slot: Optional[str] = None) -> tuple[Optional[str], int]:
+    """
+    Returns `(slot_key, pid)` if any worker slot is currently running OR has queued
+    a TCDB rate-limited scraper.
+    """
+    excl = base_lane_from_slot(exclude_slot) if exclude_slot else None
     for sk in PROCESS_LANES.keys():
+        if excl and sk == excl:
+            continue
         st = get_active_job_state(lane=sk)
         if st.get("status") == "RUNNING":
             if _is_tcdb_rate_limited_job(st.get("job_type", ""), title=st.get("title", "")):
+                return sk, int(st.get("pid", 0))
+        for q_item in load_lane_job_queue(sk):
+            if isinstance(q_item, dict) and _is_tcdb_rate_limited_job(
+                q_item.get("job_type", ""),
+                payload=q_item.get("payload"),
+                title=q_item.get("title", ""),
+            ):
                 return sk, int(st.get("pid", 0))
     return None, 0
 
@@ -354,6 +371,10 @@ def get_lane_queue_file(lane: str) -> Path:
     return LOGS_DIR / f"job_queue_{base}.json"
 
 
+def _get_lane_queue_lock(lane: str) -> Path:
+    return get_lane_queue_file(lane).with_suffix(".json.lock")
+
+
 def load_lane_job_queue(lane: str) -> list[dict]:
     ensure_directories()
     q_file = get_lane_queue_file(lane)
@@ -368,35 +389,57 @@ def load_lane_job_queue(lane: str) -> list[dict]:
 
 def save_lane_job_queue(lane: str, queue_list: list[dict]) -> list[dict]:
     ensure_directories()
-    get_lane_queue_file(lane).write_text(json.dumps(queue_list, indent=2), encoding="utf-8")
+    base_lane = base_lane_from_slot(lane)
+    with interprocess_file_lock(_get_lane_queue_lock(base_lane)):
+        atomic_write_text(
+            get_lane_queue_file(base_lane),
+            json.dumps(queue_list, indent=2),
+            encoding="utf-8",
+        )
     return queue_list
 
 
 def enqueue_job_for_lane(job_type: str, title: str, payload: dict, lane: Optional[str] = None) -> dict:
     base_lane = base_lane_from_slot(resolve_job_lane(job_type, lane))
-    curr_q = load_lane_job_queue(base_lane)
-    q_item = {
-        "queue_id": f"Q-{int(time.time() * 1000)}-{len(curr_q) + 1}",
-        "lane": base_lane,
-        "job_type": job_type,
-        "title": title,
-        "payload": payload,
-        "queued_at": datetime.now().strftime("%H:%M:%S"),
-    }
-    curr_q.append(q_item)
-    save_lane_job_queue(base_lane, curr_q)
-    append_job_log(f"[QUEUED #{len(curr_q)}] '{title}' added to {PROCESS_LANES[base_lane]['short_name']} queue.", lane=base_lane)
+    with interprocess_file_lock(_get_lane_queue_lock(base_lane)):
+        curr_q = load_lane_job_queue(base_lane)
+        q_item = {
+            "queue_id": f"Q-{int(time.time() * 1000)}-{len(curr_q) + 1}",
+            "lane": base_lane,
+            "job_type": job_type,
+            "title": title,
+            "payload": payload,
+            "queued_at": datetime.now().strftime("%H:%M:%S"),
+        }
+        curr_q.append(q_item)
+        save_lane_job_queue(base_lane, curr_q)
+        q_len = len(curr_q)
+    append_job_log(f"[QUEUED #{q_len}] '{title}' added to {PROCESS_LANES[base_lane]['short_name']} queue.", lane=base_lane)
     return q_item
 
 
 def remove_queued_job(lane: str, queue_id: str) -> list[dict]:
     base_lane = base_lane_from_slot(lane)
-    curr_q = load_lane_job_queue(base_lane)
-    return save_lane_job_queue(base_lane, [item for item in curr_q if str(item.get("queue_id")) != str(queue_id)])
+    with interprocess_file_lock(_get_lane_queue_lock(base_lane)):
+        curr_q = load_lane_job_queue(base_lane)
+        return save_lane_job_queue(base_lane, [item for item in curr_q if str(item.get("queue_id")) != str(queue_id)])
 
 
 def clear_lane_job_queue(lane: str):
-    save_lane_job_queue(base_lane_from_slot(lane), [])
+    base_lane = base_lane_from_slot(lane)
+    with interprocess_file_lock(_get_lane_queue_lock(base_lane)):
+        save_lane_job_queue(base_lane, [])
+
+
+def pop_next_queued_job(lane: str) -> Optional[dict]:
+    base_lane = base_lane_from_slot(lane)
+    with interprocess_file_lock(_get_lane_queue_lock(base_lane)):
+        pending_q = load_lane_job_queue(base_lane)
+        if not pending_q:
+            return None
+        next_item = pending_q.pop(0)
+        save_lane_job_queue(base_lane, pending_q)
+        return next_item
 
 
 def _default_idle_state(lane: str) -> dict:
@@ -491,6 +534,7 @@ def stop_active_job(lane: Optional[str] = None) -> bool:
         except Exception:
             pass
     write_job_state("STOPPED", state.get("job_type", "none"), state.get("title", "Stopped"), current=0, total=1, current_item="Stopped by user.", pid=0, lane=target_lane)
+    clear_lane_job_queue(base_lane_from_slot(target_lane))
     append_job_log("🛑 Job stopped by user.", lane=target_lane)
     return True
 
@@ -542,12 +586,13 @@ def start_or_queue_background_job(
     ensure_directories()
     task_log_file = get_task_log_file(job_type)
 
-    with _SLOT_DISPATCH_LOCK:
+    with _SLOT_DISPATCH_LOCK, interprocess_file_lock(LOGS_DIR / "slot_dispatch.lock"):
         # 1. ONLY TCDB web scrapers serialize behind each other (to respect TCDB's ~25 req/min rate limit).
         #    Every other process (non-TCDB scrapers, reprocessing, scan ingestion, pre-grading, local tools)
         #    bypasses this gate and immediately claims the first available idle parallel worker!
-        if _is_tcdb_rate_limited_job(job_type, payload=payload, title=title) and not is_queued_continuation:
-            heavy_slot, heavy_pid = _find_running_heavy_tcdb_slot()
+        if _is_tcdb_rate_limited_job(job_type, payload=payload, title=title):
+            exclude_sk = base_lane_from_slot(lane) if (is_queued_continuation and lane) else None
+            heavy_slot, heavy_pid = _find_running_heavy_tcdb_slot(exclude_slot=exclude_sk)
             if heavy_slot is not None:
                 enqueue_job_for_lane(job_type, title, payload, lane=heavy_slot)
                 q_len = len(load_lane_job_queue(heavy_slot))
@@ -1868,6 +1913,7 @@ def run_background_job_from_file(payload_path: Path):
             )
         elif job_type == "refresh_market_valuations":
             inv_df = load_inventory_df()
+            orig_inv_df = inv_df.copy()
             _worker_log_cb(
                 f"💰 Starting Market Valuation & Grading Tiers Refresh across {len(inv_df):,} inventory SKU(s) "
                 f"(live_comps={bool(payload.get('fetch_live_web_comps', True))}, tiers={bool(payload.get('refresh_grading_tiers', True))})..."
@@ -1878,7 +1924,7 @@ def run_background_job_from_file(payload_path: Path):
                 refresh_grading_tiers=bool(payload.get("refresh_grading_tiers", True)),
                 progress_callback=lambda c_i, t_i, msg: _worker_log_cb(f"[{c_i}/{t_i}] {msg}"),
             )
-            save_inventory_df(updated_inv)
+            updated_inv = merge_inventory_updates_by_sku(updated_inv, baseline_df=orig_inv_df)
             _worker_log_cb(
                 f"✅ Saved updated valuations for {len(updated_inv):,} cards | "
                 f"Raw=${val_summary.get('Total_Raw_Value', 0):,.2f} | Optimal EV=${val_summary.get('Total_Optimal_EV', 0):,.2f} | "
@@ -1963,20 +2009,36 @@ def run_background_job_from_file(payload_path: Path):
         el_m, el_sec = divmod(int(total_el_s), 60)
         el_h, el_m = divmod(el_m, 60)
         el_fmt = f"{el_h}:{el_m:02d}:{el_sec:02d}" if el_h > 0 else f"{el_m:02d}:{el_sec:02d}"
-        write_job_state(
-            "COMPLETED",
-            job_type,
-            title,
-            current=state_tracker["total"],
-            total=state_tracker["total"],
-            current_item=f"Completed in {el_fmt}!",
-            start_epoch=start_ep,
-            pid=0,
-            lane=target_lane,
-            completed_cards=int(state_tracker.get("completed_cards") or 0),
-            total_cards=int(state_tracker.get("total_cards") or 0),
-        )
-        append_job_log(f"FINISHED [OK]: {title} (PID {my_pid}) | Elapsed: {el_fmt} ({total_el_s}s).", lane=target_lane, run_log_file=run_log_path)
+        if _stop_check_cb():
+            write_job_state(
+                "STOPPED",
+                job_type,
+                title,
+                current=state_tracker["current"],
+                total=state_tracker["total"],
+                current_item="Stopped by user.",
+                start_epoch=start_ep,
+                pid=0,
+                lane=target_lane,
+                completed_cards=int(state_tracker.get("completed_cards") or 0),
+                total_cards=int(state_tracker.get("total_cards") or 0),
+            )
+            append_job_log(f"🛑 Job stopped cooperatively ({title}, PID {my_pid}) after {el_fmt}.", lane=target_lane, run_log_file=run_log_path)
+        else:
+            write_job_state(
+                "COMPLETED",
+                job_type,
+                title,
+                current=state_tracker["total"],
+                total=state_tracker["total"],
+                current_item=f"Completed in {el_fmt}!",
+                start_epoch=start_ep,
+                pid=0,
+                lane=target_lane,
+                completed_cards=int(state_tracker.get("completed_cards") or 0),
+                total_cards=int(state_tracker.get("total_cards") or 0),
+            )
+            append_job_log(f"FINISHED [OK]: {title} (PID {my_pid}) | Elapsed: {el_fmt} ({total_el_s}s).", lane=target_lane, run_log_file=run_log_path)
     except CloudflareEdgeBlockPaused as cf_pause:
         append_job_log(f"⏸️ PAUSED SAFELY: {cf_pause}", lane=target_lane, run_log_file=run_log_path)
         write_job_state(
@@ -1997,29 +2059,29 @@ def run_background_job_from_file(payload_path: Path):
         append_job_log(f"ERROR [EXCEPTION]: {e}\n{tb_str}", lane=target_lane, run_log_file=run_log_path)
         write_job_state("FAILED", job_type, title, current=state_tracker["current"], total=state_tracker["total"], current_item=f"Error: {e}", start_epoch=start_ep, pid=0, error_msg=str(e), lane=target_lane)
     finally:
+        was_stopped = _stop_check_cb()
         _hb_stop.set()
         release_gpu_worker_slot()
         set_log_callback(None)
         set_progress_callback(None)
         set_stop_check_callback(None)
         base_lane = base_lane_from_slot(target_lane)
-        pending_q = load_lane_job_queue(base_lane)
-        if pending_q:
-            next_item = pending_q.pop(0)
-            save_lane_job_queue(base_lane, pending_q)
-            append_job_log(
-                f"⏭️ Starting next queued task in {PROCESS_LANES[base_lane]['short_name']}: {next_item.get('title')}",
-                lane=base_lane,
-                run_log_file=run_log_path,
-            )
-            start_background_job(
-                job_type=str(next_item.get("job_type", "task")),
-                title=str(next_item.get("title", "Queued Task")),
-                payload=dict(next_item.get("payload", {})),
-                lane=base_lane,
-                execution_mode="queue",
-                is_queued_continuation=True,
-            )
+        if not was_stopped:
+            next_item = pop_next_queued_job(base_lane)
+            if next_item:
+                append_job_log(
+                    f"⏭️ Starting next queued task in {PROCESS_LANES[base_lane]['short_name']}: {next_item.get('title')}",
+                    lane=base_lane,
+                    run_log_file=run_log_path,
+                )
+                start_background_job(
+                    job_type=str(next_item.get("job_type", "task")),
+                    title=str(next_item.get("title", "Queued Task")),
+                    payload=dict(next_item.get("payload", {})),
+                    lane=base_lane,
+                    execution_mode="queue",
+                    is_queued_continuation=True,
+                )
 
 
 def main():

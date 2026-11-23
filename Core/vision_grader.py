@@ -135,7 +135,9 @@ from Core.database import (
     get_next_sku_int,
     load_inventory_df,
     load_master_checklist,
+    merge_inventory_updates_by_sku,
     save_inventory_df,
+    update_inventory_df_atomic,
 )
 from Core.market_engine import (
     build_comp_key,
@@ -7599,7 +7601,11 @@ def regrade_batch_cards(
             progress_callback(pos_i, total_rows, df.loc[idx].to_dict())
 
     df = recalculate_dataframe_multi_grader_roi(df)
-    df.to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    with interprocess_file_lock(manifest_path.with_suffix(".csv.lock")):
+        atomic_write_bytes(
+            manifest_path,
+            lambda tmp_p: df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+        )
     return df, regraded_count
 
 
@@ -7651,7 +7657,7 @@ def regrade_inventory_cards(
             progress_callback(pos_i, total, out.loc[idx].to_dict())
 
     out = recalculate_dataframe_multi_grader_roi(out)
-    save_inventory_df(out)
+    out = merge_inventory_updates_by_sku(out, baseline_df=inv_df)
     return out, regraded_count
 
 
@@ -8173,8 +8179,42 @@ def reprocess_inventory_skus(
             if col_c not in inv_df.columns:
                 inv_df[col_c] = ""
             inv_df.loc[processed_indices, col_c] = sub_roi[col_c]
-        synced_df, renamed_cnt = sync_inventory_copy_numbers_and_files(inv_df, previous_inv_df=prev_df)
-        inv_df = save_inventory_df(synced_df)
+
+        upd_slice = inv_df.loc[processed_indices].copy()
+        base_by_sku = {}
+        if not prev_df.empty and "SKU" in prev_df.columns:
+            for _, b_r in prev_df.iterrows():
+                b_s = str(b_r.get("SKU") or "").strip()
+                if b_s:
+                    base_by_sku[b_s] = b_r.to_dict()
+
+        def _merge_reprocessed_and_sync(fresh_df: pd.DataFrame) -> pd.DataFrame:
+            nonlocal renamed_cnt
+            if fresh_df.empty or "SKU" not in fresh_df.columns:
+                return fresh_df
+            prev_fresh_df = fresh_df.copy()
+            fresh_df = fresh_df.copy()
+            fresh_df["SKU"] = fresh_df["SKU"].astype(str).str.strip()
+            sku_idx_map = {str(s).strip(): i for i, s in zip(fresh_df.index, fresh_df["SKU"]) if str(s).strip()}
+            for _, u_row in upd_slice.iterrows():
+                u_sku = str(u_row.get("SKU") or "").strip()
+                t_idx = sku_idx_map.get(u_sku)
+                if t_idx is None:
+                    continue
+                b_rec = base_by_sku.get(u_sku)
+                for col_u in upd_slice.columns:
+                    if col_u == "SKU":
+                        continue
+                    new_v = u_row.get(col_u)
+                    if b_rec is not None and str(new_v) == str(b_rec.get(col_u, "")):
+                        continue
+                    if col_u not in fresh_df.columns:
+                        fresh_df[col_u] = ""
+                    fresh_df.at[t_idx, col_u] = new_v
+            synced_df, renamed_cnt = sync_inventory_copy_numbers_and_files(fresh_df, previous_inv_df=prev_fresh_df)
+            return synced_df
+
+        inv_df = update_inventory_df_atomic(_merge_reprocessed_and_sync)
 
     _flush_border_sig_cache(force=True)
     flush_neural_embeddings_if_dirty()
@@ -8378,6 +8418,7 @@ def fix_card_rotations_and_regrade(
         return grade_upd
 
     # Phase 1: Master Inventory (_My_Collection)
+    orig_inv_snapshot = inv_df.copy() if (inv_work and not inv_df.empty) else pd.DataFrame()
     inv_impacted_indices: list[int] = []
     if inv_work and not inv_df.empty:
         for r_idx in inv_work:
@@ -8426,7 +8467,10 @@ def fix_card_rotations_and_regrade(
             for ri, (orig_raw, orig_rec) in saved_prices.items():
                 inv_df.at[ri, "Raw_Price"] = orig_raw
                 inv_df.at[ri, "Rec_Sale_Price"] = orig_rec
-            save_inventory_df(inv_df)
+            inv_df = merge_inventory_updates_by_sku(
+                inv_df.loc[inv_impacted_indices].copy(),
+                baseline_df=orig_inv_snapshot,
+            )
 
     # Phase 2: Uncommitted Batches
     for b_dir, man_p, bdf, b_rows in batch_jobs:

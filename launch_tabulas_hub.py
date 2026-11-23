@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,7 +54,10 @@ from Core.config import (
     SET_LIBRARY_ROOT,
     SOLD_CARDS_CSV,
     TRACKING_FILE,
+    atomic_write_bytes,
+    atomic_write_text,
     get_daily_log_dir,
+    interprocess_file_lock,
 )
 
 
@@ -372,6 +376,7 @@ def _build_tabulas_react_html_v2(jsx_path: Path) -> str:
 # ==============================================================================
 # MTIME-KEYED IN-MEMORY CHECKLIST CACHE & SKU RANGE PARSER
 # ==============================================================================
+_MEM_CACHE_LOCK = threading.RLock()
 _CHK_MASTER_CACHE = {"mtime": -1.0, "df": None, "known_sets": [], "known_years": []}
 _CHK_SET_CACHE: dict[str, tuple[float, object]] = {}
 _INV_MEM_CACHE = {"mtime": -1.0, "rows": []}
@@ -383,11 +388,12 @@ def _get_cached_inventory_records() -> list[dict]:
     if not INVENTORY_FILE.exists():
         return []
     try:
-        mt = INVENTORY_FILE.stat().st_mtime
-        if _INV_MEM_CACHE["mtime"] != mt:
-            _INV_MEM_CACHE["rows"] = _read_csv_records(INVENTORY_FILE, max_rows=50000)
-            _INV_MEM_CACHE["mtime"] = mt
-        return _INV_MEM_CACHE["rows"]
+        with _MEM_CACHE_LOCK:
+            mt = INVENTORY_FILE.stat().st_mtime
+            if _INV_MEM_CACHE["mtime"] != mt:
+                _INV_MEM_CACHE["rows"] = _read_csv_records(INVENTORY_FILE, max_rows=50000)
+                _INV_MEM_CACHE["mtime"] = mt
+            return list(_INV_MEM_CACHE["rows"])
     except Exception:
         return _read_csv_records(INVENTORY_FILE, max_rows=50000)
 
@@ -395,17 +401,18 @@ def _get_cached_inventory_records() -> list[dict]:
 def _get_cached_directory_records() -> list[dict]:
     """mtime-validated in-memory cache for TCDB_Set_Directory.csv."""
     try:
-        if MASTER_DIRECTORY_CSV_FILE.exists():
-            mt = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
-            if _DIR_MEM_CACHE["mtime"] == mt and _DIR_MEM_CACHE["rows"]:
-                return _DIR_MEM_CACHE["rows"]
-        from Core.scraper_engine import load_tcdb_master_directory
-        df_dir = load_tcdb_master_directory()
-        rows = df_dir.to_dict(orient="records")
-        if MASTER_DIRECTORY_CSV_FILE.exists():
-            _DIR_MEM_CACHE["mtime"] = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
-            _DIR_MEM_CACHE["rows"] = rows
-        return rows
+        with _MEM_CACHE_LOCK:
+            if MASTER_DIRECTORY_CSV_FILE.exists():
+                mt = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
+                if _DIR_MEM_CACHE["mtime"] == mt and _DIR_MEM_CACHE["rows"]:
+                    return list(_DIR_MEM_CACHE["rows"])
+            from Core.scraper_engine import load_tcdb_master_directory
+            df_dir = load_tcdb_master_directory()
+            rows = df_dir.to_dict(orient="records")
+            if MASTER_DIRECTORY_CSV_FILE.exists():
+                _DIR_MEM_CACHE["rows"] = rows
+                _DIR_MEM_CACHE["mtime"] = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
+            return list(rows)
     except Exception:
         return []
 
@@ -493,42 +500,43 @@ def _get_cached_checklist_df(set_name: str = ""):
                 df_in[col] = ""
         return df_in
 
-    if set_name:
-        cand_csv = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(set_name)}.csv"
-        if not cand_csv.exists() and SET_CHECKLISTS_DIR.exists():
-            target_low = sanitize_filename_part(set_name).lower()
-            cand_csv = next((p for p in SET_CHECKLISTS_DIR.glob("*.csv") if p.stem.lower() == target_low), cand_csv)
-        if cand_csv.exists():
-            mt = cand_csv.stat().st_mtime
-            key = str(cand_csv)
-            cached = _CHK_SET_CACHE.get(key)
-            if cached is not None and cached[0] == mt:
-                return cached[1]
-            df_s = _ensure_cols(pd.read_csv(cand_csv, dtype=str, keep_default_na=False))
-            _CHK_SET_CACHE[key] = (mt, df_s)
-            return df_s
+    with _MEM_CACHE_LOCK:
+        if set_name:
+            cand_csv = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(set_name)}.csv"
+            if not cand_csv.exists() and SET_CHECKLISTS_DIR.exists():
+                target_low = sanitize_filename_part(set_name).lower()
+                cand_csv = next((p for p in SET_CHECKLISTS_DIR.glob("*.csv") if p.stem.lower() == target_low), cand_csv)
+            if cand_csv.exists():
+                mt = cand_csv.stat().st_mtime
+                key = str(cand_csv)
+                cached = _CHK_SET_CACHE.get(key)
+                if cached is not None and cached[0] == mt:
+                    return cached[1]
+                df_s = _ensure_cols(pd.read_csv(cand_csv, dtype=str, keep_default_na=False))
+                _CHK_SET_CACHE[key] = (mt, df_s)
+                return df_s
 
-    if not CHECKLIST_PATH.exists():
-        return pd.DataFrame(columns=CHECKLIST_COLUMNS)
+        if not CHECKLIST_PATH.exists():
+            return pd.DataFrame(columns=CHECKLIST_COLUMNS)
 
-    mt_master = CHECKLIST_PATH.stat().st_mtime
-    if _CHK_MASTER_CACHE["df"] is None or _CHK_MASTER_CACHE["mtime"] != mt_master:
-        df_m = _ensure_cols(pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False))
-        k_sets = sorted([s for s in df_m["Set"].dropna().unique().tolist() if str(s).strip()])
-        k_yrs = set()
-        for s_v in k_sets:
-            m_yr = re.search(r"\b((?:19|20)\d{2}(?:-\d{2})?)\b", str(s_v))
-            if m_yr:
-                k_yrs.add(m_yr.group(1))
-        _CHK_MASTER_CACHE["mtime"] = mt_master
-        _CHK_MASTER_CACHE["df"] = df_m
-        _CHK_MASTER_CACHE["known_sets"] = k_sets
-        _CHK_MASTER_CACHE["known_years"] = sorted(list(k_yrs), reverse=True)
+        mt_master = CHECKLIST_PATH.stat().st_mtime
+        if _CHK_MASTER_CACHE["df"] is None or _CHK_MASTER_CACHE["mtime"] != mt_master:
+            df_m = _ensure_cols(pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False))
+            k_sets = sorted([s for s in df_m["Set"].dropna().unique().tolist() if str(s).strip()])
+            k_yrs = set()
+            for s_v in k_sets:
+                m_yr = re.search(r"\b((?:19|20)\d{2}(?:-\d{2})?)\b", str(s_v))
+                if m_yr:
+                    k_yrs.add(m_yr.group(1))
+            _CHK_MASTER_CACHE["df"] = df_m
+            _CHK_MASTER_CACHE["known_sets"] = k_sets
+            _CHK_MASTER_CACHE["known_years"] = sorted(list(k_yrs), reverse=True)
+            _CHK_MASTER_CACHE["mtime"] = mt_master
 
-    master_df = _CHK_MASTER_CACHE["df"]
-    if set_name:
-        return master_df[master_df["Set"] == set_name]
-    return master_df
+        master_df = _CHK_MASTER_CACHE["df"]
+        if set_name:
+            return master_df[master_df["Set"] == set_name]
+        return master_df
 
 
 def consolidate_single_react_app_file():
@@ -626,20 +634,31 @@ def _write_csv_records(csv_path: Path, records: list[dict], explicit_cols: list[
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     if not records:
         cols = explicit_cols or []
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-            if cols:
-                writer = csv.DictWriter(f, fieldnames=cols)
-                writer.writeheader()
+
+        def _write_empty(tmp_p: Path):
+            with open(tmp_p, "w", encoding="utf-8-sig", newline="") as f:
+                if cols:
+                    writer = csv.DictWriter(f, fieldnames=cols)
+                    writer.writeheader()
+
+        with interprocess_file_lock(csv_path.with_suffix(csv_path.suffix + ".lock")):
+            atomic_write_bytes(csv_path, _write_empty)
         return
+
     cols = explicit_cols or list(records[0].keys())
     for r in records:
         for k in r.keys():
             if k not in cols:
                 cols.append(k)
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(records)
+
+    def _write_rows(tmp_p: Path):
+        with open(tmp_p, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(records)
+
+    with interprocess_file_lock(csv_path.with_suffix(csv_path.suffix + ".lock")):
+        atomic_write_bytes(csv_path, _write_rows)
 
 
 def _read_json_file(json_path: Path, default_val):
@@ -653,7 +672,8 @@ def _read_json_file(json_path: Path, default_val):
 
 def _write_json_file(json_path: Path, data):
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with interprocess_file_lock(json_path.with_suffix(json_path.suffix + ".lock")):
+        atomic_write_text(json_path, json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _discover_incoming_scans() -> list[dict]:
@@ -1847,72 +1867,74 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             from Core.database import load_inventory_df, save_inventory_df, sync_inventory_copy_numbers_and_files
             from Core.vision_grader import recalculate_dataframe_multi_grader_roi
 
-            prev_df = load_inventory_df()
-            prev_by_sku = {str(r["SKU"]).strip(): r.to_dict() for _, r in prev_df.iterrows() if str(r.get("SKU", "")).strip()} if not prev_df.empty else {}
+            inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+            with interprocess_file_lock(inv_lock, timeout=30.0):
+                prev_df = load_inventory_df()
+                prev_by_sku = {str(r["SKU"]).strip(): r.to_dict() for _, r in prev_df.iterrows() if str(r.get("SKU", "")).strip()} if not prev_df.empty else {}
 
-            in_df = pd.DataFrame(payload)
-            if not in_df.empty:
-                recalc_indices = []
-                manual_price_overrides: dict[int, tuple[str | None, str | None]] = {}
+                in_df = pd.DataFrame(payload)
+                if not in_df.empty:
+                    recalc_indices = []
+                    manual_price_overrides: dict[int, tuple[str | None, str | None]] = {}
 
-                for idx_r, row_r in in_df.iterrows():
-                    sku_s = str(row_r.get("SKU") or "").strip()
-                    prev_r = prev_by_sku.get(sku_s)
-                    in_raw = str(row_r.get("Raw_Price") or "").strip()
-                    in_rec = str(row_r.get("Rec_Sale_Price") or "").strip()
+                    for idx_r, row_r in in_df.iterrows():
+                        sku_s = str(row_r.get("SKU") or "").strip()
+                        prev_r = prev_by_sku.get(sku_s)
+                        in_raw = str(row_r.get("Raw_Price") or "").strip()
+                        in_rec = str(row_r.get("Rec_Sale_Price") or "").strip()
 
-                    if prev_r is None or not in_rec:
-                        # Brand new row or missing Rec_Sale_Price -> calculate ROI & pricing
-                        recalc_indices.append(idx_r)
-                        if in_raw or in_rec:
-                            manual_price_overrides[idx_r] = (in_raw if in_raw else None, in_rec if in_rec else None)
-                    else:
-                        label_fields_changed = (
-                            str(row_r.get("Set") or "").strip() != str(prev_r.get("Set") or "").strip()
-                            or str(row_r.get("Subset") or "").strip() != str(prev_r.get("Subset") or "").strip()
-                            or str(row_r.get("Card Number") or "").strip().lstrip("#") != str(prev_r.get("Card Number") or "").strip().lstrip("#")
-                            or str(row_r.get("Player") or "").strip() != str(prev_r.get("Player") or "").strip()
-                            or str(row_r.get("Team") or "").strip() != str(prev_r.get("Team") or "").strip()
-                            or str(row_r.get("Print Run") or "").strip() != str(prev_r.get("Print Run") or "").strip()
-                        )
-                        id_changed = label_fields_changed or (
-                            str(row_r.get("Hold_Tag") or "").strip() != str(prev_r.get("Hold_Tag") or "").strip()
-                        )
-                        raw_edited = in_raw != str(prev_r.get("Raw_Price") or "").strip()
-                        rec_edited = in_rec != str(prev_r.get("Rec_Sale_Price") or "").strip()
-
-                        if label_fields_changed:
-                            # Auto-flag card as unprinted whenever label-visible identity metadata changes
-                            in_df.at[idx_r, "Label_Printed"] = "False"
-                        if id_changed:
+                        if prev_r is None or not in_rec:
+                            # Brand new row or missing Rec_Sale_Price -> calculate ROI & pricing
                             recalc_indices.append(idx_r)
-                        if raw_edited or rec_edited:
-                            manual_price_overrides[idx_r] = (
-                                in_raw if raw_edited else None,
-                                in_rec if rec_edited else None,
+                            if in_raw or in_rec:
+                                manual_price_overrides[idx_r] = (in_raw if in_raw else None, in_rec if in_rec else None)
+                        else:
+                            label_fields_changed = (
+                                str(row_r.get("Set") or "").strip() != str(prev_r.get("Set") or "").strip()
+                                or str(row_r.get("Subset") or "").strip() != str(prev_r.get("Subset") or "").strip()
+                                or str(row_r.get("Card Number") or "").strip().lstrip("#") != str(prev_r.get("Card Number") or "").strip().lstrip("#")
+                                or str(row_r.get("Player") or "").strip() != str(prev_r.get("Player") or "").strip()
+                                or str(row_r.get("Team") or "").strip() != str(prev_r.get("Team") or "").strip()
+                                or str(row_r.get("Print Run") or "").strip() != str(prev_r.get("Print Run") or "").strip()
                             )
+                            id_changed = label_fields_changed or (
+                                str(row_r.get("Hold_Tag") or "").strip() != str(prev_r.get("Hold_Tag") or "").strip()
+                            )
+                            raw_edited = in_raw != str(prev_r.get("Raw_Price") or "").strip()
+                            rec_edited = in_rec != str(prev_r.get("Rec_Sale_Price") or "").strip()
 
-                if recalc_indices:
-                    sub_recalc = recalculate_dataframe_multi_grader_roi(in_df.loc[recalc_indices].copy())
-                    for col_c in sub_recalc.columns:
-                        if col_c not in in_df.columns:
-                            in_df[col_c] = ""
-                        in_df.loc[recalc_indices, col_c] = sub_recalc[col_c]
+                            if label_fields_changed:
+                                # Auto-flag card as unprinted whenever label-visible identity metadata changes
+                                in_df.at[idx_r, "Label_Printed"] = "False"
+                            if id_changed:
+                                recalc_indices.append(idx_r)
+                            if raw_edited or rec_edited:
+                                manual_price_overrides[idx_r] = (
+                                    in_raw if raw_edited else None,
+                                    in_rec if rec_edited else None,
+                                )
 
-                # Strictly preserve user-typed Raw_Price and Rec_Sale_Price edits & stamp Valuation_Source='Manual'
-                for idx_r, (keep_raw, keep_rec) in manual_price_overrides.items():
-                    if keep_raw is not None:
-                        in_df.at[idx_r, "Raw_Price"] = keep_raw
-                        try:
-                            raw_f = float(re.sub(r"[^0-9.\-]", "", str(keep_raw)) or "0")
-                        except Exception:
-                            raw_f = 0.0
-                        in_df.at[idx_r, "Valuation_Source"] = "Manual" if raw_f > 0 else "Uncomped"
-                    if keep_rec is not None:
-                        in_df.at[idx_r, "Rec_Sale_Price"] = keep_rec
+                    if recalc_indices:
+                        sub_recalc = recalculate_dataframe_multi_grader_roi(in_df.loc[recalc_indices].copy())
+                        for col_c in sub_recalc.columns:
+                            if col_c not in in_df.columns:
+                                in_df[col_c] = ""
+                            in_df.loc[recalc_indices, col_c] = sub_recalc[col_c]
 
-            synced_df, renamed_cnt = sync_inventory_copy_numbers_and_files(in_df, previous_inv_df=prev_df)
-            saved_df = save_inventory_df(synced_df)
+                    # Strictly preserve user-typed Raw_Price and Rec_Sale_Price edits & stamp Valuation_Source='Manual'
+                    for idx_r, (keep_raw, keep_rec) in manual_price_overrides.items():
+                        if keep_raw is not None:
+                            in_df.at[idx_r, "Raw_Price"] = keep_raw
+                            try:
+                                raw_f = float(re.sub(r"[^0-9.\-]", "", str(keep_raw)) or "0")
+                            except Exception:
+                                raw_f = 0.0
+                            in_df.at[idx_r, "Valuation_Source"] = "Manual" if raw_f > 0 else "Uncomped"
+                        if keep_rec is not None:
+                            in_df.at[idx_r, "Rec_Sale_Price"] = keep_rec
+
+                synced_df, renamed_cnt = sync_inventory_copy_numbers_and_files(in_df, previous_inv_df=prev_df)
+                saved_df = save_inventory_df(synced_df)
             self._send_json({"success": True, "count": len(saved_df), "renamedFiles": renamed_cnt, "rows": saved_df.to_dict(orient="records")})
             return
 
@@ -1949,9 +1971,11 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                             sig_now = str(row.get("OCR_Signals") or "").strip()
                             if "UserConfirmed" not in sig_now:
                                 full_df.at[r_idx, "OCR_Signals"] = f"{sig_now}+UserConfirmed".strip("+")
-                    tmp_man = man_p.with_suffix(".csv.tmp")
-                    full_df.to_csv(tmp_man, index=False, encoding="utf-8-sig")
-                    os.replace(str(tmp_man), str(man_p))
+                    with interprocess_file_lock(man_p.with_suffix(".csv.lock")):
+                        atomic_write_bytes(
+                            man_p,
+                            lambda tmp_p: full_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+                        )
                     _log_ui_action_to_file("Batch", f"Confirmed {len(target_skus_set)} card(s) correct in {b_name}", "confirmOnly=True")
                     self._send_json({
                         "success": True,
@@ -1995,7 +2019,11 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                         if col_r not in res_df.columns:
                             res_df[col_r] = ""
                         res_df.loc[mod_mask, col_r] = sub_roi[col_r]
-                    res_df.to_csv(man_p, index=False, encoding="utf-8-sig")
+                    with interprocess_file_lock(man_p.with_suffix(".csv.lock")):
+                        atomic_write_bytes(
+                            man_p,
+                            lambda tmp_p: res_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+                        )
 
             _log_ui_action_to_file("Batch", f"Updated {len(target_skus_set) or len(res_df)} card(s) in {b_name}", f"overrides={ovr_c}, renamed={ren_c}")
             self._send_json({
@@ -2502,10 +2530,14 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
             if sku_val and bool(payload.get("markInventorySold", True)):
                 try:
-                    inv_df = load_inventory_df()
-                    if not inv_df.empty and sku_val in set(inv_df["SKU"].astype(str)):
-                        inv_df.loc[inv_df["SKU"] == sku_val, "Status"] = "Sold"
-                        save_inventory_df(inv_df)
+                    from Core.database import update_inventory_df_atomic
+
+                    def _mark_sold(inv_df_cur):
+                        if not inv_df_cur.empty and sku_val in set(inv_df_cur["SKU"].astype(str).str.strip()):
+                            inv_df_cur.loc[inv_df_cur["SKU"].astype(str).str.strip() == sku_val, "Status"] = "Sold"
+                        return inv_df_cur
+
+                    update_inventory_df_atomic(_mark_sold)
                 except Exception:
                     pass
 
@@ -2527,10 +2559,14 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 sku_rev = str(removed_rec.get("SKU") or "").strip()
                 if sku_rev:
                     try:
-                        inv_df = load_inventory_df()
-                        if not inv_df.empty and sku_rev in set(inv_df["SKU"].astype(str)):
-                            inv_df.loc[inv_df["SKU"] == sku_rev, "Status"] = "In Stock"
-                            save_inventory_df(inv_df)
+                        from Core.database import update_inventory_df_atomic
+
+                        def _revert_stock(inv_df_cur):
+                            if not inv_df_cur.empty and sku_rev in set(inv_df_cur["SKU"].astype(str).str.strip()):
+                                inv_df_cur.loc[inv_df_cur["SKU"].astype(str).str.strip() == sku_rev, "Status"] = "In Stock"
+                            return inv_df_cur
+
+                        update_inventory_df_atomic(_revert_stock)
                     except Exception:
                         pass
 
@@ -2703,17 +2739,23 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/labels/mark-printed" and isinstance(payload, dict):
-            from Core.database import load_inventory_df, save_inventory_df
+            from Core.database import load_inventory_df, update_inventory_df_atomic
             skus = [str(s).strip() for s in (payload.get("skus") or []) if str(s).strip()]
             printed_val = "False" if bool(payload.get("unmark", False)) else "True"
-            inv_df = load_inventory_df()
             marked_cnt = 0
-            if skus and not inv_df.empty:
-                mask = inv_df["SKU"].astype(str).str.strip().isin(skus)
-                marked_cnt = int(mask.sum())
-                if marked_cnt > 0:
-                    inv_df.loc[mask, "Label_Printed"] = printed_val
-                    inv_df = save_inventory_df(inv_df)
+            if skus:
+                def _mark_labels(inv_df_cur):
+                    nonlocal marked_cnt
+                    if not inv_df_cur.empty:
+                        mask = inv_df_cur["SKU"].astype(str).str.strip().isin(skus)
+                        marked_cnt = int(mask.sum())
+                        if marked_cnt > 0:
+                            inv_df_cur.loc[mask, "Label_Printed"] = printed_val
+                    return inv_df_cur
+
+                inv_df = update_inventory_df_atomic(_mark_labels)
+            else:
+                inv_df = load_inventory_df()
             _log_ui_action_to_file("Labels", f"Set Label_Printed={printed_val}", f"Updated {marked_cnt} SKU(s)")
             self._send_json({
                 "success": True,

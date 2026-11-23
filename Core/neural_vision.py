@@ -37,6 +37,7 @@ from Core.config import (
     atomic_write_bytes,
     canonical_set_key,
     ensure_directories,
+    interprocess_file_lock,
     norm,
     parse_unified_card_filename,
 )
@@ -815,20 +816,33 @@ def save_neural_embeddings_cache(cache_obj: dict):
     global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME, _MEM_EMBED_DIRTY_COUNT, _MEM_EMBED_LAST_FLUSH_TS
     with _INDEX_LOCK:
         try:
-            cache_obj["schema"] = NEURAL_CACHE_SCHEMA_V25
-            cache_obj["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with interprocess_file_lock(NEURAL_EMBEDDINGS_CACHE_FILE.with_suffix(".pkl.lock")):
+                if NEURAL_EMBEDDINGS_CACHE_FILE.exists():
+                    try:
+                        disk_mt = NEURAL_EMBEDDINGS_CACHE_FILE.stat().st_mtime
+                        if disk_mt > _MEM_EMBED_MTIME:
+                            with open(NEURAL_EMBEDDINGS_CACHE_FILE, "rb") as f_disk:
+                                disk_data = pickle.load(f_disk)
+                            if isinstance(disk_data, dict) and isinstance(disk_data.get("embeddings"), dict):
+                                merged_embs = dict(disk_data["embeddings"])
+                                merged_embs.update(cache_obj.get("embeddings", {}) or {})
+                                cache_obj["embeddings"] = merged_embs
+                    except Exception:
+                        pass
+                cache_obj["schema"] = NEURAL_CACHE_SCHEMA_V25
+                cache_obj["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            def _dump_embs(tmp_p: Path):
-                with open(tmp_p, "wb") as f:
-                    pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+                def _dump_embs(tmp_p: Path):
+                    with open(tmp_p, "wb") as f:
+                        pickle.dump(cache_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            atomic_write_bytes(NEURAL_EMBEDDINGS_CACHE_FILE, _dump_embs)
-            _MEM_EMBED_CACHE = cache_obj
-            _MEM_EMBED_MTIME = NEURAL_EMBEDDINGS_CACHE_FILE.stat().st_mtime
-            _MEM_EMBED_DIRTY_COUNT = 0
-            _MEM_EMBED_LAST_FLUSH_TS = time.monotonic()
-            _SET_MATRIX_CACHE.clear()
-            _PAR_GROUP_MATRIX_CACHE.clear()
+                atomic_write_bytes(NEURAL_EMBEDDINGS_CACHE_FILE, _dump_embs)
+                _MEM_EMBED_CACHE = cache_obj
+                _MEM_EMBED_MTIME = NEURAL_EMBEDDINGS_CACHE_FILE.stat().st_mtime
+                _MEM_EMBED_DIRTY_COUNT = 0
+                _MEM_EMBED_LAST_FLUSH_TS = time.monotonic()
+                _SET_MATRIX_CACHE.clear()
+                _PAR_GROUP_MATRIX_CACHE.clear()
         except Exception:
             pass
 

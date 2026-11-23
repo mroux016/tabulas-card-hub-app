@@ -82,6 +82,7 @@ from Core.config import (
     canonical_subset_key,
     ensure_directories,
     format_print_run,
+    interprocess_file_lock,
     norm,
     normalize_numeric_tcdb_cid,
     parse_unified_card_filename,
@@ -393,18 +394,48 @@ def cleanup_stale_driver_locks(
     return removed
 
 
+_TRACKED_DRIVER_PIDS: set[int] = set()
+_TRACKED_DRIVER_PIDS_LOCK = threading.Lock()
+
+
+def register_driver_pid(pid: Optional[int]):
+    try:
+        pid_i = int(pid or 0)
+        if pid_i > 0:
+            with _TRACKED_DRIVER_PIDS_LOCK:
+                _TRACKED_DRIVER_PIDS.add(pid_i)
+    except Exception:
+        pass
+
+
+def unregister_driver_pid(pid: Optional[int]):
+    try:
+        pid_i = int(pid or 0)
+        if pid_i > 0:
+            with _TRACKED_DRIVER_PIDS_LOCK:
+                _TRACKED_DRIVER_PIDS.discard(pid_i)
+    except Exception:
+        pass
+
+
 def cleanup_orphaned_drivers():
-    if os.name == "nt":
-        for proc in ("uc_driver.exe", "chromedriver.exe"):
-            try:
+    with _TRACKED_DRIVER_PIDS_LOCK:
+        pids_to_kill = list(_TRACKED_DRIVER_PIDS)
+        _TRACKED_DRIVER_PIDS.clear()
+    for pid in pids_to_kill:
+        try:
+            if os.name == "nt":
                 subprocess.run(
-                    ["taskkill", "/F", "/IM", proc, "/T"],
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=5,
                 )
-            except Exception:
-                pass
+            else:
+                import signal
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
     cleanup_stale_driver_locks()
 
 
@@ -436,16 +467,34 @@ def connect_session(existing_session=None, max_attempts: int = 5, target_domain:
             cleanup_orphaned_drivers()
             time.sleep(1.5)
 
-            with SB(uc=True, window_size="800,1000") as sb:
-                sb.uc_open_with_reconnect(target_domain, 5)
-                log_msg(f"⏳ Waiting 10 seconds for Cloudflare clearance (Attempt {attempt}/{max_attempts})...")
-                sb.sleep(10)
+            session_pids: list[int] = []
+            try:
+                with SB(uc=True, window_size="800,1000") as sb:
+                    try:
+                        svc = getattr(getattr(sb, "driver", None), "service", None)
+                        svc_proc = getattr(svc, "process", None)
+                        if svc_proc and getattr(svc_proc, "pid", None):
+                            session_pids.append(int(svc_proc.pid))
+                            register_driver_pid(svc_proc.pid)
+                        br_pid = getattr(getattr(sb, "driver", None), "browser_pid", None)
+                        if br_pid:
+                            session_pids.append(int(br_pid))
+                            register_driver_pid(br_pid)
+                    except Exception:
+                        pass
 
-                if sb.driver.window_handles:
-                    sb.driver.switch_to.window(sb.driver.window_handles[-1])
+                    sb.uc_open_with_reconnect(target_domain, 5)
+                    log_msg(f"⏳ Waiting 10 seconds for Cloudflare clearance (Attempt {attempt}/{max_attempts})...")
+                    sb.sleep(10)
 
-                cookies = {cookie["name"]: cookie["value"] for cookie in sb.driver.get_cookies()}
-                ua = sb.driver.execute_script("return navigator.userAgent;")
+                    if sb.driver.window_handles:
+                        sb.driver.switch_to.window(sb.driver.window_handles[-1])
+
+                    cookies = {cookie["name"]: cookie["value"] for cookie in sb.driver.get_cookies()}
+                    ua = sb.driver.execute_script("return navigator.userAgent;")
+            finally:
+                for spid in session_pids:
+                    unregister_driver_pid(spid)
 
             if existing_session is not None:
                 existing_session.cookies.clear()
@@ -2684,7 +2733,8 @@ def save_catalog(set_folder_name: str, catalog: dict):
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{sanitize_filename_part(set_folder_name)}_catalog.json"
     try:
-        path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+        with interprocess_file_lock(path.with_suffix(".json.lock")):
+            atomic_write_text(path, json.dumps(catalog, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -3004,7 +3054,11 @@ def sync_set_library_download_status(
             df["Front_Downloaded"] = f_flags
             df["Back_Downloaded"] = b_flags
             df = df[CHECKLIST_COLUMNS]
-            df.to_csv(csv_p, index=False, encoding="utf-8-sig")
+            with interprocess_file_lock(csv_p.with_suffix(".csv.lock")):
+                atomic_write_bytes(
+                    csv_p,
+                    lambda tmp_p: df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+                )
 
             # Sync exact per-set card counts & downloaded image totals into the ETA telemetry cache
             try:
@@ -3046,11 +3100,18 @@ def sync_set_library_download_status(
         master_df = pd.concat(dfs_all, ignore_index=True).drop_duplicates(
             subset=["Set", "Subset", "Card Number", "Player", "TCDB_CID"], keep="first"
         )
-        master_df[CHECKLIST_COLUMNS].to_csv(CHECKLIST_PATH, index=False, encoding="utf-8-sig")
-        try:
-            shutil.copy2(CHECKLIST_PATH, CHECKLIST_BACKUP_PATH)
-        except Exception:
-            pass
+        with interprocess_file_lock(CHECKLIST_PATH.with_suffix(".csv.lock")):
+            atomic_write_bytes(
+                CHECKLIST_PATH,
+                lambda tmp_p: master_df[CHECKLIST_COLUMNS].to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+            )
+            try:
+                atomic_write_bytes(
+                    CHECKLIST_BACKUP_PATH,
+                    lambda tmp_p: shutil.copy2(CHECKLIST_PATH, tmp_p),
+                )
+            except Exception:
+                pass
         log_msg(f"  ✅ Wrote {len(master_df):,} total rows to Master_Checklist.csv in {time.time() - t_sync0:.2f}s.")
 
     log_msg(
@@ -3402,78 +3463,80 @@ def _merge_set_checklist_into_master(set_df: pd.DataFrame, checklist_set_name: s
             set_df[col] = ""
     set_csv_path = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(checklist_set_name)}.csv"
     set_df = set_df[CHECKLIST_COLUMNS]
-    atomic_write_bytes(
-        set_csv_path,
-        lambda tmp_p: set_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
-    )
-
-    merged_master = None
-    if CHECKLIST_PATH.exists() and CHECKLIST_PATH.stat().st_size > 0:
-        master_df = None
-        last_read_err = None
-        for attempt in range(4):
-            try:
-                master_df = pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False)
-                break
-            except Exception as read_err:
-                last_read_err = read_err
-                time.sleep(0.08 * (attempt + 1))
-
-        if master_df is None and CHECKLIST_BACKUP_PATH.exists() and CHECKLIST_BACKUP_PATH.stat().st_size > 0:
-            try:
-                master_df = pd.read_csv(CHECKLIST_BACKUP_PATH, dtype=str, keep_default_na=False)
-                log_msg(f"  [!] Master_Checklist.csv read locked ({last_read_err}); recovered other sets from Master_Checklist_Backup.csv.")
-            except Exception:
-                master_df = None
-
-        if master_df is None:
-            # Never wipe Master_Checklist.csv with a single set on transient read/lock error.
-            # Try safe rebuild from all Set_Checklists/*.csv; abort master write if any other set CSV fails to load.
-            rebuilt_parts = []
-            rebuild_ok = True
-            for other_csv in sorted(SET_CHECKLISTS_DIR.glob("*.csv")):
-                if other_csv.resolve() == set_csv_path.resolve():
-                    continue
-                try:
-                    part_df = pd.read_csv(other_csv, dtype=str, keep_default_na=False)
-                    for col in CHECKLIST_COLUMNS:
-                        if col not in part_df.columns:
-                            part_df[col] = ""
-                    part_df["Set"] = part_df["Set"].map(canonicalize_checklist_set_title)
-                    part_df = part_df[part_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS]
-                    if not part_df.empty:
-                        rebuilt_parts.append(part_df)
-                except Exception:
-                    rebuild_ok = False
-                    break
-            if rebuild_ok:
-                rebuilt_parts.append(set_df)
-                merged_master = pd.concat(rebuilt_parts, ignore_index=True)
-                log_msg(f"  [!] Rebuilt Master_Checklist.csv safely from {len(rebuilt_parts)} set checklist CSV(s) after transient read error ({last_read_err}).")
-            else:
-                log_msg(f"  [!] Skipped Master_Checklist.csv overwrite to prevent data loss (transient read error: {last_read_err}). Set CSV saved safely: {set_csv_path.name}")
-                return
-        else:
-            for col in CHECKLIST_COLUMNS:
-                if col not in master_df.columns:
-                    master_df[col] = ""
-            master_df["Set"] = master_df["Set"].map(canonicalize_checklist_set_title)
-            other_sets_df = master_df[master_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS].copy()
-            merged_master = pd.concat([other_sets_df, set_df], ignore_index=True) if not other_sets_df.empty else set_df
-    else:
-        merged_master = set_df
-
-    atomic_write_bytes(
-        CHECKLIST_PATH,
-        lambda tmp_p: merged_master[CHECKLIST_COLUMNS].to_csv(tmp_p, index=False, encoding="utf-8-sig"),
-    )
-    try:
+    with interprocess_file_lock(set_csv_path.with_suffix(".csv.lock")):
         atomic_write_bytes(
-            CHECKLIST_BACKUP_PATH,
-            lambda tmp_p: shutil.copy2(CHECKLIST_PATH, tmp_p),
+            set_csv_path,
+            lambda tmp_p: set_df.to_csv(tmp_p, index=False, encoding="utf-8-sig"),
         )
-    except Exception:
-        pass
+
+    with interprocess_file_lock(CHECKLIST_PATH.with_suffix(".csv.lock")):
+        merged_master = None
+        if CHECKLIST_PATH.exists() and CHECKLIST_PATH.stat().st_size > 0:
+            master_df = None
+            last_read_err = None
+            for attempt in range(4):
+                try:
+                    master_df = pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False)
+                    break
+                except Exception as read_err:
+                    last_read_err = read_err
+                    time.sleep(0.08 * (attempt + 1))
+
+            if master_df is None and CHECKLIST_BACKUP_PATH.exists() and CHECKLIST_BACKUP_PATH.stat().st_size > 0:
+                try:
+                    master_df = pd.read_csv(CHECKLIST_BACKUP_PATH, dtype=str, keep_default_na=False)
+                    log_msg(f"  [!] Master_Checklist.csv read locked ({last_read_err}); recovered other sets from Master_Checklist_Backup.csv.")
+                except Exception:
+                    master_df = None
+
+            if master_df is None:
+                # Never wipe Master_Checklist.csv with a single set on transient read/lock error.
+                # Try safe rebuild from all Set_Checklists/*.csv; abort master write if any other set CSV fails to load.
+                rebuilt_parts = []
+                rebuild_ok = True
+                for other_csv in sorted(SET_CHECKLISTS_DIR.glob("*.csv")):
+                    if other_csv.resolve() == set_csv_path.resolve():
+                        continue
+                    try:
+                        part_df = pd.read_csv(other_csv, dtype=str, keep_default_na=False)
+                        for col in CHECKLIST_COLUMNS:
+                            if col not in part_df.columns:
+                                part_df[col] = ""
+                        part_df["Set"] = part_df["Set"].map(canonicalize_checklist_set_title)
+                        part_df = part_df[part_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS]
+                        if not part_df.empty:
+                            rebuilt_parts.append(part_df)
+                    except Exception:
+                        rebuild_ok = False
+                        break
+                if rebuild_ok:
+                    rebuilt_parts.append(set_df)
+                    merged_master = pd.concat(rebuilt_parts, ignore_index=True)
+                    log_msg(f"  [!] Rebuilt Master_Checklist.csv safely from {len(rebuilt_parts)} set checklist CSV(s) after transient read error ({last_read_err}).")
+                else:
+                    log_msg(f"  [!] Skipped Master_Checklist.csv overwrite to prevent data loss (transient read error: {last_read_err}). Set CSV saved safely: {set_csv_path.name}")
+                    return
+            else:
+                for col in CHECKLIST_COLUMNS:
+                    if col not in master_df.columns:
+                        master_df[col] = ""
+                master_df["Set"] = master_df["Set"].map(canonicalize_checklist_set_title)
+                other_sets_df = master_df[master_df["Set"] != checklist_set_name][CHECKLIST_COLUMNS].copy()
+                merged_master = pd.concat([other_sets_df, set_df], ignore_index=True) if not other_sets_df.empty else set_df
+        else:
+            merged_master = set_df
+
+        atomic_write_bytes(
+            CHECKLIST_PATH,
+            lambda tmp_p: merged_master[CHECKLIST_COLUMNS].to_csv(tmp_p, index=False, encoding="utf-8-sig"),
+        )
+        try:
+            atomic_write_bytes(
+                CHECKLIST_BACKUP_PATH,
+                lambda tmp_p: shutil.copy2(CHECKLIST_PATH, tmp_p),
+            )
+        except Exception:
+            pass
 
 
 def _update_catalog_from_parsed_rows(
@@ -4755,7 +4818,7 @@ def _download_single_template_side(
         )
         if res and res.status_code == 200 and is_valid_image_payload(res.content):
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_bytes(res.content)
+            atomic_write_bytes(dest_path, lambda tmp_p: tmp_p.write_bytes(res.content))
             learner.record_tier_outcome(
                 set_key=set_key,
                 quality_tier=tier_code,

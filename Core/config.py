@@ -1232,7 +1232,7 @@ def interprocess_file_lock(
         return
 
     acquired_os_lock = False
-    deadline = time.time() + max(0.5, float(timeout))
+    deadline = time.time() + max(0.05, float(timeout))
     token = f"{os.getpid()}|{tid}|{time.time():.6f}"
     try:
         while True:
@@ -1249,15 +1249,14 @@ def interprocess_file_lock(
                 should_break = False
                 try:
                     st = lp.stat()
-                    if (now_t - st.st_mtime) > float(stale_seconds):
+                    raw_meta = lp.read_text(encoding="utf-8", errors="ignore").strip()
+                    parts = raw_meta.split("|")
+                    holder_pid = int(parts[0]) if (parts and parts[0].isdigit()) else 0
+                    if holder_pid > 0:
+                        if holder_pid != os.getpid() and not _is_lock_holder_pid_alive(holder_pid):
+                            should_break = True
+                    elif (now_t - st.st_mtime) > float(stale_seconds):
                         should_break = True
-                    else:
-                        raw_meta = lp.read_text(encoding="utf-8", errors="ignore").strip()
-                        parts = raw_meta.split("|")
-                        if parts and parts[0].isdigit():
-                            holder_pid = int(parts[0])
-                            if holder_pid != os.getpid() and not _is_lock_holder_pid_alive(holder_pid):
-                                should_break = True
                 except FileNotFoundError:
                     continue
                 except Exception:
@@ -1271,12 +1270,9 @@ def interprocess_file_lock(
                     continue
 
                 if now_t >= deadline:
-                    # Break stuck lock after timeout rather than hanging worker indefinitely
-                    try:
-                        lp.unlink()
-                    except Exception:
-                        pass
-                    break
+                    raise TimeoutError(
+                        f"Timed out after {float(timeout):.2f}s waiting for interprocess file lock: {lp}"
+                    )
                 time.sleep(0.04)
 
         _LOCAL_LOCK_DEPTH[depth_key] = 1
