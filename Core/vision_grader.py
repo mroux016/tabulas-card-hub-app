@@ -484,11 +484,11 @@ def _detect_light_bed_shadow_edges(
                     # Local minimum check
                     if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
                         continue
-                    out_seg = prof[max(0, idx - 12):max(1, idx - 2)]
+                    out_seg = prof[max(0, idx - 22):max(1, idx - 2)]
                     in_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 14)]
                     if out_seg.size < 2 or in_seg.size < 2:
                         continue
-                    l_out = float(np.median(out_seg))
+                    l_out = float(np.percentile(out_seg, 85))
                     l_in = float(np.median(in_seg))
                     if l_out < 175.0:
                         continue
@@ -504,6 +504,8 @@ def _detect_light_bed_shadow_edges(
                     if score > best_score:
                         best_score = score
                         best_pos = idx
+                    if is_shadow_valley and ((idx >= int(dim * 0.022) and depth >= 12.0) or depth >= 18.0):
+                        break
             else:
                 lo = max(16, limit_in)
                 hi = dim - 2
@@ -513,11 +515,11 @@ def _detect_light_bed_shadow_edges(
                     val = float(prof[idx])
                     if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
                         continue
-                    out_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 12)]
+                    out_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 22)]
                     in_seg = prof[max(0, idx - 14):max(1, idx - 2)]
                     if out_seg.size < 2 or in_seg.size < 2:
                         continue
-                    l_out = float(np.median(out_seg))
+                    l_out = float(np.percentile(out_seg, 85))
                     l_in = float(np.median(in_seg))
                     if l_out < 175.0:
                         continue
@@ -532,6 +534,8 @@ def _detect_light_bed_shadow_edges(
                     if score > best_score:
                         best_score = score
                         best_pos = idx
+                    if is_shadow_valley and (((dim - idx) >= int(dim * 0.022) and depth >= 12.0) or depth >= 18.0):
+                        break
 
             if best_pos is not None and best_score >= 7.0:
                 hits.append((s_i, best_pos))
@@ -5377,7 +5381,24 @@ def recompute_grades_from_diagnostics(
     else:
         est_psa = est_bgs
 
-    tier_lbl = "Gem Mint" if est_psa >= 10.0 else ("Mint" if est_psa >= 9.0 else ("NM-MT" if est_psa >= 8.0 else "NM"))
+    num_defects = len(active_defects)
+    total_penalty = float(surf_pen + corn_pen + edge_pen)
+    has_heavy_structural = any(str(d.get("type") or "") in ("corner_crease", "edge_tear") for d in active_defects)
+
+    if num_defects >= 1:
+        est_psa = min(est_psa, 9.0)
+        est_bgs = min(est_bgs, 9.5)
+    if num_defects >= 3 or total_penalty >= 1.5:
+        est_psa = min(est_psa, 8.0)
+    if has_heavy_structural or total_penalty >= 2.5:
+        est_psa = min(est_psa, 7.0)
+
+    tier_lbl = (
+        "Gem Mint" if est_psa >= 10.0 else
+        ("Mint" if est_psa >= 9.0 else
+         ("NM-MT" if est_psa >= 8.0 else
+          ("NM" if est_psa >= 7.0 else "EX-MT")))
+    )
     sub_map = {
         "centering": sub_centering,
         "corners": sub_corners,

@@ -295,6 +295,108 @@ def test_corner_softness_and_scratch_lower_grade():
     assert float(pg["Est_PSA"]) < 10.0, pg
 
 
+def test_psa_bgs_grading_ceilings_on_confirmed_defects():
+    from Core.vision_grader import recompute_grades_from_diagnostics
+
+    base_diag = {
+        "centering": {
+            "front": {"lr": "50/50", "tb": "50/50", "lr_left": 50, "lr_right": 50, "tb_top": 50, "tb_bottom": 50, "sub_centering": 10.0},
+            "back": {"lr": "50/50", "tb": "50/50", "lr_left": 50, "lr_right": 50, "tb_top": 50, "tb_bottom": 50, "sub_centering": 10.0},
+        },
+        "raw_confirmed_defects": [],
+        "confirmed_defects": [],
+        "superficial_artifacts": [],
+    }
+    # 1 defect -> Est_PSA <= 9.0, Est_BGS <= 9.5
+    d1 = dict(base_diag, raw_confirmed_defects=[{"id": "f-1", "type": "surface_scratch", "category": "surface", "severity": 0.5, "penalty": 0.5}])
+    g1, _ = recompute_grades_from_diagnostics(d1)
+    assert float(g1["Est_PSA"]) <= 9.0 and float(g1["Est_BGS"]) <= 9.5, g1
+
+    # >= 3 defects or total_penalty >= 1.5 -> Est_PSA <= 8.0
+    d3 = dict(base_diag, raw_confirmed_defects=[
+        {"id": "f-1", "type": "surface_scratch", "category": "surface", "severity": 0.5, "penalty": 0.5},
+        {"id": "f-2", "type": "edge_dent", "category": "edges", "severity": 0.5, "penalty": 0.5},
+        {"id": "f-3", "type": "ink_spot", "category": "surface", "severity": 0.5, "penalty": 0.5},
+    ])
+    g3, _ = recompute_grades_from_diagnostics(d3)
+    assert float(g3["Est_PSA"]) <= 8.0, g3
+
+    # Heavy structural (corner_crease or edge_tear or total_penalty >= 2.5) -> Est_PSA <= 7.0
+    dc = dict(base_diag, raw_confirmed_defects=[{"id": "f-c", "type": "corner_crease", "category": "corners", "severity": 1.5, "penalty": 1.5}])
+    gc, _ = recompute_grades_from_diagnostics(dc)
+    assert float(gc["Est_PSA"]) <= 7.0, gc
+
+
+def test_white_border_edge_silhouette_ding():
+    # White-bordered card on light bed with a localized dark shadow notch on Right edge
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(242, 242, 240), interior_rgb=(120, 145, 175))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    # Subtle drop-shadow bevel around physical card
+    cv2.rectangle(arr, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), (185, 185, 188), 2)
+    # Plant localized dark notch touching outer Right edge at y=500..520
+    cv2.rectangle(arr, (x2 - 12, 500), (x2, 520), (80, 82, 85), -1)
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    edge_dents = [d for d in res["confirmed_defects"] if d["type"] == "edge_dent" and d["category"] == "edges"]
+    assert len(edge_dents) >= 1, res["confirmed_defects"]
+
+
+def test_corner_crease_detection():
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(240, 240, 238), interior_rgb=(240, 240, 238))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    # Diagonal luminance crease across Bot-Right corner zone (slope /)
+    pts = np.array([[x2 - 80, y2 - 6], [x2 - 6, y2 - 80], [x2 - 6, y2 - 6]], dtype=np.int32)
+    cv2.fillPoly(arr, [pts], (216, 216, 214))
+    cv2.line(arr, (x2 - 78, y2 - 8), (x2 - 8, y2 - 78), (195, 195, 193), 2)
+    card_im = Image.fromarray(arr)
+    res = inspect_card_surface_through_sleeve(card_im, f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    creases = [d for d in res["confirmed_defects"] if d["type"] == "corner_crease"]
+    assert len(creases) >= 1, res["confirmed_defects"]
+    assert creases[0]["category"] == "corners" and creases[0]["marker_style"] == "circle" and creases[0]["severity"] >= 1.5
+    pg = estimate_card_pregrade(card_im, f_im, front_box=f_box, back_box=f_box)
+    assert float(pg["Est_PSA"]) <= 7.0, pg
+
+
+def test_edge_foil_peel_tear():
+    # Colored/foil border with bright neutral irregular paper-core tear along bottom 0.5%-5% band
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(70, 130, 195), interior_rgb=(85, 110, 145))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    pts = np.array([[340, y2 - 4], [375, y2 - 28], [405, y2 - 4]], dtype=np.int32)
+    cv2.fillPoly(arr, [pts], (244, 244, 242))
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    tears = [d for d in res["confirmed_defects"] if d["type"] == "edge_tear" and d["category"] == "edges"]
+    assert len(tears) >= 1, res["confirmed_defects"]
+
+
+def test_dark_ink_spot_and_thin_blue_pen_stroke():
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(240, 240, 238), interior_rgb=(140, 150, 160))
+    arr = np.array(f_im)
+    # 1. Isolated compact black ink blob (L* < 45)
+    cv2.circle(arr, (220, 420), 9, (4, 5, 6), -1)
+    # 2. Thin 2-px curved blue pen stroke
+    pen_pts = np.array([[320, 520], [335, 555], [342, 595], [340, 635]], dtype=np.int32)
+    cv2.polylines(arr, [pen_pts], False, (18, 45, 195), 2)
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    types = [d["type"] for d in res["confirmed_defects"]]
+    assert "ink_spot" in types, res["confirmed_defects"]
+    assert "surface_scratch" in types, res["confirmed_defects"]
+    ink = next(d for d in res["confirmed_defects"] if d["type"] == "ink_spot")
+    assert ink["category"] == "surface" and ink["marker_style"] == "circle"
+
+
+def test_white_margin_pink_bleed():
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(244, 244, 244), interior_rgb=(120, 140, 160))
+    arr = np.array(f_im)
+    x1, y1, x2, y2 = f_box
+    # Localized smooth pink ink bleed on right white margin (a* shift >= 8 over >= 200 px^2)
+    cv2.rectangle(arr, (x2 - 26, 420), (x2 - 8, 520), (245, 212, 224), -1)
+    res = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    stains = [d for d in res["confirmed_defects"] if d["type"] == "surface_stain" and d["category"] == "surface"]
+    assert len(stains) >= 1, res["confirmed_defects"]
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")
@@ -318,4 +420,16 @@ if __name__ == "__main__":
     print("[PASS] test_white_border_pinstripes_no_glare_or_streak_explosion")
     test_corner_softness_and_scratch_lower_grade()
     print("[PASS] test_corner_softness_and_scratch_lower_grade")
+    test_psa_bgs_grading_ceilings_on_confirmed_defects()
+    print("[PASS] test_psa_bgs_grading_ceilings_on_confirmed_defects")
+    test_white_border_edge_silhouette_ding()
+    print("[PASS] test_white_border_edge_silhouette_ding")
+    test_corner_crease_detection()
+    print("[PASS] test_corner_crease_detection")
+    test_edge_foil_peel_tear()
+    print("[PASS] test_edge_foil_peel_tear")
+    test_dark_ink_spot_and_thin_blue_pen_stroke()
+    print("[PASS] test_dark_ink_spot_and_thin_blue_pen_stroke")
+    test_white_margin_pink_bleed()
+    print("[PASS] test_white_margin_pink_bleed")
     print("ALL WIN #4 TESTS PASSED")
