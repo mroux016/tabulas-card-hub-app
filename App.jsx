@@ -466,6 +466,173 @@ function renderFormattedChangelog(text) {
   });
 }
 
+function renderRichChangelogBlock(markdownText, fallbackLines = [], sections = null) {
+  const structured = Array.isArray(sections) && sections.length > 0 ? sections : [];
+  if (structured.length > 0) {
+    return (
+      <div className="space-y-2.5">
+        {structured.map((sec, sIdx) => {
+          const h = String(sec?.heading || '').trim();
+          const hLow = h.toLowerCase();
+          const badgeCls = hLow.includes('fix')
+            ? 'text-amber-300 border-amber-700/60 bg-amber-950/50'
+            : hLow.includes('ui') || hLow.includes('workflow')
+            ? 'text-violet-300 border-violet-700/60 bg-violet-950/50'
+            : 'text-sky-300 border-sky-700/60 bg-sky-950/50';
+          const items = Array.isArray(sec?.items) ? sec.items : [];
+          return (
+            <div key={sIdx} className="space-y-1">
+              {h && hLow !== 'highlights' && hLow !== 'release notes' && (
+                <div className={`inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border ${badgeCls}`}>
+                  {h}
+                </div>
+              )}
+              <ul className="list-disc list-inside text-[12px] text-slate-200 space-y-1 leading-relaxed pl-1">
+                {items.map((item, iIdx) => (
+                  <li key={iIdx}>{renderFormattedChangelog(item)}</li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  const raw = String(markdownText || '').replace(/\r\n/g, '\n').trim();
+  if (raw) {
+    const blocks = [];
+    let curHeading = '';
+    let curBullets = [];
+    let curParas = [];
+    const flushBlock = () => {
+      if (curHeading || curBullets.length || curParas.length) {
+        blocks.push({ heading: curHeading, bullets: curBullets, paras: curParas });
+      }
+      curHeading = '';
+      curBullets = [];
+      curParas = [];
+    };
+    raw.split('\n').forEach((line) => {
+      const t = line.trim();
+      if (!t || t === '---') return;
+      const mH = t.match(/^#{2,4}\s+(.+)$/);
+      if (mH) {
+        flushBlock();
+        curHeading = mH[1].trim();
+        return;
+      }
+      const mB = t.match(/^[-*•]\s+(.+)$/);
+      if (mB) {
+        curBullets.push(mB[1].trim());
+        return;
+      }
+      curParas.push(t);
+    });
+    flushBlock();
+
+    if (blocks.length > 0) {
+      return (
+        <div className="space-y-2.5">
+          {blocks.map((blk, bIdx) => {
+            const hLow = blk.heading.toLowerCase();
+            const badgeCls = hLow.includes('fix')
+              ? 'text-amber-300 border-amber-700/60 bg-amber-950/50'
+              : hLow.includes('ui') || hLow.includes('workflow')
+              ? 'text-violet-300 border-violet-700/60 bg-violet-950/50'
+              : 'text-sky-300 border-sky-700/60 bg-sky-950/50';
+            return (
+              <div key={bIdx} className="space-y-1">
+                {blk.heading && (
+                  <div className={`inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border ${badgeCls}`}>
+                    {blk.heading}
+                  </div>
+                )}
+                {blk.paras.map((p, pIdx) => (
+                  <p key={pIdx} className="text-[12px] text-slate-200 leading-relaxed">{renderFormattedChangelog(p)}</p>
+                ))}
+                {blk.bullets.length > 0 && (
+                  <ul className="list-disc list-inside text-[12px] text-slate-200 space-y-1 leading-relaxed pl-1">
+                    {blk.bullets.map((b, iIdx) => (
+                      <li key={iIdx}>{renderFormattedChangelog(b)}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+  }
+
+  const lines = Array.isArray(fallbackLines) ? fallbackLines.filter(Boolean) : [];
+  if (lines.length === 0) return null;
+  return (
+    <ul className="list-disc list-inside text-[12px] text-slate-200 space-y-1 leading-relaxed pl-1">
+      {lines.map((c, i) => <li key={i}>{renderFormattedChangelog(c)}</li>)}
+    </ul>
+  );
+}
+
+function resolveNotificationTargetPage(notif) {
+  if (!notif) return null;
+  const cat = String(notif.Category || '').trim().toLowerCase();
+  const text = `${notif.Category || ''} ${notif.Title || ''} ${notif.Message || ''}`.toLowerCase();
+
+  if (cat === 'updater' || /\b(update|github release|rollback|changelog|restart required|restart recommended)\b/.test(text)) {
+    return { pageId: 'about', label: 'Updates' };
+  }
+  if (cat.includes('grad') || /\b(pre-grade|deep-dive|defect|centering|learned priors|psa|bgs)\b/.test(text)) {
+    return { pageId: 'grading_engine', label: 'Grading' };
+  }
+  if (cat === 'batch' || /\b(batch|scan ingestion|guided review|unprocessed|incoming scan)\b/.test(text)) {
+    return { pageId: 'scan_ingestion', label: 'Batches' };
+  }
+  if (cat === 'sales strategy' || /\b(sales strategy|pricing strategy|recalculation)\b/.test(text)) {
+    return { pageId: 'sales_strategy', label: 'Sales Strategy' };
+  }
+  if (cat.includes('market') || /\b(market comp|valuation|collection value|price spike)\b/.test(text)) {
+    return { pageId: 'collection_value', label: 'Market Value' };
+  }
+  if (cat.includes('listing') || /\b(listing|ebay|draft)\b/.test(text)) {
+    return { pageId: 'listing_writer', label: 'Listings' };
+  }
+  if (cat.includes('sold') || /\bsold card\b/.test(text)) {
+    return { pageId: 'sold_cards', label: 'Sold Cards' };
+  }
+  if (cat === 'bookkeeping' || /\b(expense|bookkeeping)\b/.test(text)) {
+    return { pageId: 'expenses', label: 'Bookkeeping' };
+  }
+  if (cat === 'inventory' || /\b(inventory|sku|rotate|card image)\b/.test(text)) {
+    return { pageId: 'inventory', label: 'Inventory' };
+  }
+  if (cat.includes('label') || /\b(label|thermal|avery)\b/.test(text)) {
+    return { pageId: 'label_hub', label: 'Label Hub' };
+  }
+  if (cat === 'set browser' || /\b(set cart|tracked_sets|tracked queue)\b/.test(text)) {
+    return { pageId: 'set_browser', label: 'Set Browser' };
+  }
+  if (cat.includes('scraper') || cat.includes('checklist') || /\b(tcdb|set library|checklist)\b/.test(text)) {
+    return { pageId: 'checklist_builder', label: 'Set Library' };
+  }
+  if (cat === 'worker' || /\b(worker|slot_|live monitor|job error)\b/.test(text)) {
+    return { pageId: 'live_monitor', label: 'Live Monitor' };
+  }
+  if (cat === 'scheduler' || cat === 'compute' || cat === 'devtools' || cat === 'system' || /\b(maintenance|gpu|settings|logs)\b/.test(text)) {
+    return { pageId: 'general_settings', label: 'Settings' };
+  }
+  return null;
+}
+
+function isRestartNotification(notif) {
+  if (!notif) return false;
+  if (notif.ActionType === 'restart_app') return true;
+  const cat = String(notif.Category || '').trim().toLowerCase();
+  const txt = `${notif.Title || ''} ${notif.Message || ''}`.toLowerCase();
+  return cat === 'updater' && (txt.includes('restart required') || txt.includes('restart recommended') || txt.includes('relaunch tabulas'));
+}
+
 function parseCardIdTier(card) {
   const ocr = Math.round(safeNum(card?.OCR_Confidence, 0));
   const sig = String(card?.OCR_Signals || '');
@@ -3824,6 +3991,33 @@ export default function App() {
   const [showCompsExplorer, setShowCompsExplorer] = useState(false);
   const [compsSearch, setCompsSearch] = useState('');
   const [showRollbackSnapshots, setShowRollbackSnapshots] = useState(false);
+  const [aboutSections, setAboutSections] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('tabulas_about_sections_v1') || '{}');
+      return {
+        githubOta: saved.githubOta !== undefined ? Boolean(saved.githubOta) : true,
+        moduleRegistry: saved.moduleRegistry !== undefined ? Boolean(saved.moduleRegistry) : false,
+        changelogs: saved.changelogs !== undefined ? Boolean(saved.changelogs) : true,
+        ghReleaseNotes: saved.ghReleaseNotes !== undefined ? Boolean(saved.ghReleaseNotes) : true,
+        spaciousChangelog: saved.spaciousChangelog !== undefined ? Boolean(saved.spaciousChangelog) : false,
+      };
+    } catch {
+      return { githubOta: true, moduleRegistry: false, changelogs: true, ghReleaseNotes: true, spaciousChangelog: false };
+    }
+  });
+  const toggleAboutSection = (key) => {
+    setAboutSections((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem('tabulas_about_sections_v1', JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+  const [expandedChangelogVersions, setExpandedChangelogVersions] = useState({});
+  const [changelogSearch, setChangelogSearch] = useState('');
+  const [isRestartingApp, setIsRestartingApp] = useState(false);
+  const [restartStatusMsg, setRestartStatusMsg] = useState('');
+  const [pendingRestartRequired, setPendingRestartRequired] = useState(false);
+  const [copiedNotifId, setCopiedNotifId] = useState('');
   const [showSkinPopover, setShowSkinPopover] = useState(false);
   const [toggledCats, setToggledCats] = useState({});
   const skinPopoverRef = useRef(null);
@@ -4181,17 +4375,18 @@ export default function App() {
       .catch(() => {});
   };
 
-  const pushNotification = (title, message, category = 'System', severity = 'info') => {
+  const pushNotification = (title, message, category = 'System', severity = 'info', extra = {}) => {
     const nowMs = Date.now();
     const id = `NTF-${nowMs}-${Math.floor(Math.random() * 1000)}`;
     const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    const obj = { Notification_ID: id, Timestamp: ts, Category: category, Title: title, Message: message, Severity: severity, Cleared: 'False' };
+    const obj = { Notification_ID: id, Timestamp: ts, Category: category, Title: title, Message: message, Severity: severity, Cleared: 'False', ...extra };
     setActiveToasts((prev) => {
       const nextCount = Math.min(3, prev.length + 1);
       const baseTtl = nextCount >= 3 ? 2000 : nextCount === 2 ? 2800 : 4000;
       const errBonus = nextCount >= 3 ? 1000 : nextCount === 2 ? 1000 : 1200;
-      const newTtl = severity === 'error' ? baseTtl + errBonus : baseTtl;
+      const newTtl = extra?.ActionType === 'restart_app' ? 15000 : (severity === 'error' ? baseTtl + errBonus : baseTtl);
       const acceleratedPrev = prev.map((t) => {
+        if (t.ActionType === 'restart_app') return t;
         const capForT = t.Severity === 'error' ? baseTtl + errBonus : baseTtl;
         const capExp = Math.max(nowMs + 450, (t._createdAt || nowMs) + capForT);
         return { ...t, _expiresAt: Math.min(t._expiresAt || capExp, capExp) };
@@ -4201,6 +4396,103 @@ export default function App() {
     });
     setNotifications((prev) => [obj, ...prev]);
     fetch(`${NODE_API_BASE}/notifications`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) }).catch(() => {});
+  };
+
+  const handleCopyNotification = (notif, e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    if (!notif) return;
+    const formatted = `[${notif.Timestamp || ''}] [${notif.Category || 'System'}] ${notif.Title || ''}\n${notif.Message || ''}`.trim();
+    const markCopied = () => {
+      setCopiedNotifId(notif.Notification_ID || 'copied');
+      setTimeout(() => {
+        setCopiedNotifId((prev) => (prev === (notif.Notification_ID || 'copied') ? '' : prev));
+      }, 1800);
+    };
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(formatted).then(markCopied).catch(() => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = formatted;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+          markCopied();
+        } catch {}
+      });
+    } else {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = formatted;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        markCopied();
+      } catch {}
+    }
+  };
+
+  const handleNavigateFromNotification = (notif) => {
+    const target = resolveNotificationTargetPage(notif);
+    if (!target || !target.pageId) return;
+    setShowNotifPopup(false);
+    setActivePage(target.pageId);
+  };
+
+  const handleRestartApp = (e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    if (isRestartingApp) return;
+    setIsRestartingApp(true);
+    setRestartStatusMsg('Requesting clean server restart...');
+    fetch(`${NODE_API_BASE}/system/restart`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: false }),
+    })
+      .then((r) => r.json().then((data) => ({ status: r.status, data })))
+      .then(({ status, data }) => {
+        if (!data?.success) {
+          setIsRestartingApp(false);
+          setRestartStatusMsg('');
+          pushNotification(
+            status === 409 ? 'Restart Deferred — Job Running' : 'Restart Failed',
+            data?.error || data?.message || 'Unable to restart server right now.',
+            'Updater',
+            'warning'
+          );
+          return;
+        }
+        setRestartStatusMsg('Server restarting... waiting to reconnect');
+        const startedAt = Date.now();
+        const pollReconnect = () => {
+          if (Date.now() - startedAt > 45000) {
+            setIsRestartingApp(false);
+            setRestartStatusMsg('Reconnect timed out — refresh the page manually if needed.');
+            return;
+          }
+          fetch(`${NODE_API_BASE}/updater/config`, { cache: 'no-store' })
+            .then((resp) => {
+              if (resp.ok) {
+                setRestartStatusMsg('Reconnected! Reloading app...');
+                window.location.reload();
+              } else {
+                setTimeout(pollReconnect, 1200);
+              }
+            })
+            .catch(() => setTimeout(pollReconnect, 1200));
+        };
+        setTimeout(pollReconnect, 1500);
+      })
+      .catch((err) => {
+        setIsRestartingApp(false);
+        setRestartStatusMsg('');
+        pushNotification('Restart Request Failed', err?.message || 'Could not contact restart endpoint.', 'Updater', 'error');
+      });
   };
 
   useEffect(() => {
@@ -4931,6 +5223,7 @@ export default function App() {
           pending_count: res.pending_count || 0,
           message: res.message || 'Checked ./Updates.',
           packages: res.all_packages || [],
+          changelog_entries: res.changelog_entries || prev.changelog_entries || [],
           snapshots: res.snapshots || [],
           archived_snapshots_count: res.archived_snapshots_count ?? prev.archived_snapshots_count ?? 0,
         }));
@@ -4945,8 +5238,14 @@ export default function App() {
       .then((res) => {
         if (res.success && res.status === 'UPDATED') {
           if (res.restartRequired) {
-            pushNotification('Updates Applied — App Restart Recommended', `${res.message} Backend server file (launch_tabulas_hub.py) was updated; close and relaunch Tabulas Hub to activate new API routes. Reloading UI in 2.5s...`, 'Updater', 'warning');
-            setTimeout(() => window.location.reload(), 2500);
+            setPendingRestartRequired(true);
+            pushNotification(
+              'Updates Applied — App Restart Recommended',
+              `${res.message} Backend server file (launch_tabulas_hub.py) was updated; click Restart App to activate new API routes.`,
+              'Updater',
+              'warning',
+              { ActionType: 'restart_app' }
+            );
           } else {
             pushNotification('Updates Applied — Reloading App', `${res.message} Reloading in 1.5s...`, 'Updater', 'success');
             setTimeout(() => window.location.reload(), 1500);
@@ -4964,9 +5263,19 @@ export default function App() {
       .then((r) => r.json())
       .then((res) => {
         if (res.success) {
-          const extra = res.restartRequired ? ' Close and relaunch Tabulas Hub to finish reloading server routes.' : '';
-          pushNotification('Rollback Complete — Reloading App', `${res.message}${extra} Reloading in 1.8s...`, 'Updater', 'warning');
-          setTimeout(() => window.location.reload(), 1800);
+          if (res.restartRequired) {
+            setPendingRestartRequired(true);
+            pushNotification(
+              'Rollback Complete — Restart Required',
+              `${res.message} Click Restart App to finish reloading server routes.`,
+              'Updater',
+              'warning',
+              { ActionType: 'restart_app' }
+            );
+          } else {
+            pushNotification('Rollback Complete — Reloading App', `${res.message} Reloading in 1.8s...`, 'Updater', 'warning');
+            setTimeout(() => window.location.reload(), 1800);
+          }
         } else {
           pushNotification('Rollback Failed', res.error || 'Unable to roll back.', 'Updater', 'error');
         }
@@ -5084,11 +5393,16 @@ export default function App() {
       .then((res) => {
         if (res.success) {
           setGhApplyResult(res);
+          setPendingRestartRequired(true);
+          if (Array.isArray(res.changelog_entries)) {
+            setUpdaterInfo((prev) => ({ ...prev, current_version: res.version || prev.current_version, changelog_entries: res.changelog_entries }));
+          }
           pushNotification(
             'GitHub Update Installed — Restart Required',
-            `${res.message || 'Update installed.'} Please restart Tabulas Card Hub to activate all changes.`,
+            `${res.message || 'Update installed.'} Click Restart App to activate all changes.`,
             'Updater',
-            'success'
+            'success',
+            { ActionType: 'restart_app' }
           );
           refreshAllHubData();
         } else {
@@ -5748,6 +6062,11 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {isRestartingApp && (
+              <span className="px-2.5 py-1 rounded-xl bg-amber-950/90 border border-amber-500/70 text-amber-200 text-[11px] font-bold animate-pulse">
+                ⏳ {restartStatusMsg || 'Restarting server...'}
+              </span>
+            )}
             <div ref={notifContainerRef} className="relative">
               <button
                 onClick={() => setShowNotifPopup(!showNotifPopup)}
@@ -5774,16 +6093,55 @@ export default function App() {
                     {notifications.length === 0 ? (
                       <div className="p-4 text-xs text-slate-500 text-center">No active notifications. Archived in Notifications_History.csv.</div>
                     ) : (
-                      notifications.slice(0, 15).map((n) => (
-                        <div key={n.Notification_ID} className="p-2.5 hover:bg-slate-800/50 flex items-start justify-between gap-2 text-xs">
-                          <div className="min-w-0">
-                            <div className="font-bold text-white truncate">{n.Title}</div>
-                            <div className="text-[11px] text-slate-300">{n.Message}</div>
-                            <div className="text-[10px] text-slate-500 font-mono mt-0.5">{n.Timestamp} • {n.Category}</div>
+                      notifications.slice(0, 15).map((n) => {
+                        const navTarget = resolveNotificationTargetPage(n);
+                        const needsRestart = isRestartNotification(n);
+                        const isCopied = copiedNotifId === n.Notification_ID;
+                        return (
+                          <div
+                            key={n.Notification_ID}
+                            onClick={() => navTarget && handleNavigateFromNotification(n)}
+                            title={navTarget ? `Open ${navTarget.label}` : undefined}
+                            className={`p-2.5 hover:bg-slate-800/50 flex items-start justify-between gap-2 text-xs ${navTarget ? 'cursor-pointer' : ''}`}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-bold text-white truncate">{n.Title}</span>
+                                {navTarget && <span className="text-[9.5px] px-1.5 py-0.2 rounded bg-sky-950/70 border border-sky-700/60 text-sky-300 shrink-0">↗ {navTarget.label}</span>}
+                              </div>
+                              <div className="text-[11px] text-slate-300">{n.Message}</div>
+                              <div className="text-[10px] text-slate-500 font-mono mt-0.5">{n.Timestamp} • {n.Category}</div>
+                              {needsRestart && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleRestartApp(e)}
+                                  disabled={isRestartingApp}
+                                  className="mt-1.5 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-[10.5px] font-bold"
+                                >
+                                  {isRestartingApp ? '⏳ Restarting...' : '🔄 Restart App'}
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex flex-col gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => handleCopyNotification(n, e)}
+                                className={`text-[10px] px-1.5 py-0.5 rounded border ${isCopied ? 'bg-emerald-950 border-emerald-600 text-emerald-300' : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'}`}
+                                title="Copy notification"
+                              >
+                                {isCopied ? '✓ Copied' : '📋'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); clearNotification(n.Notification_ID, false); }}
+                                className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400"
+                              >
+                                Clear
+                              </button>
+                            </div>
                           </div>
-                          <button onClick={() => clearNotification(n.Notification_ID, false)} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 shrink-0">Clear</button>
-                        </div>
-                      ))
+                        );
+                      })
                     )}
                   </div>
                 </div>
@@ -5873,13 +6231,43 @@ export default function App() {
                   : t.Severity === 'success'
                   ? 'border-emerald-500/65'
                   : 'border-cyan-500/60';
+              const navTarget = resolveNotificationTargetPage(t);
+              const needsRestart = isRestartNotification(t);
               return (
-                <div key={t.Notification_ID} className={`bg-slate-900/95 border ${sevBorder} shadow-2xl rounded-2xl p-3 flex items-start justify-between gap-3 text-xs backdrop-blur-xl`}>
-                  <div className="min-w-0">
-                    <div className="font-bold text-white">{t.Title}</div>
+                <div
+                  key={t.Notification_ID}
+                  onClick={() => navTarget && handleNavigateFromNotification(t)}
+                  className={`bg-slate-900/95 border ${sevBorder} shadow-2xl rounded-2xl p-3 flex items-start justify-between gap-3 text-xs backdrop-blur-xl ${navTarget ? 'cursor-pointer hover:border-sky-400/70' : ''}`}
+                >
+                  <div className="min-w-0 space-y-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-bold text-white">{t.Title}</span>
+                      {navTarget && <span className="text-[9.5px] px-1.5 py-0.2 rounded bg-sky-950/70 border border-sky-700/60 text-sky-300">↗ {navTarget.label}</span>}
+                    </div>
                     <div className="text-slate-300 text-[11px]">{t.Message}</div>
+                    {needsRestart && (
+                      <div className="pt-1">
+                        <button
+                          type="button"
+                          onClick={(e) => handleRestartApp(e)}
+                          disabled={isRestartingApp}
+                          className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-[11px] font-bold shadow"
+                        >
+                          {isRestartingApp ? `⏳ ${restartStatusMsg || 'Restarting...'}` : '🔄 Restart App Now'}
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <button onClick={() => setActiveToasts((p) => p.filter((x) => x.Notification_ID !== t.Notification_ID))} className="text-slate-400 hover:text-white shrink-0">✖</button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveToasts((p) => p.filter((x) => x.Notification_ID !== t.Notification_ID));
+                    }}
+                    className="text-slate-400 hover:text-white shrink-0"
+                  >
+                    ✖
+                  </button>
                 </div>
               );
             })}
@@ -6651,21 +7039,26 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-5 gap-2.5">
-                        {notifications.slice(0, 5).map((n) => (
-                          <div
-                            key={n.Notification_ID}
-                            className="rounded-xl bg-slate-950/75 border border-slate-800 p-2.5 space-y-1 min-w-0"
-                          >
-                            <div className="flex items-center justify-between gap-1.5 text-[10px]">
-                              <span className={`px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-bold truncate ${skin.accentText}`}>
-                                {n.Category || 'System'}
-                              </span>
-                              <span className="font-mono text-slate-500 shrink-0">{String(n.Timestamp || '').slice(11, 19)}</span>
+                        {notifications.slice(0, 5).map((n) => {
+                          const navTarget = resolveNotificationTargetPage(n);
+                          return (
+                            <div
+                              key={n.Notification_ID}
+                              onClick={() => navTarget && handleNavigateFromNotification(n)}
+                              title={navTarget ? `Open ${navTarget.label}` : undefined}
+                              className={`rounded-xl bg-slate-950/75 border border-slate-800 p-2.5 space-y-1 min-w-0 ${navTarget ? 'cursor-pointer hover:border-sky-600/70 transition' : ''}`}
+                            >
+                              <div className="flex items-center justify-between gap-1.5 text-[10px]">
+                                <span className={`px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-bold truncate ${skin.accentText}`}>
+                                  {n.Category || 'System'}
+                                </span>
+                                <span className="font-mono text-slate-500 shrink-0">{String(n.Timestamp || '').slice(11, 19)}</span>
+                              </div>
+                              <div className="text-xs font-bold text-white truncate" title={n.Title}>{n.Title}</div>
+                              <div className="text-[11px] text-slate-400 line-clamp-2" title={n.Message}>{n.Message}</div>
                             </div>
-                            <div className="text-xs font-bold text-white truncate" title={n.Title}>{n.Title}</div>
-                            <div className="text-[11px] text-slate-400 line-clamp-2" title={n.Message}>{n.Message}</div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -12204,8 +12597,33 @@ export default function App() {
             })()}
 
             {/* 23. CHECK FOR UPDATES */}
-            {activePage === 'about' && (
-              <div className={`flex-1 flex flex-col min-h-0 gap-4 ${skin.cardBg} border ${skin.border} rounded-2xl p-5`}>
+            {activePage === 'about' && (() => {
+              const rawEntries = Array.isArray(updaterInfo.changelog_entries) && updaterInfo.changelog_entries.length > 0
+                ? updaterInfo.changelog_entries
+                : [...(updaterInfo.packages || [])].reverse();
+              const clQuery = changelogSearch.trim().toLowerCase();
+              const filteredChangelogEntries = clQuery
+                ? rawEntries.filter((ent) => {
+                    const hay = `${ent.version || ''} ${ent.title || ''} ${ent.changelog_md || ''} ${(ent.changelog || []).join(' ')}`.toLowerCase();
+                    return hay.includes(clQuery);
+                  })
+                : rawEntries;
+              const isEntryExpanded = (verKey, idx) => {
+                if (expandedChangelogVersions[verKey] !== undefined) return Boolean(expandedChangelogVersions[verKey]);
+                return idx < 2;
+              };
+              const setAllChangelogExpanded = (openState) => {
+                const next = {};
+                filteredChangelogEntries.forEach((ent, idx) => {
+                  const k = String(ent.version || ent.package_file || idx);
+                  next[k] = openState;
+                });
+                setExpandedChangelogVersions(next);
+              };
+              const moduleUpdatesCount = moduleList.filter((m) => String(m['New Version'] || '').trim() || String(m.Status || '').includes('Update Available')).length;
+
+              return (
+              <div className={`flex-1 flex flex-col min-h-0 overflow-y-auto gap-3.5 ${skin.cardBg} border ${skin.border} rounded-2xl p-5`}>
                 <div className="flex flex-wrap items-center justify-between gap-3 shrink-0">
                   <div>
                     <h2 className="text-base font-bold text-white">🔄 Check for Updates — Tabulas Card Hub v{updaterInfo.current_version || APP_VERSION}</h2>
@@ -12222,6 +12640,27 @@ export default function App() {
                     <button onClick={handleApplyPendingUpdates} disabled={!updaterInfo.pending_count} className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs shadow">🚀 Apply Pending Updates ({updaterInfo.pending_count || 0}) &amp; Reload App</button>
                   </div>
                 </div>
+
+                {(pendingRestartRequired || isRestartingApp) && (
+                  <div className="p-3.5 rounded-xl bg-emerald-950/85 border border-emerald-500/70 text-emerald-100 text-xs flex flex-wrap items-center justify-between gap-3 shrink-0">
+                    <div>
+                      <div className="font-bold text-sm">🔄 Restart Required to Activate Updated Server &amp; UI</div>
+                      <div className="text-[11px] text-emerald-200">
+                        {isRestartingApp
+                          ? (restartStatusMsg || 'Restarting Tabulas Card Hub server...')
+                          : 'Updates have been installed on disk. Click Restart App to cleanly reboot the local server and reload.'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => handleRestartApp(e)}
+                      disabled={isRestartingApp}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold shadow"
+                    >
+                      {isRestartingApp ? '⏳ Restarting...' : '🔄 Restart App Now'}
+                    </button>
+                  </div>
+                )}
 
                 {showRollbackSnapshots && (
                   <div className="bg-slate-950 border border-amber-500/40 rounded-xl p-3.5 space-y-2 max-h-60 overflow-y-auto shrink-0">
@@ -12288,18 +12727,32 @@ export default function App() {
 
                 <div className="bg-slate-950 border border-sky-500/30 rounded-xl p-3.5 space-y-3 shrink-0">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <div className="text-xs font-bold text-sky-400 uppercase">🐙 GitHub Releases (Remote OTA Updater)</div>
-                      <div className="text-[11px] text-slate-400">Check &amp; install verified release zips with SHA-256 verification and pre-update backups. Local <span className="font-mono">Updates\*.txt</span> remains available above.</div>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => toggleAboutSection('githubOta')}
+                      className="flex items-center gap-2 text-left group"
+                    >
+                      <span className="text-xs text-sky-400">{aboutSections.githubOta ? '▼' : '▶'}</span>
+                      <div>
+                        <div className="text-xs font-bold text-sky-400 uppercase group-hover:text-sky-300">
+                          🐙 GitHub Releases (Remote OTA Updater)
+                          {ghConfig.repo && <span className="ml-2 font-mono text-[10.5px] text-slate-400 normal-case">({ghConfig.repo} • {ghConfig.channel})</span>}
+                        </div>
+                        {aboutSections.githubOta && (
+                          <div className="text-[11px] text-slate-400">Check &amp; install verified release zips with SHA-256 verification and pre-update backups. Local <span className="font-mono">Updates\*.txt</span> remains available above.</div>
+                        )}
+                      </div>
+                    </button>
                     <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => handleSaveGithubUpdaterConfig(false)}
-                        disabled={ghConfigSaving}
-                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-xs font-semibold disabled:opacity-50"
-                      >
-                        {ghConfigSaving ? '💾 Saving...' : '💾 Save Config'}
-                      </button>
+                      {aboutSections.githubOta && (
+                        <button
+                          onClick={() => handleSaveGithubUpdaterConfig(false)}
+                          disabled={ghConfigSaving}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-xs font-semibold disabled:opacity-50"
+                        >
+                          {ghConfigSaving ? '💾 Saving...' : '💾 Save Config'}
+                        </button>
+                      )}
                       <button
                         onClick={handleCheckGithubReleases}
                         disabled={ghChecking || !ghConfig.repo.trim()}
@@ -12310,110 +12763,133 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
-                    <div>
-                      <label className="block text-[10.5px] text-slate-400 mb-1">Repository (<span className="font-mono">owner/repo</span>)</label>
-                      <input
-                        type="text"
-                        value={ghConfig.repo}
-                        onChange={(e) => setGhConfig((prev) => ({ ...prev, repo: e.target.value }))}
-                        placeholder="e.g. myorg/tabulas-card-hub"
-                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[10.5px] text-slate-400 mb-1">Release Channel</label>
-                      <select
-                        value={ghConfig.channel}
-                        onChange={(e) => setGhConfig((prev) => ({ ...prev, channel: e.target.value }))}
-                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 text-xs"
-                      >
-                        <option value="beta">Beta (Pre-releases &amp; Stable)</option>
-                        <option value="stable">Stable (Latest Non-Pre-release)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[10.5px] text-slate-400 mb-1">
-                        GitHub Token (optional{ghConfig.hasToken ? ` • Saved ${ghConfig.maskedToken}` : ''})
-                      </label>
-                      <div className="flex gap-1.5">
-                        <input
-                          type="password"
-                          value={ghConfig.tokenInput}
-                          onChange={(e) => setGhConfig((prev) => ({ ...prev, tokenInput: e.target.value }))}
-                          placeholder={ghConfig.hasToken ? ghConfig.maskedToken || '••••••••' : 'ghp_... (for private repos)'}
-                          className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
-                        />
-                        {ghConfig.hasToken && (
+                  {aboutSections.githubOta && (
+                    <div className="space-y-3">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+                        <div>
+                          <label className="block text-[10.5px] text-slate-400 mb-1">Repository (<span className="font-mono">owner/repo</span>)</label>
+                          <input
+                            type="text"
+                            value={ghConfig.repo}
+                            onChange={(e) => setGhConfig((prev) => ({ ...prev, repo: e.target.value }))}
+                            placeholder="e.g. myorg/tabulas-card-hub"
+                            className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10.5px] text-slate-400 mb-1">Release Channel</label>
+                          <select
+                            value={ghConfig.channel}
+                            onChange={(e) => setGhConfig((prev) => ({ ...prev, channel: e.target.value }))}
+                            className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 text-xs"
+                          >
+                            <option value="beta">Beta (Pre-releases &amp; Stable)</option>
+                            <option value="stable">Stable (Latest Non-Pre-release)</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-[10.5px] text-slate-400 mb-1">
+                            GitHub Token (optional{ghConfig.hasToken ? ` • Saved ${ghConfig.maskedToken}` : ''})
+                          </label>
+                          <div className="flex gap-1.5">
+                            <input
+                              type="password"
+                              value={ghConfig.tokenInput}
+                              onChange={(e) => setGhConfig((prev) => ({ ...prev, tokenInput: e.target.value }))}
+                              placeholder={ghConfig.hasToken ? ghConfig.maskedToken || '••••••••' : 'ghp_... (for private repos)'}
+                              className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                            />
+                            {ghConfig.hasToken && (
+                              <button
+                                type="button"
+                                onClick={() => handleSaveGithubUpdaterConfig(true)}
+                                className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 text-slate-300 hover:text-rose-200 text-[11px]"
+                                title="Clear saved token"
+                              >
+                                Clear
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {ghError && (
+                        <div className="p-2.5 rounded-lg bg-rose-950/70 border border-rose-600/60 text-rose-200 text-xs">
+                          ⚠️ {ghError}
+                        </div>
+                      )}
+
+                      {ghApplyResult?.success && (
+                        <div className="p-3 rounded-lg bg-emerald-950/80 border border-emerald-500/70 text-emerald-100 text-xs flex flex-wrap items-center justify-between gap-2">
+                          <div className="space-y-1">
+                            <div className="font-bold">✅ {ghApplyResult.message}</div>
+                            <div className="text-[11px] text-emerald-200">
+                              Restart Required: Click Restart App to activate all updated backend &amp; UI files.
+                              {ghApplyResult.requirementsChanged && (
+                                <span className="ml-1 font-semibold text-amber-300">
+                                  (requirements.txt changed — run pip install -r requirements.txt before restarting.)
+                                </span>
+                              )}
+                            </div>
+                          </div>
                           <button
                             type="button"
-                            onClick={() => handleSaveGithubUpdaterConfig(true)}
-                            className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 text-slate-300 hover:text-rose-200 text-[11px]"
-                            title="Clear saved token"
+                            onClick={(e) => handleRestartApp(e)}
+                            disabled={isRestartingApp}
+                            className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold shadow"
                           >
-                            Clear
+                            {isRestartingApp ? '⏳ Restarting...' : '🔄 Restart App Now'}
                           </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
+                        </div>
+                      )}
 
-                  {ghError && (
-                    <div className="p-2.5 rounded-lg bg-rose-950/70 border border-rose-600/60 text-rose-200 text-xs">
-                      ⚠️ {ghError}
-                    </div>
-                  )}
-
-                  {ghApplyResult?.success && (
-                    <div className="p-3 rounded-lg bg-emerald-950/80 border border-emerald-500/70 text-emerald-100 text-xs space-y-1">
-                      <div className="font-bold">✅ {ghApplyResult.message}</div>
-                      <div className="text-[11px] text-emerald-200">
-                        Restart Required: Close and relaunch Tabulas Card Hub to activate all updated backend &amp; UI files.
-                        {ghApplyResult.requirementsChanged && (
-                          <span className="ml-1 font-semibold text-amber-300">
-                            (requirements.txt changed — run pip install -r requirements.txt before restarting.)
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {ghReleaseInfo && (
-                    <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-700 space-y-2 text-xs">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-bold text-white">{ghReleaseInfo.release_name || ghReleaseInfo.tag_name}</span>
-                          <span className="font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300 text-[11px]">v{ghReleaseInfo.latest_version}</span>
-                          {ghReleaseInfo.is_prerelease && (
-                            <span className="px-1.5 py-0.5 rounded bg-amber-950 border border-amber-600/60 text-amber-200 text-[10px] font-semibold">Pre-release</span>
-                          )}
-                          {ghReleaseInfo.update_available ? (
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-600/60 text-emerald-300 text-[10px] font-bold">🆕 Update Available</span>
-                          ) : (
-                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px]">🟢 Up to Date</span>
+                      {ghReleaseInfo && (
+                        <div className="p-3.5 rounded-lg bg-slate-900/90 border border-slate-700 space-y-2.5 text-xs">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-white">{ghReleaseInfo.release_name || ghReleaseInfo.tag_name}</span>
+                              <span className="font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300 text-[11px]">v{ghReleaseInfo.latest_version}</span>
+                              {ghReleaseInfo.is_prerelease && (
+                                <span className="px-1.5 py-0.5 rounded bg-amber-950 border border-amber-600/60 text-amber-200 text-[10px] font-semibold">Pre-release</span>
+                              )}
+                              {ghReleaseInfo.update_available ? (
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-600/60 text-emerald-300 text-[10px] font-bold">🆕 Update Available</span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px]">🟢 Up to Date</span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {(ghReleaseInfo.changelog_md || (ghReleaseInfo.changelog || []).length > 0) && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleAboutSection('ghReleaseNotes')}
+                                  className="px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] text-slate-200"
+                                >
+                                  {aboutSections.ghReleaseNotes ? '▲ Collapse Notes' : '▼ Expand Notes'}
+                                </button>
+                              )}
+                              {ghReleaseInfo.html_url && (
+                                <a href={ghReleaseInfo.html_url} target="_blank" rel="noreferrer" className="text-[11px] text-sky-400 hover:underline">
+                                  View on GitHub ↗
+                                </a>
+                              )}
+                              {ghReleaseInfo.update_available && ghReleaseInfo.zip_asset_api_url && (
+                                <button
+                                  onClick={handleApplyGithubRelease}
+                                  disabled={ghApplying}
+                                  className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold shadow"
+                                >
+                                  {ghApplying ? '⏳ Installing Update...' : '⬇️ Download & Install Update'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          {aboutSections.ghReleaseNotes && (ghReleaseInfo.changelog_md || (ghReleaseInfo.changelog || []).length > 0) && (
+                            <div className="max-h-[420px] overflow-y-auto bg-slate-950/90 border border-slate-800 rounded-lg p-3.5">
+                              {renderRichChangelogBlock(ghReleaseInfo.changelog_md, ghReleaseInfo.changelog, ghReleaseInfo.changelog_sections)}
+                            </div>
                           )}
                         </div>
-                        <div className="flex items-center gap-2">
-                          {ghReleaseInfo.html_url && (
-                            <a href={ghReleaseInfo.html_url} target="_blank" rel="noreferrer" className="text-[11px] text-sky-400 hover:underline">
-                              View on GitHub ↗
-                            </a>
-                          )}
-                          {ghReleaseInfo.update_available && ghReleaseInfo.zip_asset_api_url && (
-                            <button
-                              onClick={handleApplyGithubRelease}
-                              disabled={ghApplying}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold shadow"
-                            >
-                              {ghApplying ? '⏳ Installing Update...' : '⬇️ Download & Install Update'}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      {ghReleaseInfo.changelog_md && (
-                        <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap font-sans text-[11px] text-slate-300 bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 leading-relaxed">
-                          {ghReleaseInfo.changelog_md}
-                        </pre>
                       )}
                     </div>
                   )}
@@ -12421,93 +12897,188 @@ export default function App() {
 
                 {moduleList.length > 0 && (
                   <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2 shrink-0">
-                    <div className="flex items-center justify-between">
-                      <div className="text-xs font-bold text-emerald-400 uppercase">🧩 Installed Module Registry ({moduleList.length} Modules)</div>
-                      {moduleList.some((m) => m['New Version']) && (
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-950/90 border border-amber-500/70 text-amber-200">
-                          🆕 {moduleList.filter((m) => m['New Version']).length} Module Update(s) Available
+                    <div className="flex items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() => toggleAboutSection('moduleRegistry')}
+                        className="flex items-center gap-2 text-left group"
+                      >
+                        <span className="text-xs text-emerald-400">{aboutSections.moduleRegistry ? '▼' : '▶'}</span>
+                        <span className="text-xs font-bold text-emerald-400 uppercase group-hover:text-emerald-300">
+                          🧩 Installed Module Registry ({moduleList.length} Modules)
                         </span>
-                      )}
+                      </button>
+                      <div className="flex items-center gap-2">
+                        {moduleUpdatesCount > 0 && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-950/90 border border-amber-500/70 text-amber-200">
+                            🆕 {moduleUpdatesCount} Module Update(s) Available
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => toggleAboutSection('moduleRegistry')}
+                          className="text-[11px] text-slate-400 hover:text-white"
+                        >
+                          {aboutSections.moduleRegistry ? 'Collapse' : 'Expand'}
+                        </button>
+                      </div>
                     </div>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-[11px] whitespace-nowrap">
-                        <thead className="text-slate-400 border-b border-slate-800">
-                          <tr>
-                            <th className="p-1.5">Module</th>
-                            <th className="p-1.5">Role</th>
-                            <th className="p-1.5">Current Version</th>
-                            <th className="p-1.5">New Version</th>
-                            <th className="p-1.5">Last Modified</th>
-                            <th className="p-1.5">Size</th>
-                            <th className="p-1.5">Status</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800/70">
-                          {moduleList.map((m, i) => {
-                            const newVer = String(m['New Version'] || '').trim();
-                            const hasUpd = Boolean(newVer) || String(m.Status || '').includes('Update Available');
-                            const isMissing = String(m.Status || '').includes('Missing');
-                            return (
-                              <tr key={i} className={hasUpd ? 'bg-amber-950/20' : ''}>
-                                <td className="p-1.5 font-mono text-sky-300 font-semibold">{m.Module}</td>
-                                <td className="p-1.5 text-slate-300">{m['Component Role']}</td>
-                                <td className="p-1.5 font-mono text-emerald-300">{m['Disk Version'] ? `v${String(m['Disk Version']).replace(/^v/i, '')}` : '—'}</td>
-                                <td className="p-1.5 font-mono">
-                                  {newVer ? (
-                                    <span className="px-1.5 py-0.5 rounded-md bg-amber-950/90 border border-amber-500/70 text-amber-200 font-bold">
-                                      v{newVer.replace(/^v/i, '')}
-                                    </span>
-                                  ) : (
-                                    <span className="text-slate-600">—</span>
-                                  )}
-                                </td>
-                                <td className="p-1.5 font-mono text-slate-400">{m['Disk Last Modified']}</td>
-                                <td className="p-1.5 font-mono text-slate-400">{m.Size}</td>
-                                <td className="p-1.5">
-                                  {hasUpd ? (
-                                    <span className="px-2 py-0.5 rounded-full bg-amber-950/90 border border-amber-500/70 text-amber-200 text-[10px] font-bold">
-                                      🆕 Update Available
-                                    </span>
-                                  ) : isMissing ? (
-                                    <span className="px-2 py-0.5 rounded-full bg-rose-950/90 border border-rose-600/70 text-rose-200 text-[10px] font-bold">
-                                      ❌ Missing
-                                    </span>
-                                  ) : (
-                                    <span className="px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-[10px] font-semibold">
-                                      🟢 Current
-                                    </span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
+                    {aboutSections.moduleRegistry && (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-[11px] whitespace-nowrap">
+                          <thead className="text-slate-400 border-b border-slate-800">
+                            <tr>
+                              <th className="p-1.5">Module</th>
+                              <th className="p-1.5">Role</th>
+                              <th className="p-1.5">Current Version</th>
+                              <th className="p-1.5">New Version</th>
+                              <th className="p-1.5">Last Modified</th>
+                              <th className="p-1.5">Size</th>
+                              <th className="p-1.5">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/70">
+                            {moduleList.map((m, i) => {
+                              const newVer = String(m['New Version'] || '').trim();
+                              const hasUpd = Boolean(newVer) || String(m.Status || '').includes('Update Available');
+                              const isMissing = String(m.Status || '').includes('Missing');
+                              return (
+                                <tr key={i} className={hasUpd ? 'bg-amber-950/20' : ''}>
+                                  <td className="p-1.5 font-mono text-sky-300 font-semibold">{m.Module}</td>
+                                  <td className="p-1.5 text-slate-300">{m['Component Role']}</td>
+                                  <td className="p-1.5 font-mono text-emerald-300">{m['Disk Version'] ? `v${String(m['Disk Version']).replace(/^v/i, '')}` : '—'}</td>
+                                  <td className="p-1.5 font-mono">
+                                    {newVer ? (
+                                      <span className="px-1.5 py-0.5 rounded-md bg-amber-950/90 border border-amber-500/70 text-amber-200 font-bold">
+                                        v{newVer.replace(/^v/i, '')}
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-600">—</span>
+                                    )}
+                                  </td>
+                                  <td className="p-1.5 font-mono text-slate-400">{m['Disk Last Modified']}</td>
+                                  <td className="p-1.5 font-mono text-slate-400">{m.Size}</td>
+                                  <td className="p-1.5">
+                                    {hasUpd ? (
+                                      <span className="px-2 py-0.5 rounded-full bg-amber-950/90 border border-amber-500/70 text-amber-200 text-[10px] font-bold">
+                                        🆕 Update Available
+                                      </span>
+                                    ) : isMissing ? (
+                                      <span className="px-2 py-0.5 rounded-full bg-rose-950/90 border border-rose-600/70 text-rose-200 text-[10px] font-bold">
+                                        ❌ Missing
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-[10px] font-semibold">
+                                        🟢 Current
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
                 )}
 
-                <div className="flex-1 min-h-0 flex flex-col bg-slate-950 border border-slate-800 rounded-xl p-3.5 gap-2">
-                  <div className="flex items-center justify-between shrink-0">
-                    <div className="text-xs font-bold text-sky-400 uppercase">Changelogs</div>
-                    <span className="text-[10.5px] font-mono text-slate-500">{(updaterInfo.packages || []).length} release(s) • newest first</span>
-                  </div>
-                  <div className="flex-1 min-h-0 overflow-y-auto space-y-2.5 pr-1">
-                    {[...(updaterInfo.packages || [])].reverse().map((pkg) => (
-                      <div key={pkg.package_file} className="border-b border-slate-800 pb-2.5 text-xs">
-                        <div className="flex flex-wrap justify-between gap-2 font-semibold text-white">
-                          <span>v{pkg.version} — {renderFormattedChangelog(pkg.title)} {pkg.is_rolled_back ? '(ROLLED BACK)' : ''}</span>
-                          <span className="font-mono text-[10px] text-slate-400">{pkg.timestamp}</span>
-                        </div>
-                        <ul className="list-disc list-inside text-[11px] text-slate-300 mt-1 space-y-0.5 leading-relaxed">
-                          {(pkg.changelog || []).map((c, i) => <li key={i}>{renderFormattedChangelog(c)}</li>)}
-                        </ul>
+                <div className={`flex flex-col bg-slate-950 border border-slate-800 rounded-xl p-4 gap-3 ${aboutSections.changelogs ? (aboutSections.spaciousChangelog ? 'min-h-[620px]' : 'flex-1 min-h-[360px]') : 'shrink-0'}`}>
+                  <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => toggleAboutSection('changelogs')}
+                      className="flex items-center gap-2 text-left group"
+                    >
+                      <span className="text-xs text-sky-400">{aboutSections.changelogs ? '▼' : '▶'}</span>
+                      <span className="text-xs font-bold text-sky-400 uppercase group-hover:text-sky-300">
+                        📜 Changelogs &amp; Release Notes ({filteredChangelogEntries.length} Release{filteredChangelogEntries.length === 1 ? '' : 's'})
+                      </span>
+                    </button>
+                    {aboutSections.changelogs && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          type="text"
+                          value={changelogSearch}
+                          onChange={(e) => setChangelogSearch(e.target.value)}
+                          placeholder="Filter releases..."
+                          className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 text-[11px] w-44"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setAllChangelogExpanded(true)}
+                          className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-300"
+                        >
+                          Expand All
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAllChangelogExpanded(false)}
+                          className="px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-300"
+                        >
+                          Collapse All
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => toggleAboutSection('spaciousChangelog')}
+                          className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold ${aboutSections.spaciousChangelog ? 'bg-sky-950 border-sky-600 text-sky-200' : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300'}`}
+                        >
+                          {aboutSections.spaciousChangelog ? '⤢ Compact Reader' : '⤢ Spacious Reader'}
+                        </button>
                       </div>
-                    ))}
+                    )}
                   </div>
+                  {aboutSections.changelogs && (
+                    <div className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-1">
+                      {filteredChangelogEntries.length === 0 ? (
+                        <div className="text-xs text-slate-500 py-6 text-center">No changelog entries match your filter.</div>
+                      ) : (
+                        filteredChangelogEntries.map((ent, idx) => {
+                          const verKey = String(ent.version || ent.package_file || idx);
+                          const isOpen = isEntryExpanded(verKey, idx);
+                          const srcLabel = ent.source === 'github_release'
+                            ? 'GitHub Release'
+                            : ent.source === 'changelog_md'
+                            ? 'Release Notes'
+                            : 'Local Package';
+                          return (
+                            <div key={verKey} className="rounded-xl bg-slate-900/65 border border-slate-800 overflow-hidden">
+                              <button
+                                type="button"
+                                onClick={() => setExpandedChangelogVersions((prev) => ({ ...prev, [verKey]: !isOpen }))}
+                                className="w-full px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-left hover:bg-slate-800/40 transition"
+                              >
+                                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                  <span className="text-xs text-sky-400">{isOpen ? '▼' : '▶'}</span>
+                                  <span className="font-mono font-bold text-sm text-white">v{ent.version}</span>
+                                  {ent.is_current && (
+                                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700 font-bold">CURRENT</span>
+                                  )}
+                                  {ent.is_rolled_back && (
+                                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-700 font-bold">ROLLED BACK</span>
+                                  )}
+                                  <span className="text-xs font-semibold text-slate-200 truncate">{renderFormattedChangelog(ent.title)}</span>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300">{srcLabel}</span>
+                                  <span className="font-mono text-[10.5px] text-slate-400">{ent.date || ent.timestamp || ''}</span>
+                                </div>
+                              </button>
+                              {isOpen && (
+                                <div className="px-4 pb-3.5 pt-2 border-t border-slate-800/80 bg-slate-950/50">
+                                  {renderRichChangelogBlock(ent.changelog_md, ent.changelog, ent.sections)}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
-            )}
+              );
+            })()}
 
             {/* 25. FULL NOTIFICATION HISTORY */}
             {activePage === 'notification_history' && (
@@ -12515,7 +13086,7 @@ export default function App() {
                 <div className="flex items-center justify-between shrink-0">
                   <div>
                     <h2 className="text-sm font-bold text-white">🔔 Full Notification History ({notifications.length} Visible)</h2>
-                    <p className="text-xs text-slate-400">Clearing hides items in the UI while permanently preserving them in Inventory\Notifications_History.csv.</p>
+                    <p className="text-xs text-slate-400">Click any notification to jump to its workspace. Clearing hides items in the UI while permanently preserving them in Inventory\Notifications_History.csv.</p>
                   </div>
                   {notifications.length > 0 && (
                     <button onClick={() => clearNotification('', true)} className="px-3 py-1.5 rounded-xl bg-amber-950 hover:bg-amber-800 text-amber-200 border border-amber-700 text-xs font-semibold">🧹 Clear All Visible</button>
@@ -12523,17 +13094,65 @@ export default function App() {
                 </div>
                 <div className="flex-1 min-h-0 overflow-auto border border-slate-800 rounded-xl">
                   <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-950 text-slate-400 sticky top-0"><tr><th className="p-2">Timestamp</th><th className="p-2">Category</th><th className="p-2">Title</th><th className="p-2">Message</th><th className="p-2">Action</th></tr></thead>
+                    <thead className="bg-slate-950 text-slate-400 sticky top-0"><tr><th className="p-2">Timestamp</th><th className="p-2">Category</th><th className="p-2">Title</th><th className="p-2">Message</th><th className="p-2 text-right">Actions</th></tr></thead>
                     <tbody className="divide-y divide-slate-800">
-                      {notifications.map((n) => (
-                        <tr key={n.Notification_ID} className="hover:bg-slate-800/40">
-                          <td className="p-2 font-mono text-slate-400">{n.Timestamp}</td>
-                          <td className="p-2">{n.Category}</td>
-                          <td className="p-2 font-bold text-white">{n.Title}</td>
-                          <td className="p-2 text-slate-300">{n.Message}</td>
-                          <td className="p-2"><button onClick={() => clearNotification(n.Notification_ID, false)} className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">Clear</button></td>
-                        </tr>
-                      ))}
+                      {notifications.map((n) => {
+                        const navTarget = resolveNotificationTargetPage(n);
+                        const needsRestart = isRestartNotification(n);
+                        const isCopied = copiedNotifId === n.Notification_ID;
+                        return (
+                          <tr
+                            key={n.Notification_ID}
+                            onClick={() => navTarget && handleNavigateFromNotification(n)}
+                            title={navTarget ? `Open ${navTarget.label}` : undefined}
+                            className={`hover:bg-slate-800/40 transition ${navTarget ? 'cursor-pointer' : ''}`}
+                          >
+                            <td className="p-2 font-mono text-slate-400 whitespace-nowrap">{n.Timestamp}</td>
+                            <td className="p-2 whitespace-nowrap">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]">{n.Category}</span>
+                            </td>
+                            <td className="p-2 font-bold text-white">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span>{n.Title}</span>
+                                {navTarget && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-950/70 border border-sky-700/60 text-sky-300 font-semibold">
+                                    ↗ {navTarget.label}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="p-2 text-slate-300">{n.Message}</td>
+                            <td className="p-2 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center gap-1.5">
+                                {needsRestart && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleRestartApp(e)}
+                                    disabled={isRestartingApp}
+                                    className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-[11px] font-bold"
+                                  >
+                                    {isRestartingApp ? '⏳...' : '🔄 Restart App'}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleCopyNotification(n, e)}
+                                  className={`px-2 py-0.5 rounded border text-[11px] font-semibold ${isCopied ? 'bg-emerald-950 border-emerald-600 text-emerald-300' : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'}`}
+                                >
+                                  {isCopied ? '✓ Copied' : '📋 Copy'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); clearNotification(n.Notification_ID, false); }}
+                                  className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                                >
+                                  Clear
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

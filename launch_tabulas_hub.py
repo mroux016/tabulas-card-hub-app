@@ -22,10 +22,111 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+_ACTIVE_HTTP_SERVER = None
+_ACTIVE_SERVER_PORT = 5000
+_ACTIVE_FORCE_BROWSER = False
+_RESTART_LOCK = threading.Lock()
+_RESTART_IN_PROGRESS = False
+
+
+def request_clean_server_restart(
+    *,
+    force: bool = False,
+    busy_checker=None,
+    spawn_fn=None,
+    exit_fn=None,
+    delay_seconds: float = 0.6,
+) -> dict:
+    """
+    Triggers a clean self-restart of the Tabulas Card Hub server, respecting active
+    worker pool locks unless `force=True`.
+    """
+    global _RESTART_IN_PROGRESS
+    from Core.maintenance_scheduler import is_worker_pool_busy
+
+    if not force:
+        checker = busy_checker or is_worker_pool_busy
+        busy_res = checker()
+        if isinstance(busy_res, tuple):
+            is_busy, busy_reason = bool(busy_res[0]), str(busy_res[1] or "")
+        else:
+            is_busy, busy_reason = bool(busy_res), ""
+        if is_busy:
+            return {
+                "ok": False,
+                "success": False,
+                "aborted": True,
+                "reason": "worker_pool_busy",
+                "error": f"Cannot restart while a background job is running ({busy_reason or 'active worker slot'}).",
+            }
+
+    with _RESTART_LOCK:
+        if _RESTART_IN_PROGRESS:
+            return {
+                "ok": True,
+                "success": True,
+                "restarting": True,
+                "message": "Server restart is already in progress...",
+            }
+        _RESTART_IN_PROGRESS = True
+
+    port = int(_ACTIVE_SERVER_PORT or os.environ.get("TABULAS_PORT", 5000) or 5000)
+    force_browser = bool(_ACTIVE_FORCE_BROWSER)
+    script_path = str(Path(__file__).resolve())
+
+    def _default_spawn():
+        cmd = [sys.executable, script_path, "--port", str(port), "--no-open"]
+        if force_browser:
+            cmd.append("--browser")
+        kwargs: dict = {
+            "cwd": str(HUB_DIR),
+            "close_fds": True,
+        }
+        create_new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if create_new_group:
+            kwargs["creationflags"] = create_new_group
+        subprocess.Popen(cmd, **kwargs)
+
+    do_spawn = spawn_fn or _default_spawn
+    do_exit = exit_fn or (lambda: os._exit(0))
+
+    def _restart_worker():
+        try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            srv = _ACTIVE_HTTP_SERVER
+            if srv is not None:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+            do_spawn()
+        finally:
+            do_exit()
+
+    t = threading.Thread(target=_restart_worker, daemon=True, name="tabulas-clean-restart")
+    t.start()
+    return {
+        "ok": True,
+        "success": True,
+        "restarting": True,
+        "message": "Restarting Tabulas Card Hub server...",
+    }
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
 HUB_DIR = Path(os.environ.get("CARDS_BASE_DIR", r"C:\Tabulas Card Hub"))
 for _sp in (HUB_DIR / "App", HUB_DIR):
     if _sp.exists() and str(_sp) not in sys.path:
         sys.path.insert(0, str(_sp))
+if str(_SCRIPT_DIR) not in sys.path or sys.path[0] != str(_SCRIPT_DIR):
+    if str(_SCRIPT_DIR) in sys.path:
+        sys.path.remove(str(_SCRIPT_DIR))
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 from Core.config import (
     APP_DIR,
@@ -1049,6 +1150,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     "pending_count": upd_check.get("pending_count", 0),
                     "message": upd_check.get("message", ""),
                     "packages": upd_check.get("all_packages", []),
+                    "changelog_entries": updater.get_unified_changelog_history(),
                     "snapshots": updater.list_available_rollback_versions(include_archived=False),
                     "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 },
@@ -1065,10 +1167,20 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({
                 **upd_check,
                 "modules": inspect_all_module_versions(pending_updates_map=pending_mod_map),
+                "changelog_entries": updater.get_unified_changelog_history(),
                 "snapshots": [s for s in all_snaps if not s.get("is_archived")],
                 "archived_snapshots": [s for s in all_snaps if s.get("is_archived")],
                 "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 "registry": updater.load_version_registry(),
+            })
+            return
+
+        if route == "/api/updater/changelogs":
+            import updater
+            self._send_json({
+                "ok": True,
+                "success": True,
+                "entries": updater.get_unified_changelog_history(),
             })
             return
 
@@ -1750,6 +1862,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     "success": True,
                     **res,
                     "modules": inspect_all_module_versions(pending_updates_map=pending_mod_map),
+                    "changelog_entries": updater.get_unified_changelog_history(),
                     "snapshots": updater.list_available_rollback_versions(include_archived=False),
                     "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 })
@@ -1771,6 +1884,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     "restartRequired": restart_required,
                     **res,
                     "modules": _inspect_mods_fresh(),
+                    "changelog_entries": updater.get_unified_changelog_history(),
                     "snapshots": updater.list_available_rollback_versions(include_archived=False),
                     "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 })
@@ -1788,6 +1902,7 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     "reloaded": bool(res.get("success")),
                     "restartRequired": restart_required,
                     "modules": _inspect_mods_fresh(),
+                    "changelog_entries": updater.get_unified_changelog_history(),
                     "snapshots": updater.list_available_rollback_versions(include_archived=False),
                     "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 })
@@ -1847,11 +1962,15 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 release_info = payload.get("release_info") if isinstance(payload.get("release_info"), dict) else payload
                 res = updater.apply_github_release_update(release_info, APP_DIR, cfg)
                 status_code = 200 if res.get("success") else (409 if res.get("aborted") else 400)
+                extra_payload = {}
+                if res.get("success"):
+                    extra_payload["changelog_entries"] = updater.get_unified_changelog_history()
                 self._send_json({
                     "ok": bool(res.get("success")),
                     "restartRequired": bool(res.get("restart_required")),
                     "requirementsChanged": bool(res.get("requirements_changed")),
                     **res,
+                    **extra_payload,
                 }, status=status_code)
             except Exception as exc:
                 self._send_json({"ok": False, "success": False, "error": str(exc)}, status=500)
@@ -3243,6 +3362,13 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, **res_m})
             return
 
+        if route == "/api/system/restart":
+            force_restart = bool(payload.get("force", False)) if isinstance(payload, dict) else False
+            res_r = request_clean_server_restart(force=force_restart)
+            status_code = 200 if res_r.get("success") else (409 if res_r.get("aborted") else 500)
+            self._send_json(res_r, status=status_code)
+            return
+
         if route == "/api/compute/settings" and isinstance(payload, dict):
             from Core.compute_backend import probe_system_hardware, save_compute_settings
             saved_cs = save_compute_settings(payload)
@@ -3311,10 +3437,13 @@ def _find_edge_executable() -> str | None:
     return shutil.which("msedge")
 
 
-def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool = False):
-    import threading
+def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool = False, open_window: bool = True):
+    global _ACTIVE_HTTP_SERVER, _ACTIVE_SERVER_PORT, _ACTIVE_FORCE_BROWSER
     url = f"http://localhost:{port}"
     server = ThreadingHTTPServer(("127.0.0.1", port), _TabulasPythonApiAndReactHandler)
+    _ACTIVE_HTTP_SERVER = server
+    _ACTIVE_SERVER_PORT = int(port)
+    _ACTIVE_FORCE_BROWSER = bool(force_browser)
 
     print("\n" + "=" * 72)
     print("🚀 TABULAS CARD HUB (DESKTOP APP + FULL PYTHON REST API) IS LIVE!")
@@ -3331,6 +3460,15 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
         start_maintenance_scheduler_daemon(poll_seconds=60)
     except Exception:
         pass
+
+    if not open_window:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+        return
 
     if not force_browser:
         # Mode 1: Native Desktop App Window via pywebview (zero Chrome/browser tabs!)
@@ -3398,6 +3536,7 @@ def main():
         default=int(os.environ.get("TABULAS_PORT", 5000)),
         help="Port to bind the local server (default: TABULAS_PORT env or 5000)",
     )
+    parser.add_argument("--no-open", action="store_true", help="Start server without launching a new browser/desktop window")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
 
@@ -3407,7 +3546,11 @@ def main():
         cli_p = (APP_DIR / "cli.py") if (APP_DIR / "cli.py").exists() else (HUB_DIR / "cli.py")
         subprocess.run([sys.executable, str(cli_p), "--version"], cwd=str(HUB_DIR))
         return
-    launch_zero_node_python_react_server(port=args.port, force_browser=bool(args.browser))
+    launch_zero_node_python_react_server(
+        port=args.port,
+        force_browser=bool(args.browser),
+        open_window=not bool(args.no_open),
+    )
 
 
 if __name__ == "__main__":

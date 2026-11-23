@@ -1408,12 +1408,291 @@ def _build_github_headers(config: Optional[dict], accept: str) -> dict[str, str]
     return headers
 
 
+def _resolve_changelog_path(changelog_path: Optional[Path] = None) -> Path:
+    if changelog_path is not None:
+        return Path(changelog_path)
+    cand = APP_DIR / "CHANGELOG.md"
+    if cand.exists():
+        return cand
+    return Path(__file__).resolve().parent / "CHANGELOG.md"
+
+
+def format_release_changelog(raw_md: str, *, fallback_title: str = "") -> dict:
+    """
+    Normalizes release markdown into clean user-facing markdown, structured sections,
+    and flat bullet lines suitable for version_registry.json and UI rendering.
+    """
+    raw = str(raw_md or "").replace("\r\n", "\n").strip()
+    if not raw:
+        lines = [fallback_title.strip()] if fallback_title.strip() else []
+        return {
+            "markdown": f"- {lines[0]}" if lines else "",
+            "sections": [{"heading": "Release Notes", "items": lines}] if lines else [],
+            "lines": lines,
+        }
+
+    # Strip trailing horizontal rules and GitHub auto-generated Full Changelog links
+    cleaned_lines: list[str] = []
+    for ln in raw.splitlines():
+        s = ln.rstrip()
+        if re.match(r"^\*\*Full Changelog\*\*\s*:\s*https?://", s.strip(), re.IGNORECASE):
+            continue
+        if s.strip() == "---":
+            continue
+        cleaned_lines.append(s)
+
+    sections: list[dict] = []
+    current_heading = ""
+    current_items: list[str] = []
+    flat_lines: list[str] = []
+
+    def _flush():
+        nonlocal current_heading, current_items
+        if current_items:
+            sections.append({
+                "heading": current_heading or "Highlights",
+                "items": list(current_items),
+            })
+        current_items = []
+
+    for ln in cleaned_lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        m_sub = re.match(r"^#{2,4}\s+(.+)$", stripped)
+        if m_sub:
+            _flush()
+            current_heading = m_sub.group(1).strip()
+            continue
+        item = re.sub(r"^[-*•]\s+", "", stripped).strip()
+        if item:
+            current_items.append(item)
+            if current_heading and current_heading.lower() not in ("highlights", "release notes"):
+                flat_lines.append(f"[{current_heading}] {item}")
+            else:
+                flat_lines.append(item)
+    _flush()
+
+    md_parts: list[str] = []
+    for sec in sections:
+        if sec["heading"] and sec["heading"].lower() not in ("highlights", "release notes"):
+            md_parts.append(f"### {sec['heading']}")
+        for it in sec["items"]:
+            md_parts.append(f"- {it}")
+        md_parts.append("")
+    clean_md = "\n".join(md_parts).strip()
+    if not clean_md and fallback_title.strip():
+        clean_md = f"- {fallback_title.strip()}"
+        flat_lines = [fallback_title.strip()]
+        sections = [{"heading": "Release Notes", "items": flat_lines}]
+
+    return {
+        "markdown": clean_md,
+        "sections": sections,
+        "lines": flat_lines,
+    }
+
+
+def parse_changelog_markdown(changelog_path: Optional[Path] = None) -> list[dict]:
+    """
+    Parses `CHANGELOG.md` into structured release entries sorted newest-first.
+    Supports headings like:
+      ## [v0.25.0-beta.8] — 2026-11-23 — Release Title
+      ## v0.25.0-beta.7 - Release Title
+    """
+    path = _resolve_changelog_path(changelog_path)
+    if not path.exists():
+        return []
+
+    raw = path.read_text(encoding="utf-8-sig", errors="replace").replace("\r\n", "\n")
+    heading_re = re.compile(
+        r"^##\s+\[?v?([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.]+)?)\]?\s*(?:[—–-]\s*(.+))?$",
+        re.MULTILINE,
+    )
+    matches = list(heading_re.finditer(raw))
+    entries: list[dict] = []
+
+    for idx, m in enumerate(matches):
+        ver = m.group(1).strip().lstrip("vV")
+        rest = (m.group(2) or "").strip()
+        date_str = ""
+        title = rest
+        m_date = re.match(r"^(\d{4}-\d{2}-\d{2})\s*(?:[—–-]\s*(.+))?$", rest)
+        if m_date:
+            date_str = m_date.group(1).strip()
+            title = (m_date.group(2) or "").strip()
+        if not title:
+            title = f"Release v{ver}"
+
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        body_raw = raw[start:end].strip()
+        formatted = format_release_changelog(body_raw, fallback_title=title)
+
+        entries.append({
+            "version": ver,
+            "tag_name": f"v{ver}",
+            "date": date_str,
+            "timestamp": f"{date_str} 00:00:00" if date_str else "",
+            "title": title,
+            "source": "changelog_md",
+            "package_file": "CHANGELOG.md",
+            "changelog_md": formatted["markdown"],
+            "changelog": formatted["lines"],
+            "sections": formatted["sections"],
+        })
+
+    entries.sort(key=lambda e: parse_version_tuple(e.get("version", "")), reverse=True)
+    return entries
+
+
+def extract_changelog_for_version(version_or_tag: str, changelog_path: Optional[Path] = None) -> Optional[dict]:
+    """Returns the parsed `CHANGELOG.md` entry matching `version_or_tag`, or `None`."""
+    target = str(version_or_tag or "").strip().lstrip("vV").lower()
+    if not target:
+        return None
+    for entry in parse_changelog_markdown(changelog_path=changelog_path):
+        if str(entry.get("version", "")).strip().lstrip("vV").lower() == target:
+            return entry
+    return None
+
+
+def get_unified_changelog_history(
+    changelog_path: Optional[Path] = None,
+    registry_path: Optional[Path] = None,
+) -> list[dict]:
+    """
+    Merges release history from `CHANGELOG.md`, `Updates/version_registry.json`, and
+    `Updates/*.txt` packages into a deduplicated newest-first list for the Updates UI.
+    """
+    merged: dict[str, dict] = {}
+
+    def _norm_ver(v: Any) -> str:
+        return str(v or "").strip().lstrip("vV")
+
+    # 1. Start with CHANGELOG.md (richest user-facing formatting)
+    for entry in parse_changelog_markdown(changelog_path=changelog_path):
+        ver = _norm_ver(entry.get("version"))
+        if not ver:
+            continue
+        merged[ver] = {
+            **entry,
+            "is_applied": False,
+            "is_rolled_back": False,
+            "files_modified": [],
+        }
+
+    # 2. Enrich / add from Updates/*.txt packages
+    try:
+        pkgs = discover_update_packages(include_rolled_back=True)
+    except Exception:
+        pkgs = []
+    for pkg in pkgs:
+        ver = _norm_ver(pkg.get("version"))
+        if not ver:
+            continue
+        existing = merged.get(ver)
+        if existing:
+            existing["is_rolled_back"] = bool(existing.get("is_rolled_back") or pkg.get("is_rolled_back"))
+            if not existing.get("timestamp") and pkg.get("timestamp"):
+                existing["timestamp"] = pkg["timestamp"]
+            if existing.get("package_file") == "CHANGELOG.md" and pkg.get("package_file"):
+                existing["package_file"] = pkg["package_file"]
+        else:
+            lines = [str(x).strip() for x in (pkg.get("changelog") or []) if str(x).strip()]
+            raw_md = "\n".join(f"- {ln}" for ln in lines)
+            fmt = format_release_changelog(raw_md, fallback_title=pkg.get("title", ""))
+            merged[ver] = {
+                "version": ver,
+                "tag_name": f"v{ver}",
+                "date": str(pkg.get("timestamp") or "")[:10],
+                "timestamp": str(pkg.get("timestamp") or ""),
+                "title": str(pkg.get("title") or f"Update v{ver}"),
+                "source": "local_package",
+                "package_file": str(pkg.get("package_file") or ""),
+                "changelog_md": fmt["markdown"],
+                "changelog": fmt["lines"],
+                "sections": fmt["sections"],
+                "is_applied": False,
+                "is_rolled_back": bool(pkg.get("is_rolled_back")),
+                "files_modified": [],
+            }
+
+    # 3. Enrich / add from version_registry.json (includes applied GitHub Releases)
+    reg_file = Path(registry_path) if registry_path else REGISTRY_FILE
+    reg_data: dict[str, Any] = {}
+    if reg_file.exists():
+        try:
+            loaded = json.loads(reg_file.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                reg_data = loaded
+        except Exception:
+            reg_data = {}
+
+    cur_ver = _norm_ver(reg_data.get("current_release_version"))
+    for h in reg_data.get("version_history") or []:
+        if not isinstance(h, dict):
+            continue
+        ver = _norm_ver(h.get("version"))
+        if not ver:
+            continue
+        pkg_id = str(h.get("package_file") or "")
+        if pkg_id.startswith("rollback_to_"):
+            continue
+        is_gh = pkg_id.startswith("github:")
+        h_lines = [str(x).strip() for x in (h.get("changelog") or []) if str(x).strip()]
+        h_md = str(h.get("changelog_md") or "").strip()
+        h_secs = h.get("changelog_sections") if isinstance(h.get("changelog_sections"), list) else None
+        existing = merged.get(ver)
+        if existing:
+            existing["is_applied"] = True
+            existing["applied_at"] = h.get("applied_at") or h.get("timestamp") or existing.get("applied_at", "")
+            existing["files_modified"] = list(h.get("files_modified") or existing.get("files_modified") or [])
+            if is_gh:
+                existing["source"] = "github_release"
+                existing["package_file"] = pkg_id
+            if not existing.get("changelog_md") and h_md:
+                fmt = format_release_changelog(h_md, fallback_title=h.get("title", ""))
+                existing["changelog_md"] = fmt["markdown"]
+                existing["changelog"] = fmt["lines"]
+                existing["sections"] = h_secs or fmt["sections"]
+        else:
+            raw_md = h_md or "\n".join(f"- {ln}" for ln in h_lines)
+            fmt = format_release_changelog(raw_md, fallback_title=h.get("title", ""))
+            merged[ver] = {
+                "version": ver,
+                "tag_name": f"v{ver}",
+                "date": str(h.get("timestamp") or "")[:10],
+                "timestamp": str(h.get("timestamp") or h.get("applied_at") or ""),
+                "applied_at": str(h.get("applied_at") or ""),
+                "title": str(h.get("title") or f"Release v{ver}"),
+                "source": "github_release" if is_gh else "registry",
+                "package_file": pkg_id or "registry",
+                "changelog_md": fmt["markdown"],
+                "changelog": fmt["lines"] or h_lines,
+                "sections": h_secs or fmt["sections"],
+                "is_applied": True,
+                "is_rolled_back": False,
+                "files_modified": list(h.get("files_modified") or []),
+            }
+
+    for ver, item in merged.items():
+        if cur_ver and not is_newer_version(ver, cur_ver) and not item.get("is_rolled_back"):
+            item["is_applied"] = True
+        item["is_current"] = bool(cur_ver and ver == cur_ver)
+
+    result = list(merged.values())
+    result.sort(key=lambda e: parse_version_tuple(e.get("version", "")), reverse=True)
+    return result
+
+
 def check_github_release(
     config: dict,
     current_version: str,
     *,
     session: Any = None,
     timeout: float = 15.0,
+    changelog_path: Optional[Path] = None,
 ) -> dict:
     """
     Queries GitHub Releases API for the configured repo & channel (`stable` or `beta`).
@@ -1480,14 +1759,24 @@ def check_github_release(
             if zip_asset is None or low.startswith("tabulas-hub-"):
                 zip_asset = asset
 
+    raw_body = str(selected.get("body") or "").strip()
+    release_title = str(selected.get("name") or tag_name).strip()
+    if not raw_body:
+        local_cl = extract_changelog_for_version(tag_name, changelog_path=changelog_path)
+        if local_cl and local_cl.get("changelog_md"):
+            raw_body = str(local_cl["changelog_md"])
+    formatted_cl = format_release_changelog(raw_body, fallback_title=release_title)
+
     return {
         "update_available": bool(latest_ver and is_newer_release_version(latest_ver, clean_current)),
         "current_version": clean_current,
         "latest_version": latest_ver,
         "tag_name": tag_name,
-        "release_name": str(selected.get("name") or tag_name),
+        "release_name": release_title,
         "published_at": str(selected.get("published_at") or ""),
-        "changelog_md": str(selected.get("body") or ""),
+        "changelog_md": formatted_cl["markdown"],
+        "changelog": formatted_cl["lines"],
+        "changelog_sections": formatted_cl["sections"],
         "html_url": str(selected.get("html_url") or ""),
         "zip_asset_api_url": str((zip_asset or {}).get("url") or ""),
         "zip_asset_name": str((zip_asset or {}).get("name") or ""),
@@ -1729,7 +2018,13 @@ def apply_github_release_update(
                 new_ver = str(release_info.get("latest_version") or release_info.get("tag_name") or "").strip().lstrip("vV")
                 rel_title = str(release_info.get("release_name") or f"GitHub Release v{new_ver}").strip()
                 cl_raw = str(release_info.get("changelog_md") or "").strip()
-                cl_lines = [ln.lstrip("-*• ").strip() for ln in cl_raw.splitlines() if ln.strip()] if cl_raw else [f"Applied GitHub Release {release_info.get('tag_name') or new_ver}"]
+                if not cl_raw and isinstance(release_info.get("changelog"), list):
+                    cl_raw = "\n".join(f"- {str(x).strip()}" for x in release_info["changelog"] if str(x).strip())
+                formatted_cl = format_release_changelog(
+                    cl_raw,
+                    fallback_title=f"Applied GitHub Release {release_info.get('tag_name') or new_ver}",
+                )
+                cl_lines = formatted_cl["lines"]
 
                 reg_file.parent.mkdir(parents=True, exist_ok=True)
                 with interprocess_file_lock(reg_file.with_suffix(".lock")):
@@ -1764,6 +2059,8 @@ def apply_github_release_update(
                         "package_file": pkg_id,
                         "files_modified": files_updated,
                         "changelog": cl_lines,
+                        "changelog_md": formatted_cl["markdown"],
+                        "changelog_sections": formatted_cl["sections"],
                     })
                     atomic_write_text(reg_file, json.dumps(latest_reg, indent=2), encoding="utf-8")
 
@@ -1778,6 +2075,9 @@ def apply_github_release_update(
                     "files_updated": files_updated,
                     "files_skipped_protected": files_skipped_protected,
                     "backup_zip": str(backup_zip),
+                    "changelog": cl_lines,
+                    "changelog_md": formatted_cl["markdown"],
+                    "changelog_sections": formatted_cl["sections"],
                     "restart_required": True,
                     "requirements_changed": requirements_changed,
                     "message": f"Installed GitHub Release v{new_ver} ({len(files_updated)} file(s) updated). Restart required.",
