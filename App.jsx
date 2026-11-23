@@ -3802,6 +3802,13 @@ export default function App() {
   const [schedules, setSchedules] = useState([]);
   const [moduleList, setModuleList] = useState([]);
   const [updaterInfo, setUpdaterInfo] = useState({ status: 'UP_TO_DATE', current_version: APP_VERSION, pending_count: 0, message: 'Click "Check for Updates".', packages: [], snapshots: [] });
+  const [ghConfig, setGhConfig] = useState({ repo: '', channel: 'beta', tokenInput: '', hasToken: false, tokenSource: '', maskedToken: '' });
+  const [ghConfigSaving, setGhConfigSaving] = useState(false);
+  const [ghChecking, setGhChecking] = useState(false);
+  const [ghApplying, setGhApplying] = useState(false);
+  const [ghReleaseInfo, setGhReleaseInfo] = useState(null);
+  const [ghApplyResult, setGhApplyResult] = useState(null);
+  const [ghError, setGhError] = useState('');
   const [liveLanes, setLiveLanes] = useState({});
   const [liveLogs, setLiveLogs] = useState({});
   const [selectedTrackedUrls, setSelectedTrackedUrls] = useState([]);
@@ -4965,6 +4972,135 @@ export default function App() {
         }
       })
       .catch((e) => pushNotification('Rollback Error', e.message, 'Updater', 'error'));
+  };
+
+  useEffect(() => {
+    if (activePage !== 'about') return;
+    fetch(`${NODE_API_BASE}/updater/config`)
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && res.config) {
+          const c = res.config;
+          setGhConfig((prev) => ({
+            ...prev,
+            repo: c.repo || '',
+            channel: c.channel || 'beta',
+            tokenInput: '',
+            hasToken: Boolean(c.has_token),
+            tokenSource: c.token_source || '',
+            maskedToken: c.github_token_masked || '',
+          }));
+        }
+      })
+      .catch(() => {});
+  }, [activePage]);
+
+  const handleSaveGithubUpdaterConfig = (clearToken = false) => {
+    setGhConfigSaving(true);
+    setGhError('');
+    const body = {
+      repo: ghConfig.repo.trim(),
+      channel: ghConfig.channel,
+    };
+    if (clearToken) {
+      body.clear_token = true;
+    } else if (ghConfig.tokenInput.trim()) {
+      body.github_token = ghConfig.tokenInput.trim();
+    }
+    fetch(`${NODE_API_BASE}/updater/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res.success && res.config) {
+          const c = res.config;
+          setGhConfig({
+            repo: c.repo || '',
+            channel: c.channel || 'beta',
+            tokenInput: '',
+            hasToken: Boolean(c.has_token),
+            tokenSource: c.token_source || '',
+            maskedToken: c.github_token_masked || '',
+          });
+          pushNotification('GitHub Updater Saved', `Repo: ${c.repo || 'not set'} • Channel: ${c.channel}`, 'Updater', 'success');
+        } else {
+          setGhError(res.error || 'Failed to save GitHub updater config.');
+        }
+      })
+      .catch((e) => setGhError(e.message))
+      .finally(() => setGhConfigSaving(false));
+  };
+
+  const handleCheckGithubReleases = () => {
+    setGhChecking(true);
+    setGhError('');
+    setGhApplyResult(null);
+    const body = {
+      repo: ghConfig.repo.trim(),
+      channel: ghConfig.channel,
+    };
+    if (ghConfig.tokenInput.trim()) {
+      body.github_token = ghConfig.tokenInput.trim();
+    }
+    fetch(`${NODE_API_BASE}/updater/check-github`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res.success) {
+          setGhReleaseInfo(res);
+          pushNotification(
+            res.update_available ? 'GitHub Update Available' : 'GitHub Releases Up to Date',
+            res.update_available ? `v${res.latest_version} is available (current: v${res.current_version}).` : `Running latest ${res.channel} release (v${res.current_version}).`,
+            'Updater',
+            res.update_available ? 'warning' : 'info'
+          );
+        } else {
+          setGhError(res.error || 'Failed to check GitHub Releases.');
+          pushNotification('GitHub Check Failed', res.error || 'Unable to reach GitHub Releases.', 'Updater', 'error');
+        }
+      })
+      .catch((e) => {
+        setGhError(e.message);
+        pushNotification('GitHub Check Failed', e.message, 'Updater', 'error');
+      })
+      .finally(() => setGhChecking(false));
+  };
+
+  const handleApplyGithubRelease = () => {
+    if (!ghReleaseInfo) return;
+    setGhApplying(true);
+    setGhError('');
+    fetch(`${NODE_API_BASE}/updater/apply-github`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ release_info: ghReleaseInfo }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res.success) {
+          setGhApplyResult(res);
+          pushNotification(
+            'GitHub Update Installed — Restart Required',
+            `${res.message || 'Update installed.'} Please restart Tabulas Card Hub to activate all changes.`,
+            'Updater',
+            'success'
+          );
+          refreshAllHubData();
+        } else {
+          setGhError(res.error || res.message || 'Failed to install GitHub release.');
+          pushNotification('GitHub Update Failed', res.error || res.message || 'Install failed.', 'Updater', 'error');
+        }
+      })
+      .catch((e) => {
+        setGhError(e.message);
+        pushNotification('GitHub Update Error', e.message, 'Updater', 'error');
+      })
+      .finally(() => setGhApplying(false));
   };
 
   const getOrderedLanes = () => {
@@ -12149,6 +12285,139 @@ export default function App() {
                     )}
                   </div>
                 )}
+
+                <div className="bg-slate-950 border border-sky-500/30 rounded-xl p-3.5 space-y-3 shrink-0">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-bold text-sky-400 uppercase">🐙 GitHub Releases (Remote OTA Updater)</div>
+                      <div className="text-[11px] text-slate-400">Check &amp; install verified release zips with SHA-256 verification and pre-update backups. Local <span className="font-mono">Updates\*.txt</span> remains available above.</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleSaveGithubUpdaterConfig(false)}
+                        disabled={ghConfigSaving}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-xs font-semibold disabled:opacity-50"
+                      >
+                        {ghConfigSaving ? '💾 Saving...' : '💾 Save Config'}
+                      </button>
+                      <button
+                        onClick={handleCheckGithubReleases}
+                        disabled={ghChecking || !ghConfig.repo.trim()}
+                        className="px-3 py-1.5 rounded-lg bg-sky-700 hover:bg-sky-600 disabled:opacity-40 text-white text-xs font-bold shadow"
+                      >
+                        {ghChecking ? '⏳ Checking GitHub...' : '🔍 Check GitHub for Updates'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+                    <div>
+                      <label className="block text-[10.5px] text-slate-400 mb-1">Repository (<span className="font-mono">owner/repo</span>)</label>
+                      <input
+                        type="text"
+                        value={ghConfig.repo}
+                        onChange={(e) => setGhConfig((prev) => ({ ...prev, repo: e.target.value }))}
+                        placeholder="e.g. myorg/tabulas-card-hub"
+                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10.5px] text-slate-400 mb-1">Release Channel</label>
+                      <select
+                        value={ghConfig.channel}
+                        onChange={(e) => setGhConfig((prev) => ({ ...prev, channel: e.target.value }))}
+                        className="w-full px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 text-xs"
+                      >
+                        <option value="beta">Beta (Pre-releases &amp; Stable)</option>
+                        <option value="stable">Stable (Latest Non-Pre-release)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10.5px] text-slate-400 mb-1">
+                        GitHub Token (optional{ghConfig.hasToken ? ` • Saved ${ghConfig.maskedToken}` : ''})
+                      </label>
+                      <div className="flex gap-1.5">
+                        <input
+                          type="password"
+                          value={ghConfig.tokenInput}
+                          onChange={(e) => setGhConfig((prev) => ({ ...prev, tokenInput: e.target.value }))}
+                          placeholder={ghConfig.hasToken ? ghConfig.maskedToken || '••••••••' : 'ghp_... (for private repos)'}
+                          className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-100 font-mono text-xs"
+                        />
+                        {ghConfig.hasToken && (
+                          <button
+                            type="button"
+                            onClick={() => handleSaveGithubUpdaterConfig(true)}
+                            className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 text-slate-300 hover:text-rose-200 text-[11px]"
+                            title="Clear saved token"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {ghError && (
+                    <div className="p-2.5 rounded-lg bg-rose-950/70 border border-rose-600/60 text-rose-200 text-xs">
+                      ⚠️ {ghError}
+                    </div>
+                  )}
+
+                  {ghApplyResult?.success && (
+                    <div className="p-3 rounded-lg bg-emerald-950/80 border border-emerald-500/70 text-emerald-100 text-xs space-y-1">
+                      <div className="font-bold">✅ {ghApplyResult.message}</div>
+                      <div className="text-[11px] text-emerald-200">
+                        Restart Required: Close and relaunch Tabulas Card Hub to activate all updated backend &amp; UI files.
+                        {ghApplyResult.requirementsChanged && (
+                          <span className="ml-1 font-semibold text-amber-300">
+                            (requirements.txt changed — run pip install -r requirements.txt before restarting.)
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {ghReleaseInfo && (
+                    <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-700 space-y-2 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-white">{ghReleaseInfo.release_name || ghReleaseInfo.tag_name}</span>
+                          <span className="font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300 text-[11px]">v{ghReleaseInfo.latest_version}</span>
+                          {ghReleaseInfo.is_prerelease && (
+                            <span className="px-1.5 py-0.5 rounded bg-amber-950 border border-amber-600/60 text-amber-200 text-[10px] font-semibold">Pre-release</span>
+                          )}
+                          {ghReleaseInfo.update_available ? (
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-600/60 text-emerald-300 text-[10px] font-bold">🆕 Update Available</span>
+                          ) : (
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px]">🟢 Up to Date</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {ghReleaseInfo.html_url && (
+                            <a href={ghReleaseInfo.html_url} target="_blank" rel="noreferrer" className="text-[11px] text-sky-400 hover:underline">
+                              View on GitHub ↗
+                            </a>
+                          )}
+                          {ghReleaseInfo.update_available && ghReleaseInfo.zip_asset_api_url && (
+                            <button
+                              onClick={handleApplyGithubRelease}
+                              disabled={ghApplying}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold shadow"
+                            >
+                              {ghApplying ? '⏳ Installing Update...' : '⬇️ Download & Install Update'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {ghReleaseInfo.changelog_md && (
+                        <pre className="max-h-36 overflow-y-auto whitespace-pre-wrap font-sans text-[11px] text-slate-300 bg-slate-950/80 border border-slate-800 rounded-lg p-2.5 leading-relaxed">
+                          {ghReleaseInfo.changelog_md}
+                        </pre>
+                      )}
+                    </div>
+                  )}
+                </div>
 
                 {moduleList.length > 0 && (
                   <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2 shrink-0">

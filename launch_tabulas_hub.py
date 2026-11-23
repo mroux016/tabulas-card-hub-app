@@ -1072,6 +1072,16 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if route == "/api/updater/config":
+            import updater
+            cfg = updater.load_updater_config()
+            self._send_json({
+                "ok": True,
+                "success": True,
+                "config": updater.mask_updater_config(cfg),
+            })
+            return
+
         if route == "/api/templates/lookup":
             from Core.database import resolve_template_reference_paths
             set_n = (query.get("set") or [""])[0].strip()
@@ -1782,6 +1792,70 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                     "archived_snapshots_count": updater.count_archived_rollback_snapshots(),
                 })
                 return
+
+        if route == "/api/updater/config" and isinstance(payload, dict):
+            import updater
+            try:
+                saved = updater.save_updater_config(payload)
+                self._send_json({
+                    "ok": True,
+                    "success": True,
+                    "config": updater.mask_updater_config(saved),
+                    "message": "GitHub updater configuration saved.",
+                })
+            except Exception as exc:
+                self._send_json({"ok": False, "success": False, "error": str(exc)}, status=400)
+            return
+
+        if route == "/api/updater/check-github" and isinstance(payload, dict):
+            from Core.config import APP_RELEASE_VERSION
+            import updater
+            try:
+                cfg = updater.load_updater_config()
+                repo_slug = str(payload.get("repo") or "").strip()
+                if repo_slug and "/" in repo_slug:
+                    parts = [p.strip() for p in repo_slug.split("/", 1)]
+                    if len(parts) == 2 and parts[0] and parts[1]:
+                        cfg["github_owner"], cfg["github_repo"] = parts[0], parts[1]
+                if payload.get("github_owner"):
+                    cfg["github_owner"] = str(payload["github_owner"]).strip()
+                if payload.get("github_repo"):
+                    cfg["github_repo"] = str(payload["github_repo"]).strip()
+                if payload.get("channel") in ("stable", "beta"):
+                    cfg["channel"] = str(payload["channel"])
+                tok_in = str(payload.get("github_token") or "").strip()
+                if tok_in and not tok_in.startswith("••••") and not set(tok_in).issubset({"*", "•"}):
+                    cfg["github_token"] = tok_in
+
+                reg = updater.load_version_registry()
+                current_ver = str(reg.get("current_release_version") or APP_RELEASE_VERSION).lstrip("vV")
+                rel_info = updater.check_github_release(cfg, current_ver)
+                self._send_json({
+                    "ok": True,
+                    "success": True,
+                    **rel_info,
+                })
+            except Exception as exc:
+                self._send_json({"ok": False, "success": False, "error": str(exc)}, status=400)
+            return
+
+        if route == "/api/updater/apply-github" and isinstance(payload, dict):
+            from Core.config import APP_DIR
+            import updater
+            try:
+                cfg = updater.load_updater_config()
+                release_info = payload.get("release_info") if isinstance(payload.get("release_info"), dict) else payload
+                res = updater.apply_github_release_update(release_info, APP_DIR, cfg)
+                status_code = 200 if res.get("success") else (409 if res.get("aborted") else 400)
+                self._send_json({
+                    "ok": bool(res.get("success")),
+                    "restartRequired": bool(res.get("restart_required")),
+                    "requirementsChanged": bool(res.get("requirements_changed")),
+                    **res,
+                }, status=status_code)
+            except Exception as exc:
+                self._send_json({"ok": False, "success": False, "error": str(exc)}, status=500)
+            return
 
         if route == "/api/set-library/action" and isinstance(payload, dict):
             import cli

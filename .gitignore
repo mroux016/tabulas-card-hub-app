@@ -9,6 +9,7 @@ Runtime/
 .desktop_app_profile/
 Core/.verified_backups/
 Core/downloaded_files/
+updater_config.json
 
 # Temporary & OS files
 *.tmp

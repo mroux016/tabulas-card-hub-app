@@ -17,9 +17,28 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Optional
+
+import requests
+
+try:
+    from packaging.version import InvalidVersion as _PackagingInvalidVersion
+    from packaging.version import Version as _PackagingVersion
+except Exception:
+    _PackagingVersion = None
+    _PackagingInvalidVersion = ValueError
+
+from Core.config import (
+    UPDATER_CONFIG_FILE,
+    atomic_write_bytes,
+    atomic_write_text,
+    interprocess_file_lock,
+)
+from Core.maintenance_scheduler import is_worker_pool_busy
 
 __version__ = "0.25.0-beta.1"
 __last_updated__ = "2026-11-21 18:45:00"
@@ -1184,6 +1203,592 @@ def main():
         return
 
     run_interactive_cli()
+
+
+# ==============================================================================
+# 7. GITHUB RELEASES CLIENT & SAFE ZIP APPLIER
+# ==============================================================================
+GITHUB_API_VERSION = "2026-03-10"
+GITHUB_USER_AGENT = "TabulasCardHub-Updater"
+DEFAULT_UPDATER_CONFIG = {
+    "github_owner": "",
+    "github_repo": "",
+    "channel": "beta",
+    "github_token": "",
+}
+PROTECTED_UPDATE_ROOTS = {
+    "data",
+    "cache",
+    "logs",
+    "set library",
+    "archive",
+    "batches",
+    "downloaded_files",
+    ".git",
+    ".agents",
+    ".env",
+}
+_PRE_STAGE_RANKS = {
+    "dev": 0,
+    "alpha": 1,
+    "a": 1,
+    "beta": 2,
+    "b": 2,
+    "rc": 3,
+    "c": 3,
+    "": 4,
+}
+
+
+def _fallback_parse_semver(ver_str: str) -> tuple:
+    """Safe semver/beta tuple parser used when `packaging` is unavailable or fails."""
+    s = str(ver_str or "").strip().lstrip("vV")
+    if not s:
+        return (0, 0, 0, 0, 0)
+    m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-_.]?([a-zA-Z]+)[._-]?(\d+)?)?", s)
+    if not m:
+        return (0, 0, 0, 0, 0)
+    major = int(m.group(1) or 0)
+    minor = int(m.group(2) or 0)
+    patch = int(m.group(3) or 0)
+    stage = (m.group(4) or "").lower()
+    stage_rank = _PRE_STAGE_RANKS.get(stage, 1 if stage else 4)
+    pre_num = int(m.group(5) or 0)
+    return (major, minor, patch, stage_rank, pre_num)
+
+
+def _parse_release_version(ver_str: str):
+    """Parses a release tag/version using `packaging.version.Version` with semver fallback."""
+    clean = str(ver_str or "").strip().lstrip("vV")
+    if _PackagingVersion is not None and clean:
+        try:
+            return _PackagingVersion(clean)
+        except _PackagingInvalidVersion:
+            pass
+    return _fallback_parse_semver(clean)
+
+
+def is_newer_release_version(candidate_ver: str, current_ver: str) -> bool:
+    """Returns True if `candidate_ver` is strictly newer than `current_ver`."""
+    cand_parsed = _parse_release_version(candidate_ver)
+    curr_parsed = _parse_release_version(current_ver)
+    if type(cand_parsed) is type(curr_parsed):
+        return cand_parsed > curr_parsed
+    return _fallback_parse_semver(candidate_ver) > _fallback_parse_semver(current_ver)
+
+
+def _resolve_github_token(config: Optional[dict] = None) -> tuple[str, str]:
+    cfg = config or {}
+    saved_tok = str(cfg.get("github_token") or "").strip()
+    if saved_tok:
+        return saved_tok, "config"
+    env_tok = str(os.environ.get("TABULAS_GITHUB_TOKEN") or "").strip()
+    if env_tok:
+        return env_tok, "env"
+    return "", ""
+
+
+def load_updater_config(config_path: Optional[Path] = None) -> dict:
+    """Loads `Data/updater_config.json` with `TABULAS_GITHUB_TOKEN` env fallback."""
+    cfg_p = Path(config_path) if config_path else UPDATER_CONFIG_FILE
+    data: dict[str, Any] = {}
+    if cfg_p.exists():
+        try:
+            raw = json.loads(cfg_p.read_text(encoding="utf-8-sig"))
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:
+            data = {}
+
+    owner = str(data.get("github_owner") or "").strip()
+    repo = str(data.get("github_repo") or "").strip()
+    channel = str(data.get("channel") or "beta").strip().lower()
+    if channel not in ("stable", "beta"):
+        channel = "beta"
+
+    saved_token = str(data.get("github_token") or "").strip()
+    env_token = str(os.environ.get("TABULAS_GITHUB_TOKEN") or "").strip()
+    effective_token = saved_token or env_token
+    token_source = "config" if saved_token else ("env" if env_token else "")
+
+    return {
+        "github_owner": owner,
+        "github_repo": repo,
+        "channel": channel,
+        "github_token": effective_token,
+        "has_saved_token": bool(saved_token),
+        "token_source": token_source,
+    }
+
+
+def save_updater_config(cfg: dict, config_path: Optional[Path] = None) -> dict:
+    """Atomically saves GitHub updater config to `Data/updater_config.json`."""
+    cfg_p = Path(config_path) if config_path else UPDATER_CONFIG_FILE
+    cfg_p.parent.mkdir(parents=True, exist_ok=True)
+    lock_p = cfg_p.with_suffix(".lock")
+
+    with interprocess_file_lock(lock_p):
+        existing: dict[str, Any] = {}
+        if cfg_p.exists():
+            try:
+                raw = json.loads(cfg_p.read_text(encoding="utf-8-sig"))
+                if isinstance(raw, dict):
+                    existing = raw
+            except Exception:
+                existing = {}
+
+        owner = str(cfg.get("github_owner") if cfg.get("github_owner") is not None else existing.get("github_owner", "")).strip()
+        repo = str(cfg.get("github_repo") if cfg.get("github_repo") is not None else existing.get("github_repo", "")).strip()
+        repo_slug = str(cfg.get("repo") or "").strip()
+        if repo_slug and "/" in repo_slug:
+            parts = [p.strip() for p in repo_slug.split("/", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                owner, repo = parts[0], parts[1]
+
+        channel = str(cfg.get("channel") or existing.get("channel") or "beta").strip().lower()
+        if channel not in ("stable", "beta"):
+            channel = "beta"
+
+        clear_tok = bool(cfg.get("clear_token"))
+        incoming_tok = cfg.get("github_token")
+        if clear_tok:
+            saved_tok = ""
+        elif incoming_tok is None:
+            saved_tok = str(existing.get("github_token") or "").strip()
+        else:
+            tok_str = str(incoming_tok).strip()
+            if tok_str and not set(tok_str).issubset({"*", "•"}):
+                saved_tok = tok_str
+            elif tok_str == "":
+                saved_tok = ""
+            else:
+                saved_tok = str(existing.get("github_token") or "").strip()
+
+        to_write = {
+            "github_owner": owner,
+            "github_repo": repo,
+            "channel": channel,
+            "github_token": saved_tok,
+        }
+        atomic_write_text(cfg_p, json.dumps(to_write, indent=2), encoding="utf-8")
+
+    return load_updater_config(cfg_p)
+
+
+def mask_updater_config(cfg: dict) -> dict:
+    """Returns a UI-safe config dict with any token masked."""
+    owner = str(cfg.get("github_owner") or "").strip()
+    repo = str(cfg.get("github_repo") or "").strip()
+    token, token_source = _resolve_github_token(cfg)
+    if not token_source and cfg.get("token_source"):
+        token_source = str(cfg.get("token_source") or "")
+    masked = ""
+    if token:
+        masked = f"••••{token[-4:]}" if len(token) > 4 else "••••"
+    return {
+        "github_owner": owner,
+        "github_repo": repo,
+        "repo": f"{owner}/{repo}" if (owner and repo) else (owner or repo),
+        "channel": str(cfg.get("channel") or "beta").strip().lower(),
+        "has_token": bool(token),
+        "token_source": token_source,
+        "github_token_masked": masked,
+    }
+
+
+def _build_github_headers(config: Optional[dict], accept: str) -> dict[str, str]:
+    headers = {
+        "Accept": accept,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": GITHUB_USER_AGENT,
+    }
+    token, _ = _resolve_github_token(config)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def check_github_release(
+    config: dict,
+    current_version: str,
+    *,
+    session: Any = None,
+    timeout: float = 15.0,
+) -> dict:
+    """
+    Queries GitHub Releases API for the configured repo & channel (`stable` or `beta`).
+    """
+    owner = str(config.get("github_owner") or "").strip()
+    repo = str(config.get("github_repo") or "").strip()
+    if not owner or not repo:
+        raise ValueError("GitHub owner and repository must be configured (e.g. 'owner/repo').")
+
+    channel = str(config.get("channel") or "beta").strip().lower()
+    if channel not in ("stable", "beta"):
+        channel = "beta"
+
+    http = session or requests
+    headers = _build_github_headers(config, "application/vnd.github+json")
+    base_api = f"https://api.github.com/repos/{owner}/{repo}"
+
+    if channel == "stable":
+        url = f"{base_api}/releases/latest"
+        resp = http.get(url, headers=headers, timeout=timeout)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"GitHub API error {resp.status_code}: {resp.text[:250]}")
+        selected = resp.json()
+        if not isinstance(selected, dict) or selected.get("draft"):
+            raise RuntimeError("No published stable GitHub release found.")
+    else:
+        url = f"{base_api}/releases?per_page=10"
+        resp = http.get(url, headers=headers, timeout=timeout)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"GitHub API error {resp.status_code}: {resp.text[:250]}")
+        releases = resp.json()
+        if not isinstance(releases, list):
+            raise RuntimeError("Unexpected GitHub Releases API response.")
+        candidates = [r for r in releases if isinstance(r, dict) and not r.get("draft") and r.get("tag_name")]
+        if not candidates:
+            raise RuntimeError("No non-draft GitHub releases found.")
+
+        def _cand_key(rel_obj: dict):
+            tag = str(rel_obj.get("tag_name") or "")
+            if _PackagingVersion is not None:
+                try:
+                    return (1, _PackagingVersion(tag.lstrip("vV")))
+                except _PackagingInvalidVersion:
+                    pass
+            return (0, _fallback_parse_semver(tag))
+
+        selected = max(candidates, key=_cand_key)
+
+    tag_name = str(selected.get("tag_name") or "").strip()
+    latest_ver = tag_name.lstrip("vV")
+    clean_current = str(current_version or "").strip().lstrip("vV")
+
+    assets = selected.get("assets") or []
+    zip_asset: Optional[dict] = None
+    checksum_asset: Optional[dict] = None
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        low = name.lower()
+        if low == "sha256sums.txt":
+            checksum_asset = asset
+        elif low.endswith(".zip"):
+            if zip_asset is None or low.startswith("tabulas-hub-"):
+                zip_asset = asset
+
+    return {
+        "update_available": bool(latest_ver and is_newer_release_version(latest_ver, clean_current)),
+        "current_version": clean_current,
+        "latest_version": latest_ver,
+        "tag_name": tag_name,
+        "release_name": str(selected.get("name") or tag_name),
+        "published_at": str(selected.get("published_at") or ""),
+        "changelog_md": str(selected.get("body") or ""),
+        "html_url": str(selected.get("html_url") or ""),
+        "zip_asset_api_url": str((zip_asset or {}).get("url") or ""),
+        "zip_asset_name": str((zip_asset or {}).get("name") or ""),
+        "checksum_asset_api_url": str((checksum_asset or {}).get("url") or ""),
+        "is_prerelease": bool(selected.get("prerelease", False)),
+        "channel": channel,
+    }
+
+
+def _is_protected_rel_path(rel_posix: str) -> bool:
+    parts = [p.lower() for p in PurePosixPath(rel_posix).parts if p not in ("", ".")]
+    if not parts:
+        return True
+    if parts[0] in PROTECTED_UPDATE_ROOTS:
+        return True
+    if len(parts) >= 2 and parts[0] == "core" and parts[1] == "downloaded_files":
+        return True
+    return False
+
+
+def _validate_zip_member_safety(member_name: str, app_root_resolved: Path) -> Optional[str]:
+    raw = str(member_name or "").replace("\\", "/")
+    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        return f"Unsafe absolute zip member path: {member_name}"
+    posix_parts = PurePosixPath(raw).parts
+    if any(part == ".." for part in posix_parts):
+        return f"Path traversal detected in zip member: {member_name}"
+    target = (app_root_resolved / Path(*posix_parts)).resolve()
+    try:
+        target.relative_to(app_root_resolved)
+    except ValueError:
+        return f"Zip member escapes application root: {member_name}"
+    return None
+
+
+def _parse_sha256sums(sums_text: str, target_asset_name: str = "") -> str:
+    entries: list[tuple[str, str]] = []
+    for line in str(sums_text or "").splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+)$", clean)
+        if m:
+            entries.append((m.group(1).lower(), m.group(2).strip()))
+    if not entries:
+        return ""
+    if target_asset_name:
+        target_low = Path(target_asset_name).name.lower()
+        for digest, fname in entries:
+            if Path(fname).name.lower() == target_low:
+                return digest
+    if len(entries) == 1:
+        return entries[0][0]
+    return ""
+
+
+def _create_pre_update_backup_zip(app_root: Path, backup_dir: Path, current_version: str) -> Path:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    clean_v = re.sub(r"[^0-9A-Za-z._-]+", "_", str(current_version or "unknown").lstrip("vV"))
+    backup_path = backup_dir / f"pre_update_v{clean_v}_{ts}.zip"
+    skip_dirs = {
+        ".git",
+        ".github",
+        ".agents",
+        "data",
+        "cache",
+        "logs",
+        "set library",
+        "archive",
+        "batches",
+        "downloaded_files",
+        "__pycache__",
+        "node_modules",
+    }
+    app_resolved = app_root.resolve()
+    with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(app_resolved):
+            dirnames[:] = sorted(d for d in dirnames if d.lower() not in skip_dirs)
+            for fname in sorted(filenames):
+                if fname.endswith((".log", ".lock", ".tmp")):
+                    continue
+                fp = Path(dirpath) / fname
+                rel = fp.relative_to(app_resolved).as_posix()
+                if _is_protected_rel_path(rel):
+                    continue
+                zf.write(fp, arcname=rel)
+
+    existing_backups = sorted(
+        backup_dir.glob("pre_update_*.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old_b in existing_backups[5:]:
+        try:
+            old_b.unlink()
+        except Exception:
+            pass
+    return backup_path
+
+
+def apply_github_release_update(
+    release_info: dict,
+    app_root: Path | str,
+    config: dict,
+    *,
+    session: Any = None,
+    busy_checker: Any = None,
+    cache_dir: Optional[Path] = None,
+    registry_path: Optional[Path] = None,
+    timeout: float = 60.0,
+) -> dict:
+    """
+    Safely downloads, verifies (SHA-256 + zip-slip check), backs up, and extracts a GitHub Release zip.
+    """
+    checker = busy_checker or is_worker_pool_busy
+    busy_res = checker()
+    if isinstance(busy_res, tuple):
+        is_busy, busy_reason = bool(busy_res[0]), str(busy_res[1] or "")
+    else:
+        is_busy, busy_reason = bool(busy_res), ""
+    if is_busy:
+        msg = f"Aborted update: worker pool is busy ({busy_reason or 'active job running'})."
+        return {
+            "success": False,
+            "aborted": True,
+            "reason": "worker_pool_busy",
+            "error": msg,
+            "message": msg,
+            "restart_required": False,
+            "requirements_changed": False,
+        }
+
+    zip_url = str(release_info.get("zip_asset_api_url") or "").strip()
+    sums_url = str(release_info.get("checksum_asset_api_url") or "").strip()
+    zip_name = str(release_info.get("zip_asset_name") or "release.zip").strip()
+    if not zip_url or not sums_url:
+        return {
+            "success": False,
+            "error": "Release metadata is missing zip_asset_api_url or checksum_asset_api_url.",
+            "restart_required": False,
+            "requirements_changed": False,
+        }
+
+    app_root_p = Path(app_root).resolve()
+    http = session or requests
+    dl_headers = _build_github_headers(config, "application/octet-stream")
+
+    with tempfile.TemporaryDirectory(prefix="tabulas_gh_upd_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
+        zip_tmp = tmp_dir / zip_name
+
+        r_sums = http.get(sums_url, headers=dl_headers, timeout=timeout)
+        if r_sums.status_code >= 400:
+            return {
+                "success": False,
+                "error": f"Failed to download SHA256SUMS.txt (HTTP {r_sums.status_code}).",
+                "restart_required": False,
+                "requirements_changed": False,
+            }
+        expected_sha = _parse_sha256sums(r_sums.text, zip_name)
+        if not expected_sha:
+            return {
+                "success": False,
+                "error": f"Could not find SHA-256 entry for {zip_name} in SHA256SUMS.txt.",
+                "restart_required": False,
+                "requirements_changed": False,
+            }
+
+        r_zip = http.get(zip_url, headers=dl_headers, timeout=timeout)
+        if r_zip.status_code >= 400:
+            return {
+                "success": False,
+                "error": f"Failed to download release archive (HTTP {r_zip.status_code}).",
+                "restart_required": False,
+                "requirements_changed": False,
+            }
+        zip_bytes = r_zip.content
+        actual_sha = hashlib.sha256(zip_bytes).hexdigest().lower()
+        if actual_sha != expected_sha:
+            return {
+                "success": False,
+                "error": f"SHA-256 mismatch for {zip_name}: expected {expected_sha}, got {actual_sha}.",
+                "restart_required": False,
+                "requirements_changed": False,
+            }
+        zip_tmp.write_bytes(zip_bytes)
+
+        try:
+            with zipfile.ZipFile(zip_tmp, "r") as zf:
+                infos = zf.infolist()
+                for info in infos:
+                    err = _validate_zip_member_safety(info.filename, app_root_p)
+                    if err:
+                        return {
+                            "success": False,
+                            "error": err,
+                            "restart_required": False,
+                            "requirements_changed": False,
+                        }
+
+                # Determine current version & requirements.txt hash before touching disk
+                reg_file = Path(registry_path) if registry_path else REGISTRY_FILE
+                reg_data: dict[str, Any] = {}
+                if reg_file.exists():
+                    try:
+                        parsed_reg = json.loads(reg_file.read_text(encoding="utf-8-sig"))
+                        if isinstance(parsed_reg, dict):
+                            reg_data = parsed_reg
+                    except Exception:
+                        reg_data = {}
+                cur_ver = str(reg_data.get("current_release_version") or release_info.get("current_version") or "0.0.0").lstrip("vV")
+
+                req_file = app_root_p / "requirements.txt"
+                req_sha_before = hashlib.sha256(req_file.read_bytes()).hexdigest() if req_file.exists() else ""
+
+                backup_root = (Path(cache_dir) if cache_dir else (BASE_DIR / "Cache")) / "Update_Backups"
+                backup_zip = _create_pre_update_backup_zip(app_root_p, backup_root, cur_ver)
+
+                files_updated: list[str] = []
+                files_skipped_protected: list[str] = []
+
+                for info in infos:
+                    if info.is_dir():
+                        continue
+                    rel_posix = PurePosixPath(info.filename.replace("\\", "/")).as_posix().lstrip("./")
+                    if not rel_posix or _is_protected_rel_path(rel_posix):
+                        files_skipped_protected.append(rel_posix or info.filename)
+                        continue
+                    dest_path = (app_root_p / Path(*PurePosixPath(rel_posix).parts)).resolve()
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    payload_bytes = zf.read(info.filename)
+                    atomic_write_bytes(dest_path, lambda tmp_p, b=payload_bytes: tmp_p.write_bytes(b))
+                    files_updated.append(rel_posix)
+
+                req_sha_after = hashlib.sha256(req_file.read_bytes()).hexdigest() if req_file.exists() else ""
+                requirements_changed = req_sha_before != req_sha_after
+
+                new_ver = str(release_info.get("latest_version") or release_info.get("tag_name") or "").strip().lstrip("vV")
+                rel_title = str(release_info.get("release_name") or f"GitHub Release v{new_ver}").strip()
+                cl_raw = str(release_info.get("changelog_md") or "").strip()
+                cl_lines = [ln.lstrip("-*• ").strip() for ln in cl_raw.splitlines() if ln.strip()] if cl_raw else [f"Applied GitHub Release {release_info.get('tag_name') or new_ver}"]
+
+                reg_file.parent.mkdir(parents=True, exist_ok=True)
+                with interprocess_file_lock(reg_file.with_suffix(".lock")):
+                    latest_reg: dict[str, Any] = {}
+                    if reg_file.exists():
+                        try:
+                            loaded = json.loads(reg_file.read_text(encoding="utf-8-sig"))
+                            if isinstance(loaded, dict):
+                                latest_reg = loaded
+                        except Exception:
+                            latest_reg = {}
+                    if not latest_reg:
+                        latest_reg = {
+                            "current_release_version": cur_ver,
+                            "applied_packages": [],
+                            "version_history": [],
+                            "files": {},
+                        }
+
+                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if new_ver:
+                        latest_reg["current_release_version"] = new_ver
+                    latest_reg["last_checked"] = now_ts
+                    pkg_id = f"github:{release_info.get('tag_name') or new_ver}"
+                    if pkg_id not in latest_reg.setdefault("applied_packages", []):
+                        latest_reg["applied_packages"].append(pkg_id)
+                    latest_reg.setdefault("version_history", []).append({
+                        "version": new_ver or cur_ver,
+                        "timestamp": str(release_info.get("published_at") or now_ts),
+                        "applied_at": now_ts,
+                        "title": rel_title,
+                        "package_file": pkg_id,
+                        "files_modified": files_updated,
+                        "changelog": cl_lines,
+                    })
+                    atomic_write_text(reg_file, json.dumps(latest_reg, indent=2), encoding="utf-8")
+
+                _log_updater_event(
+                    f"GITHUB RELEASE APPLIED v{new_ver} ({zip_name}) | {len(files_updated)} file(s) updated | Backup: {backup_zip.name}"
+                )
+                return {
+                    "success": True,
+                    "version": new_ver,
+                    "tag_name": str(release_info.get("tag_name") or ""),
+                    "release_name": rel_title,
+                    "files_updated": files_updated,
+                    "files_skipped_protected": files_skipped_protected,
+                    "backup_zip": str(backup_zip),
+                    "restart_required": True,
+                    "requirements_changed": requirements_changed,
+                    "message": f"Installed GitHub Release v{new_ver} ({len(files_updated)} file(s) updated). Restart required.",
+                }
+        except zipfile.BadZipFile as exc:
+            return {
+                "success": False,
+                "error": f"Downloaded archive is not a valid zip file: {exc}",
+                "restart_required": False,
+                "requirements_changed": False,
+            }
 
 
 if __name__ == "__main__":
