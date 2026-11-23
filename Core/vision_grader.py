@@ -112,6 +112,7 @@ from Core.config import (
     CMP_SUBSET_HINTS,
     FEATURE_CACHE_FILE,
     GRADING_FEEDBACK_LOG_FILE,
+    LEARNED_SET_PRIORS_FILE,
     REFERENCE_TEMPLATES_DIR,
     REVIEWED_CARDS_DIR,
     RUNTIME_CONFIG,
@@ -1125,6 +1126,10 @@ def _search_micro_band_edge(
 def detect_physical_card_box(
     img: Image.Image,
     return_meta: bool = False,
+    card_meta: Optional[dict] = None,
+    side: str = "front",
+    learned_prior: Optional[dict] = None,
+    expected_format: Optional[str] = None,
 ) -> tuple[int, int, int, int] | tuple[tuple[int, int, int, int], dict]:
     """
     Two-stage multi-format physical card-stock boundary detector (Standard 2.5"x3.5",
@@ -1137,12 +1142,31 @@ def detect_physical_card_box(
          3-Solid-Edges -> 4th-Edge Solver (+/-2.0% micro-band search or aspect-projected
          lock) whenever 3 edges are strong and 1 is weak, or raw AR deviates > 2.5%.
     """
+    active_prior = learned_prior
+    if active_prior is None and isinstance(card_meta, dict):
+        active_prior = lookup_learned_prior(
+            str(card_meta.get("set_name") or card_meta.get("Set") or ""),
+            str(card_meta.get("subset") or card_meta.get("Subset") or ""),
+            side=side,
+        )
+    eff_fmt = str(
+        expected_format
+        or (active_prior.get("card_format") if isinstance(active_prior, dict) else "")
+        or ""
+    ).strip().lower()
+    prior_used = False
+    prior_key: Optional[str] = None
+    prior_sample_count = 0
+
     w, h = img.size
     default_meta = {
         "edge_confidence": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
         "edge_inferred_side": None,
         "edge_solver_used": False,
         "edge_solver_snapped": False,
+        "prior_used": False,
+        "prior_key": None,
+        "prior_sample_count": 0,
     }
     if w < 60 or h < 60:
         box = (0, 0, w, h)
@@ -1285,7 +1309,19 @@ def detect_physical_card_box(
 
         # Multi-format prior: Standard (0.7143 / 1.400) vs. Tobacco/A&G Mini (0.5714 / 1.750)
         target_ar = None
-        if 0.62 <= cand_ar <= 0.84:
+        if eff_fmt == "mini":
+            target_ar = (2.625 / 1.5) if (cw_c > ch_c) else (1.5 / 2.625)
+            if isinstance(active_prior, dict):
+                prior_used = True
+                prior_key = active_prior.get("prior_key")
+                prior_sample_count = int(active_prior.get("prior_sample_count") or active_prior.get("sample_count") or 0)
+        elif eff_fmt == "standard":
+            target_ar = 1.400 if (cw_c > ch_c) else (2.5 / 3.5)
+            if isinstance(active_prior, dict):
+                prior_used = True
+                prior_key = active_prior.get("prior_key")
+                prior_sample_count = int(active_prior.get("prior_sample_count") or active_prior.get("sample_count") or 0)
+        elif 0.62 <= cand_ar <= 0.84:
             target_ar = 2.5 / 3.5
         elif 1.22 <= cand_ar <= 1.56:
             target_ar = 1.400
@@ -1547,6 +1583,9 @@ def detect_physical_card_box(
             "edge_inferred_side": edge_inferred_side,
             "edge_solver_used": edge_solver_used,
             "edge_solver_snapped": edge_solver_snapped,
+            "prior_used": prior_used,
+            "prior_key": prior_key,
+            "prior_sample_count": prior_sample_count,
         }
         return (box, meta) if return_meta else box
 
@@ -5519,6 +5558,9 @@ def _measure_side_centering(
     manual_card_format: Optional[str] = None,
     inv_matrix: Optional[np.ndarray] = None,
     edge_meta: Optional[dict] = None,
+    card_meta: Optional[dict] = None,
+    side: str = "front",
+    learned_prior: Optional[dict] = None,
 ) -> dict:
     """
     Measures outer card boundary & inner design frame centering on a single side,
@@ -5536,6 +5578,25 @@ def _measure_side_centering(
             for ck in ("tl", "tr", "bl", "br")
         )
     )
+    has_manual_outer = bool(
+        has_valid_manual_corners
+        or (isinstance(manual_outer_rect, list) and len(manual_outer_rect) == 4)
+    )
+    has_manual_inner = bool(isinstance(manual_inner_rect, list) and len(manual_inner_rect) == 4)
+    has_manual_fmt = bool(manual_card_format in ("standard", "mini", "non_standard"))
+    has_any_manual = has_manual_outer or has_manual_inner or has_manual_fmt
+
+    active_prior: Optional[dict] = None
+    if not has_any_manual:
+        active_prior = learned_prior
+        if active_prior is None and isinstance(card_meta, dict):
+            active_prior = lookup_learned_prior(
+                str(card_meta.get("set_name") or card_meta.get("Set") or ""),
+                str(card_meta.get("subset") or card_meta.get("Subset") or ""),
+                side=side,
+            )
+    inner_prior_applied = False
+    fmt_prior_applied = False
     if has_valid_manual_corners:
         ox, oy, ow, oh = _map_corners_norm_to_rect_forward(manual_corners, iw, ih, fwd_matrix)
         x1 = max(0, min(iw - 40, int(round(ox * iw))))
@@ -5737,6 +5798,48 @@ def _measure_side_centering(
         l_idx, r_idx = _pair_consistent(l_raw, r_raw, seg_l, seg_r, min_in_x, cw, lr_borderless)
         t_idx, b_idx = _pair_consistent(t_raw, b_raw, seg_t, seg_b, min_in_y, ch, tb_borderless)
 
+        if (
+            isinstance(active_prior, dict)
+            and isinstance(active_prior.get("inner_insets_norm"), list)
+            and len(active_prior["inner_insets_norm"]) == 4
+        ):
+            p_l, p_r, p_t, p_b = [float(v) for v in active_prior["inner_insets_norm"]]
+
+            def _apply_prior_inset(
+                raw_idx: int,
+                seg: np.ndarray,
+                grad_axis: np.ndarray,
+                min_in: int,
+                dim: int,
+                prior_frac: float,
+                has_frame_line: bool,
+                is_bl: bool,
+            ) -> int:
+                nonlocal inner_prior_applied
+                seg_pk = float(np.max(seg)) if seg.size > 0 else 0.0
+                is_ambiguous = (
+                    seg_pk < 12.0
+                    or is_bl
+                    or (not has_frame_line)
+                    or abs((raw_idx / float(max(1, dim))) - prior_frac) > 0.04
+                )
+                if not is_ambiguous:
+                    return raw_idx
+                band_lo = max(min_in, int(round((prior_frac - 0.025) * dim)))
+                band_hi = min(max(band_lo + 1, int(dim * 0.25)), int(round((prior_frac + 0.025) * dim)))
+                if band_hi > band_lo and band_hi <= len(grad_axis):
+                    band_seg = grad_axis[band_lo:band_hi + 1]
+                    if band_seg.size > 0 and float(np.max(band_seg)) >= 6.0:
+                        inner_prior_applied = True
+                        return band_lo + int(np.argmax(band_seg))
+                inner_prior_applied = True
+                return max(min_in, min(int(dim * 0.25), int(round(prior_frac * dim))))
+
+            l_idx = _apply_prior_inset(l_idx, seg_l, grad_x, min_in_x, cw, p_l, has_lr_frame_line, lr_borderless)
+            r_idx = _apply_prior_inset(r_idx, seg_r, grad_x[::-1], min_in_x, cw, p_r, has_lr_frame_line, lr_borderless)
+            t_idx = _apply_prior_inset(t_idx, seg_t, grad_y, min_in_y, ch, p_t, has_tb_frame_line, tb_borderless)
+            b_idx = _apply_prior_inset(b_idx, seg_b, grad_y[::-1], min_in_y, ch, p_b, has_tb_frame_line, tb_borderless)
+
         in_x1 = x1 + l_idx
         in_y1 = y1 + t_idx
         in_x2 = max(in_x1 + 10, x2 - r_idx)
@@ -5798,6 +5901,9 @@ def _measure_side_centering(
     card_ar = cw / float(max(1, ch))
     if manual_card_format in ("standard", "mini", "non_standard"):
         card_fmt = manual_card_format
+    elif isinstance(active_prior, dict) and active_prior.get("card_format") in ("standard", "mini", "non_standard"):
+        card_fmt = str(active_prior["card_format"])
+        fmt_prior_applied = True
     elif (0.64 <= card_ar <= 0.79) or (1.26 <= card_ar <= 1.54):
         card_fmt = "standard"
     elif (0.49 <= card_ar <= 0.64) or (1.56 <= card_ar <= 1.94):
@@ -5806,6 +5912,21 @@ def _measure_side_centering(
         card_fmt = "non_standard"
 
     em = edge_meta if isinstance(edge_meta, dict) else {}
+    prior_used = bool((not has_any_manual) and (em.get("prior_used") or fmt_prior_applied or inner_prior_applied))
+    prior_key = (
+        (active_prior.get("prior_key") if isinstance(active_prior, dict) else em.get("prior_key"))
+        if prior_used
+        else None
+    )
+    prior_sample_count = (
+        int(
+            (active_prior.get("prior_sample_count") or active_prior.get("sample_count") or 0)
+            if isinstance(active_prior, dict)
+            else (em.get("prior_sample_count") or 0)
+        )
+        if prior_used
+        else 0
+    )
     return {
         "outer_card_rect": outer_rect,
         "inner_frame_rect": inner_rect,
@@ -5824,6 +5945,9 @@ def _measure_side_centering(
         "sub_centering": sub_centering,
         "edge_confidence": em.get("edge_confidence"),
         "edge_inferred_side": em.get("edge_inferred_side"),
+        "prior_used": prior_used,
+        "prior_key": prior_key,
+        "prior_sample_count": prior_sample_count,
     }
 
 
@@ -6089,6 +6213,7 @@ def estimate_card_pregrade(
     front_file: str = "",
     back_file: str = "",
     source_images_meta: Optional[dict] = None,
+    card_meta: Optional[dict] = None,
 ) -> dict | tuple[dict, dict]:
     ov = _default_grading_overrides()
     if isinstance(overrides, dict):
@@ -6097,6 +6222,18 @@ def estimate_card_pregrade(
     man_geom = ov.get("manual_geometry") if isinstance(ov.get("manual_geometry"), dict) else {}
     fg = man_geom.get("front") if isinstance(man_geom.get("front"), dict) else {}
     bg = man_geom.get("back") if isinstance(man_geom.get("back"), dict) else {}
+
+    front_has_manual = bool(fg.get("outer_card_rect") or fg.get("inner_frame_rect") or fg.get("corners") or fg.get("card_format"))
+    back_has_manual = bool(bg.get("outer_card_rect") or bg.get("inner_frame_rect") or bg.get("corners") or bg.get("card_format"))
+    front_prior: Optional[dict] = None
+    back_prior: Optional[dict] = None
+    if isinstance(card_meta, dict):
+        _sn = str(card_meta.get("set_name") or card_meta.get("Set") or "").strip()
+        _sb = str(card_meta.get("subset") or card_meta.get("Subset") or "").strip()
+        if not front_has_manual:
+            front_prior = lookup_learned_prior(_sn, _sb, side="front")
+        if not back_has_manual:
+            back_prior = lookup_learned_prior(_sn, _sb, side="back")
 
     def _box_from_norm(rect_norm, im: Image.Image) -> Optional[tuple[int, int, int, int]]:
         if not (isinstance(rect_norm, list) and len(rect_norm) == 4):
@@ -6116,13 +6253,17 @@ def estimate_card_pregrade(
         if man_f_box is not None:
             front_box = man_f_box
         else:
-            front_box, front_edge_meta = detect_physical_card_box(front_img, return_meta=True)
+            front_box, front_edge_meta = detect_physical_card_box(
+                front_img, return_meta=True, card_meta=card_meta, side="front", learned_prior=front_prior
+            )
     if back_box is None:
         man_b_box = _box_from_norm(bg.get("outer_card_rect"), back_img)
         if man_b_box is not None:
             back_box = man_b_box
         else:
-            back_box, back_edge_meta = detect_physical_card_box(back_img, return_meta=True)
+            back_box, back_edge_meta = detect_physical_card_box(
+                back_img, return_meta=True, card_meta=card_meta, side="back", learned_prior=back_prior
+            )
 
     front_manual_skew = fg.get("skew_deg") is not None
     if front_manual_skew:
@@ -6178,6 +6319,9 @@ def estimate_card_pregrade(
         manual_card_format=fg.get("card_format"),
         inv_matrix=front_M_inv,
         edge_meta=front_edge_meta,
+        card_meta=card_meta,
+        side="front",
+        learned_prior=front_prior,
     )
     b_cent = _measure_side_centering(
         back_work_img,
@@ -6191,6 +6335,9 @@ def estimate_card_pregrade(
         manual_card_format=bg.get("card_format"),
         inv_matrix=back_M_inv,
         edge_meta=back_edge_meta,
+        card_meta=card_meta,
+        side="back",
+        learned_prior=back_prior,
     )
 
     used_fallback = False
@@ -6495,6 +6642,10 @@ def inspect_card_grading_diagnostics(
         front_file=f_p.name,
         back_file=b_p.name,
         source_images_meta=src_meta,
+        card_meta={
+            "set_name": str(row_d.get("Set") or ""),
+            "subset": str(row_d.get("Subset") or row_d.get("Subset_Parallel") or ""),
+        },
     )
 
     if reset_overrides:
@@ -6678,6 +6829,10 @@ def flag_grading_error_and_reevaluate(
             front_file=f_p.name,
             back_file=b_p.name,
             source_images_meta=diag.get("source_images"),
+            card_meta={
+                "set_name": str(row_d.get("Set") or ""),
+                "subset": str(row_d.get("Subset") or row_d.get("Subset_Parallel") or ""),
+            },
         )
     else:
         csv_grade, updated_diag = recompute_grades_from_diagnostics(diag, overrides=ov)
@@ -6747,6 +6902,288 @@ def flag_grading_error_and_reevaluate(
         "feedbackLogged": True,
         **extra_rows,
     }
+
+
+_LEARNED_PRIORS_CACHE: dict = {"path": None, "sig": None, "data": None}
+
+
+def _norm_prior_token(val: str) -> str:
+    return re.sub(r"\s+", " ", str(val or "").strip().lower())
+
+
+def rebuild_learned_set_priors(
+    feedback_log_path: Optional[Path] = None,
+    priors_path: Optional[Path] = None,
+) -> dict:
+    """
+    Compiles `Cache/Grading_Feedback/grading_feedback_log.jsonl` into
+    `Cache/Grading_Feedback/learned_set_priors.json` across a 3-tier hierarchy:
+      1. `(set_name, subset, side)` (active when `sample_count >= 3`)
+      2. `(set_name, side)` (active when `sample_count >= 5`)
+      3. `(card_format, side)` (fallback when `sample_count >= 5`)
+    """
+    log_p = Path(feedback_log_path) if feedback_log_path is not None else GRADING_FEEDBACK_LOG_FILE
+    out_p = Path(priors_path) if priors_path is not None else LEARNED_SET_PRIORS_FILE
+
+    buckets_sss: dict[str, list[dict]] = defaultdict(list)
+    buckets_ss: dict[str, list[dict]] = defaultdict(list)
+    buckets_fs: dict[str, list[dict]] = defaultdict(list)
+
+    if log_p.exists():
+        try:
+            raw_lines = log_p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            raw_lines = []
+        for line in raw_lines:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(rec, dict):
+                continue
+
+            uc = rec.get("user_correction") if isinstance(rec.get("user_correction"), dict) else {}
+            rg = rec.get("resolved_geometry") if isinstance(rec.get("resolved_geometry"), dict) else {}
+            has_geom = (
+                str(rec.get("error_type") or "").strip() == "manual_geometry_update"
+                or isinstance(uc.get("outer_card_rect"), list)
+                or isinstance(rg.get("outer_card_rect"), list)
+                or bool(uc.get("card_format"))
+                or bool(rg.get("card_format"))
+            )
+            if not has_geom:
+                continue
+
+            meta = rec.get("card_metadata") if isinstance(rec.get("card_metadata"), dict) else {}
+            set_raw = str(meta.get("Set") or rec.get("set_name") or rec.get("Set") or "").strip()
+            sub_raw = str(meta.get("Subset") or rec.get("subset") or rec.get("Subset") or "").strip()
+            set_n = _norm_prior_token(set_raw)
+            sub_n = _norm_prior_token(sub_raw)
+            side_n = "back" if str(rec.get("side") or "").strip().lower() == "back" else "front"
+
+            outer_r = (
+                uc.get("outer_card_rect")
+                if (isinstance(uc.get("outer_card_rect"), list) and len(uc.get("outer_card_rect")) == 4)
+                else (
+                    rg.get("outer_card_rect")
+                    if (isinstance(rg.get("outer_card_rect"), list) and len(rg.get("outer_card_rect")) == 4)
+                    else None
+                )
+            )
+            inner_r = (
+                uc.get("inner_frame_rect")
+                if (isinstance(uc.get("inner_frame_rect"), list) and len(uc.get("inner_frame_rect")) == 4)
+                else (
+                    rg.get("inner_frame_rect")
+                    if (isinstance(rg.get("inner_frame_rect"), list) and len(rg.get("inner_frame_rect")) == 4)
+                    else None
+                )
+            )
+            fmt_raw = str(uc.get("card_format") or rg.get("card_format") or "").strip().lower()
+            fmt = fmt_raw if fmt_raw in ("standard", "mini", "non_standard") else ""
+
+            img_sz = rec.get("image_size") if (isinstance(rec.get("image_size"), list) and len(rec.get("image_size")) == 2) else None
+
+            outer_w_norm = None
+            outer_h_norm = None
+            if outer_r is not None:
+                try:
+                    ow = float(outer_r[2])
+                    oh = float(outer_r[3])
+                    if ow > 0.05 and oh > 0.05:
+                        outer_w_norm = ow
+                        outer_h_norm = oh
+                except Exception:
+                    outer_w_norm = None
+                    outer_h_norm = None
+
+            outer_ar = None
+            try:
+                if rg.get("outer_ar") is not None and float(rg.get("outer_ar")) > 0.1:
+                    outer_ar = float(rg.get("outer_ar"))
+            except Exception:
+                outer_ar = None
+            if outer_ar is None and outer_w_norm is not None and outer_h_norm is not None:
+                if img_sz is not None:
+                    try:
+                        iw_s, ih_s = float(img_sz[0]), float(img_sz[1])
+                        if iw_s > 0 and ih_s > 0:
+                            outer_ar = (outer_w_norm * iw_s) / (outer_h_norm * ih_s)
+                    except Exception:
+                        outer_ar = None
+                if outer_ar is None:
+                    if fmt == "mini":
+                        outer_ar = 1.5 / 2.625
+                    elif fmt == "standard":
+                        outer_ar = 2.5 / 3.5
+                    else:
+                        outer_ar = outer_w_norm / outer_h_norm
+            elif outer_ar is None and fmt:
+                if fmt == "mini":
+                    outer_ar = 1.5 / 2.625
+                elif fmt == "standard":
+                    outer_ar = 2.5 / 3.5
+
+            insets = None
+            if outer_r is not None and inner_r is not None and outer_w_norm is not None and outer_h_norm is not None:
+                try:
+                    ox, oy, ow, oh = [float(v) for v in outer_r]
+                    ix, iy, iw_n, ih_n = [float(v) for v in inner_r]
+                    insets = [
+                        float(np.clip((ix - ox) / ow, 0.0, 0.45)),
+                        float(np.clip(((ox + ow) - (ix + iw_n)) / ow, 0.0, 0.45)),
+                        float(np.clip((iy - oy) / oh, 0.0, 0.45)),
+                        float(np.clip(((oy + oh) - (iy + ih_n)) / oh, 0.0, 0.45)),
+                    ]
+                except Exception:
+                    insets = None
+
+            sample = {
+                "outer_ar": outer_ar,
+                "outer_w_norm": outer_w_norm,
+                "outer_h_norm": outer_h_norm,
+                "inner_insets_norm": insets,
+                "card_format": fmt,
+            }
+            if set_n and sub_n:
+                buckets_sss[f"{set_n}|{sub_n}|{side_n}"].append(sample)
+            if set_n:
+                buckets_ss[f"{set_n}|{side_n}"].append(sample)
+            if fmt:
+                buckets_fs[f"{fmt}|{side_n}"].append(sample)
+
+    def _aggregate_bucket(samples: list[dict], tier_name: str, min_samples: int) -> dict:
+        ar_vals = [s["outer_ar"] for s in samples if s.get("outer_ar") is not None]
+        w_vals = [s["outer_w_norm"] for s in samples if s.get("outer_w_norm") is not None]
+        h_vals = [s["outer_h_norm"] for s in samples if s.get("outer_h_norm") is not None]
+        inset_vals = [s["inner_insets_norm"] for s in samples if s.get("inner_insets_norm") is not None]
+        fmt_vals = [s["card_format"] for s in samples if s.get("card_format")]
+
+        maj_fmt = None
+        if fmt_vals:
+            counts: dict[str, int] = {}
+            for fv in fmt_vals:
+                counts[fv] = counts.get(fv, 0) + 1
+            best_c = max(counts.values())
+            for fv in reversed(fmt_vals):
+                if counts[fv] == best_c:
+                    maj_fmt = fv
+                    break
+
+        cnt = len(samples)
+        return {
+            "tier": tier_name,
+            "sample_count": cnt,
+            "active": bool(cnt >= min_samples),
+            "outer_ar": round(float(np.median(ar_vals)), 4) if ar_vals else None,
+            "outer_w_norm": round(float(np.median(w_vals)), 4) if w_vals else None,
+            "outer_h_norm": round(float(np.median(h_vals)), 4) if h_vals else None,
+            "inner_insets_norm": (
+                [round(float(np.median([iv[i] for iv in inset_vals])), 4) for i in range(4)]
+                if inset_vals
+                else None
+            ),
+            "card_format": maj_fmt,
+        }
+
+    payload = {
+        "schema_version": 1,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "tiers": {
+            "set_subset_side": {
+                k: _aggregate_bucket(v, "set_subset_side", 3) for k, v in buckets_sss.items()
+            },
+            "set_side": {
+                k: _aggregate_bucket(v, "set_side", 5) for k, v in buckets_ss.items()
+            },
+            "format_side": {
+                k: _aggregate_bucket(v, "format_side", 5) for k, v in buckets_fs.items()
+            },
+        },
+    }
+
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    with interprocess_file_lock(out_p.with_suffix(".lock")):
+        atomic_write_text(out_p, json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    try:
+        resolved_out = str(out_p.resolve())
+        if _LEARNED_PRIORS_CACHE.get("path") == resolved_out:
+            _LEARNED_PRIORS_CACHE["sig"] = None
+    except Exception:
+        _LEARNED_PRIORS_CACHE["sig"] = None
+
+    return payload
+
+
+def lookup_learned_prior(
+    set_name: str = "",
+    subset: str = "",
+    side: str = "front",
+    priors_path: Optional[Path] = None,
+    card_format_hint: str = "",
+) -> Optional[dict]:
+    """
+    Looks up an active learned geometry prior using mtime-based in-memory caching.
+    Follows the 3-tier hierarchy:
+      1. `(set_name, subset, side)` (`sample_count >= 3`)
+      2. `(set_name, side)` (`sample_count >= 5`)
+      3. `(card_format, side)` (`sample_count >= 5`)
+    """
+    p = Path(priors_path) if priors_path is not None else LEARNED_SET_PRIORS_FILE
+    if not p.exists():
+        return None
+    try:
+        st = p.stat()
+        p_res = str(p.resolve())
+        sig = (p_res, int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), int(st.st_size))
+        if _LEARNED_PRIORS_CACHE.get("path") == p_res and _LEARNED_PRIORS_CACHE.get("sig") == sig:
+            data = _LEARNED_PRIORS_CACHE.get("data")
+        else:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+            _LEARNED_PRIORS_CACHE["path"] = p_res
+            _LEARNED_PRIORS_CACHE["sig"] = sig
+            _LEARNED_PRIORS_CACHE["data"] = data
+    except Exception:
+        return None
+
+    tiers = data.get("tiers") if isinstance(data, dict) else None
+    if not isinstance(tiers, dict):
+        return None
+
+    set_n = _norm_prior_token(set_name)
+    sub_n = _norm_prior_token(subset)
+    side_n = "back" if str(side or "").strip().lower() == "back" else "front"
+    fmt_n = _norm_prior_token(card_format_hint)
+
+    candidates: list[tuple[str, str, int]] = []
+    if set_n and sub_n:
+        candidates.append(("set_subset_side", f"{set_n}|{sub_n}|{side_n}", 3))
+    if set_n:
+        candidates.append(("set_side", f"{set_n}|{side_n}", 5))
+    if fmt_n in ("standard", "mini", "non_standard"):
+        candidates.append(("format_side", f"{fmt_n}|{side_n}", 5))
+
+    for tier_name, b_key, min_cnt in candidates:
+        tier_map = tiers.get(tier_name)
+        if not isinstance(tier_map, dict):
+            continue
+        entry = tier_map.get(b_key)
+        if not isinstance(entry, dict):
+            continue
+        cnt = int(entry.get("sample_count") or 0)
+        if bool(entry.get("active")) and cnt >= min_cnt:
+            res = dict(entry)
+            res["prior_key"] = f"{tier_name}:{b_key}"
+            res["prior_sample_count"] = cnt
+            return res
+
+    return None
 
 
 def update_card_grading_geometry(
@@ -6861,6 +7298,10 @@ def update_card_grading_geometry(
     with Image.open(b_p) as bim:
         b_img = bim.convert("RGB")
 
+    card_meta = {
+        "set_name": str(row_d.get("Set") or ""),
+        "subset": str(row_d.get("Subset") or row_d.get("Subset_Parallel") or ""),
+    }
     csv_grade, updated_diag = estimate_card_pregrade(
         f_img,
         b_img,
@@ -6871,6 +7312,7 @@ def update_card_grading_geometry(
         front_file=f_p.name,
         back_file=b_p.name,
         source_images_meta=diag.get("source_images"),
+        card_meta=card_meta,
     )
 
     df = _apply_csv_grade_and_cache_roi(df, r_idx, csv_grade, is_inventory=is_inv)
@@ -6893,14 +7335,40 @@ def update_card_grading_geometry(
         "Sub_Surface": str(updated_card.get("Sub_Surface") or ""),
     }
 
+    side_img = b_img if side_key == "back" else f_img
+    side_cent = (updated_diag.get("centering") or {}).get(side_key) or {}
+    resolved_outer = side_cent.get("outer_card_rect")
+    resolved_ar = None
+    if isinstance(resolved_outer, list) and len(resolved_outer) == 4:
+        try:
+            ow_px = float(resolved_outer[2]) * float(side_img.width)
+            oh_px = float(resolved_outer[3]) * float(side_img.height)
+            if ow_px > 0.0 and oh_px > 0.0:
+                resolved_ar = round(ow_px / oh_px, 4)
+        except Exception:
+            resolved_ar = None
+
     feedback_record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "target_type": resolved["target_type"],
         "batch_name": resolved["batch_name"],
         "sku": resolved["sku"],
+        "card_metadata": {
+            "Set": str(row_d.get("Set") or ""),
+            "Subset": str(row_d.get("Subset") or row_d.get("Subset_Parallel") or ""),
+            "Card_Number": str(row_d.get("Card Number") or row_d.get("Card_Number") or ""),
+            "Player": str(row_d.get("Player") or ""),
+        },
+        "image_size": [int(side_img.width), int(side_img.height)],
         "error_type": "manual_geometry_update",
         "side": "Back" if side_key == "back" else "Front",
         "user_correction": side_geom,
+        "resolved_geometry": {
+            "outer_card_rect": resolved_outer,
+            "inner_frame_rect": side_cent.get("inner_frame_rect"),
+            "card_format": side_cent.get("card_format"),
+            "outer_ar": resolved_ar,
+        },
         "grades_before": grades_before,
         "grades_after": grades_after,
     }
@@ -6908,6 +7376,10 @@ def update_card_grading_geometry(
     with interprocess_file_lock(GRADING_FEEDBACK_LOG_FILE.with_suffix(".lock")):
         with open(GRADING_FEEDBACK_LOG_FILE, "a", encoding="utf-8") as fb_f:
             fb_f.write(json.dumps(feedback_record, ensure_ascii=False) + "\n")
+    try:
+        rebuild_learned_set_priors()
+    except Exception:
+        pass
 
     return {
         "success": True,
@@ -7316,6 +7788,7 @@ def process_single_batch(
             front_box=front_box,
             back_box=back_box,
             front_patch_tokens=id_res.get("front_patch_tokens"),
+            card_meta={"set_name": set_name, "subset": chosen_sub},
         )
 
         # Pipeline JPEG encoding & 8-Corner sheet saving in background threads so disk I/O overlaps with the next PDF's OCR
@@ -8550,6 +9023,7 @@ def fix_card_rotations_and_regrade(
         grade_upd = estimate_card_pregrade(
             f_oriented, b_oriented, front_box=f_box, back_box=b_box,
             overrides=ov_rot, diagnostics_path=diag_rot,
+            card_meta={"set_name": set_n, "subset": sub_n},
         )
         if log_cb:
             log_cb(
@@ -8897,6 +9371,10 @@ def replace_card_images_from_bytes(
         g_res = estimate_card_pregrade(
             final_f, final_b, front_box=f_box, back_box=b_box,
             overrides=ov_rep, diagnostics_path=diag_rep,
+            card_meta={
+                "set_name": str(df.at[r_idx, "Set"] if "Set" in df.columns else ""),
+                "subset": str(df.at[r_idx, "Subset"] if "Subset" in df.columns else ""),
+            },
         )
         _apply_csv_grade_and_cache_roi(df, r_idx, g_res, is_inventory=is_inventory)
 

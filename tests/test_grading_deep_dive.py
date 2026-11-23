@@ -434,6 +434,112 @@ class TestGradingDeepDive(unittest.TestCase):
         cent = self.vg._measure_side_centering(im, box, edge_meta=meta)
         self.assertEqual(cent["card_format"], "standard", f"Standard card misclassified as mini: {cent}")
 
+    def test_learned_set_mini_prior_compilation_and_precedence(self):
+        import cv2
+        import numpy as np
+        import pandas as pd
+
+        # (a) Seed 3 cards in ("2025 Topps Allen & Ginter", "Mini") and log 3 manual Mini adjustments
+        set_name = "2025 Topps Allen & Ginter"
+        subset_name = "Mini"
+        set_dir = self.cfg.REVIEWED_CARDS_DIR / set_name
+        set_dir.mkdir(parents=True, exist_ok=True)
+
+        w, h = 800, 1120
+        # Ambiguous unframed Mini card in a sleeve (narrow card on light bed with subtle sleeve edge)
+        canvas = np.full((h, w, 3), 238, dtype=np.uint8)
+        mx1, my1, mx2, my2 = 160, 110, 640, 950  # 480x840 -> AR=0.5714 (Mini)
+        cv2.rectangle(canvas, (mx1, my1), (mx2, my2), (242, 240, 234), -1)
+        # Full-bleed-like low-contrast inner artwork so inner frame relies on soft prior band
+        cv2.rectangle(canvas, (mx1 + 26, my1 + 42), (mx2 - 26, my2 - 42), (168, 174, 182), -1)
+        mini_im = Image.fromarray(canvas)
+
+        df = self.db.load_inventory_df()
+        new_rows = []
+        skus = ["1000911", "1000912", "1000913"]
+        for idx_s, sku_s in enumerate(skus, start=1):
+            fn = f"AG_Mini_{idx_s}_{sku_s}_F.jpg"
+            bn = f"AG_Mini_{idx_s}_{sku_s}_B.jpg"
+            mini_im.save(set_dir / fn, format="JPEG", quality=95)
+            mini_im.save(set_dir / bn, format="JPEG", quality=95)
+            r = {col: "" for col in self.cfg.INVENTORY_COLUMNS}
+            r.update({
+                "SKU": sku_s,
+                "Status": "In Stock",
+                "Hold_Tag": "For Sale",
+                "Set": set_name,
+                "Subset": subset_name,
+                "Card Number": str(idx_s),
+                "Player": f"Mini Player {idx_s}",
+                "Front_File": fn,
+                "Back_File": bn,
+                "Raw_Price": "",
+                "Valuation_Source": "Uncomped",
+            })
+            new_rows.append(r)
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+        self.db.save_inventory_df(df)
+
+        for sku_s in skus:
+            res_upd = self.vg.update_card_grading_geometry(
+                target_type="inventory",
+                sku=sku_s,
+                payload={
+                    "side": "Front",
+                    "source": "centering_gauge",
+                    "card_format": "mini",
+                    "outer_card_rect": [0.20, 0.0982, 0.60, 0.75],
+                    "inner_frame_rect": [0.2325, 0.1357, 0.535, 0.675],
+                },
+            )
+            self.assertTrue(res_upd["success"], res_upd)
+
+        priors_file = self.cfg.LEARNED_SET_PRIORS_FILE
+        self.assertTrue(priors_file.exists(), "learned_set_priors.json was not compiled")
+        priors_data = json.loads(priors_file.read_text(encoding="utf-8"))
+        sss_bucket = priors_data["tiers"]["set_subset_side"].get("2025 topps allen & ginter|mini|front")
+        self.assertIsNotNone(sss_bucket)
+        self.assertTrue(sss_bucket["active"])
+        self.assertEqual(sss_bucket["sample_count"], 3)
+        self.assertEqual(sss_bucket["card_format"], "mini")
+        self.assertAlmostEqual(sss_bucket["outer_ar"], 0.5714, delta=0.02)
+        self.assertIsInstance(sss_bucket["inner_insets_norm"], list)
+        self.assertEqual(len(sss_bucket["inner_insets_norm"]), 4)
+
+        # (b) 4th unseen card from the same (Set, Subset, Side) automatically locks fmt=mini and records prior_used=True
+        _, diag_unseen = self.vg.estimate_card_pregrade(
+            mini_im,
+            mini_im,
+            return_diagnostics=True,
+            card_meta={"set_name": set_name, "subset": subset_name},
+        )
+        f_cent = diag_unseen["centering"]["front"]
+        self.assertEqual(f_cent["card_format"], "mini", f_cent)
+        self.assertTrue(f_cent["prior_used"], f_cent)
+        self.assertEqual(f_cent["prior_key"], "set_subset_side:2025 topps allen & ginter|mini|front")
+        self.assertEqual(f_cent["prior_sample_count"], 3)
+
+        # (c) Explicit per-SKU manual override still takes precedence over learned priors
+        _, diag_override = self.vg.estimate_card_pregrade(
+            mini_im,
+            mini_im,
+            overrides={
+                "manual_geometry": {
+                    "front": {
+                        "card_format": "standard",
+                        "outer_card_rect": [0.05, 0.04, 0.90, 0.92],
+                    }
+                }
+            },
+            return_diagnostics=True,
+            card_meta={"set_name": set_name, "subset": subset_name},
+        )
+        f_ov_cent = diag_override["centering"]["front"]
+        self.assertEqual(f_ov_cent["card_format"], "standard", f_ov_cent)
+        self.assertFalse(f_ov_cent["prior_used"], f_ov_cent)
+        self.assertIsNone(f_ov_cent["prior_key"])
+        self.assertEqual(f_ov_cent["prior_sample_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
