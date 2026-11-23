@@ -2077,18 +2077,41 @@ function GradingDeepDiveStudio({
 
   const sku = String(card?.SKU || '').trim();
   const effectiveBatch = batchName || card?._BatchName || '';
+  const reqSeqRef = useRef(0);
+  const abortCtrlRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (abortCtrlRef.current) {
+        try { abortCtrlRef.current.abort(); } catch (_) {}
+      }
+    };
+  }, []);
 
   const fetchDiagnostics = (forceRecompute = false) => {
     if (!sku) return;
+    if (abortCtrlRef.current) {
+      try { abortCtrlRef.current.abort(); } catch (_) {}
+    }
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    abortCtrlRef.current = ctrl;
+    const myReqId = ++reqSeqRef.current;
     setLoadingDiag(true);
     setDiagError('');
     fetch(`${NODE_API_BASE}/grading/inspect-card`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ targetType, sku, batchName: effectiveBatch, forceRecompute }),
+      signal: ctrl ? ctrl.signal : undefined,
     })
       .then((r) => r.json())
       .then((res) => {
+        if (!mountedRef.current || myReqId !== reqSeqRef.current) return;
+        const resSku = res?.diagnostics?.sku || res?.card?.SKU || '';
+        if (resSku && String(resSku).trim() !== sku) return;
         if (res?.success && res.diagnostics) {
           setDiagnostics(res.diagnostics);
           if (res.card && onCardUpdated) onCardUpdated(res);
@@ -2096,8 +2119,14 @@ function GradingDeepDiveStudio({
           setDiagError(res?.error || 'Could not load grading diagnostics.');
         }
       })
-      .catch((e) => setDiagError(e.message || 'Failed to inspect card diagnostics.'))
-      .finally(() => setLoadingDiag(false));
+      .catch((e) => {
+        if (e && e.name === 'AbortError') return;
+        if (!mountedRef.current || myReqId !== reqSeqRef.current) return;
+        setDiagError(e.message || 'Failed to inspect card diagnostics.');
+      })
+      .finally(() => {
+        if (mountedRef.current && myReqId === reqSeqRef.current) setLoadingDiag(false);
+      });
   };
 
   useEffect(() => {
@@ -2108,8 +2137,17 @@ function GradingDeepDiveStudio({
     setGaugeRotate(0.0);
     setGaugeNudge({ x: 0, y: 0 });
     setGaugeFormatOverride('auto');
+    setFlagPresetId('');
+    setShowFlagModal(false);
+    setLoupeZoom(2.0);
+    setDiagError('');
     setDiagnostics(null);
     fetchDiagnostics(false);
+    return () => {
+      if (abortCtrlRef.current) {
+        try { abortCtrlRef.current.abort(); } catch (_) {}
+      }
+    };
   }, [sku, targetType, effectiveBatch]);
 
   useEffect(() => {
@@ -2117,6 +2155,10 @@ function GradingDeepDiveStudio({
     setEditMode('none');
     setMainZoom(1.0);
     setMainPan({ x: 0, y: 0 });
+    setFlagPresetId('');
+    setShowFlagModal(false);
+    setLoupeZoom(2.0);
+    setDiagError('');
     const sKey = activeSide === 'Back' ? 'back' : 'front';
     const sc = diagnostics?.centering?.[sKey];
     const mg = diagnostics?.overrides?.manual_geometry?.[sKey];
@@ -2164,16 +2206,20 @@ function GradingDeepDiveStudio({
   }, [naturalSize.w, naturalSize.h, showCenteringGauge, editMode]);
 
   const sFold = encodeURIComponent(sanitizeFolderName(card?.Set || ''));
-  const frontUrl = card?.Front_File
+  const frontCacheVer = diagnostics?.source_images?.front_mtime || diagnostics?.updated_at || '';
+  const backCacheVer = diagnostics?.source_images?.back_mtime || diagnostics?.updated_at || '';
+  const frontBaseUrl = card?.Front_File
     ? (targetType === 'batch'
         ? `${API_ORIGIN}/static/batches/${encodeURIComponent(effectiveBatch)}/${encodeURIComponent(card.Front_File)}`
         : `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}`)
     : '';
-  const backUrl = card?.Back_File
+  const backBaseUrl = card?.Back_File
     ? (targetType === 'batch'
         ? `${API_ORIGIN}/static/batches/${encodeURIComponent(effectiveBatch)}/${encodeURIComponent(card.Back_File)}`
         : `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}`)
     : '';
+  const frontUrl = frontBaseUrl ? (frontCacheVer ? `${frontBaseUrl}?v=${encodeURIComponent(String(frontCacheVer))}` : frontBaseUrl) : '';
+  const backUrl = backBaseUrl ? (backCacheVer ? `${backBaseUrl}?v=${encodeURIComponent(String(backCacheVer))}` : backBaseUrl) : '';
   const activeImgUrl = activeSide === 'Back' ? (backUrl || frontUrl) : (frontUrl || backUrl);
 
   const toggleLayer = (cat) => setActiveLayers((prev) => ({ ...prev, [cat]: !prev[cat] }));
@@ -2240,11 +2286,13 @@ function GradingDeepDiveStudio({
 
   const buildCropUrl = (sideLbl, bbox, pad = 0.03, size = 240) => {
     if (!sku || !Array.isArray(bbox)) return '';
+    const sideStr = String(sideLbl || 'Front').toLowerCase();
+    const sideVer = sideStr === 'back' ? backCacheVer : frontCacheVer;
     const qs = new URLSearchParams({
       targetType,
       sku,
       batchName: effectiveBatch,
-      side: String(sideLbl || 'Front').toLowerCase(),
+      side: sideStr,
       x: String(bbox[0] ?? 0),
       y: String(bbox[1] ?? 0),
       w: String(bbox[2] ?? 0.15),
@@ -2252,6 +2300,7 @@ function GradingDeepDiveStudio({
       pad: String(pad),
       size: String(size),
     });
+    if (sideVer) qs.set('v', String(sideVer));
     return `${NODE_API_BASE}/grading/crop?${qs.toString()}`;
   };
 
@@ -2921,12 +2970,16 @@ function GradingDeepDiveStudio({
                   <span className="font-mono text-cyan-300 w-7 text-right">{gaugeOpacity}%</span>
                 </label>
 
-                {/* ROTATE (-6° TO +6°) */}
-                <div className="flex items-center gap-1 text-slate-300" title="Align Virtual Centering Card to skewed scans (-6° to +6°)">
+                {/* ROTATE (-6° TO +6°, 0.1° GRANULARITY) */}
+                <div className="flex items-center gap-1 text-slate-300" title="Align Virtual Centering Card to skewed scans (-6° to +6°; Shift+Click ±0.5°)">
                   <span className="text-slate-400">Rotate</span>
                   <button
                     type="button"
-                    onClick={() => setGaugeRotate((r) => Math.max(-6.0, Number((r - 0.25).toFixed(2))))}
+                    title="Rotate -0.1° (Shift+Click -0.5°)"
+                    onClick={(e) => {
+                      const step = e.shiftKey ? 0.5 : 0.1;
+                      setGaugeRotate((r) => Math.max(-6.0, Number((r - step).toFixed(1))));
+                    }}
                     className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
                   >
                     −
@@ -2942,7 +2995,11 @@ function GradingDeepDiveStudio({
                   />
                   <button
                     type="button"
-                    onClick={() => setGaugeRotate((r) => Math.min(6.0, Number((r + 0.25).toFixed(2))))}
+                    title="Rotate +0.1° (Shift+Click +0.5°)"
+                    onClick={(e) => {
+                      const step = e.shiftKey ? 0.5 : 0.1;
+                      setGaugeRotate((r) => Math.min(6.0, Number((r + step).toFixed(1))));
+                    }}
                     className="px-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold"
                   >
                     +
@@ -9877,14 +9934,20 @@ export default function App() {
                           <button onClick={() => setInspectorIdx((i) => Math.min(gradingCandidates.length - 1, i + 1))} disabled={safeIdx >= gradingCandidates.length - 1} className={`px-4 py-2 rounded-xl text-xs font-bold disabled:opacity-30 ${skin.accentBtn}`}>Next Card ▶</button>
                         </div>
                       </div>
-                      <SideBySideCardComparison
-                        scanFrontUrl={card.Front_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}` : ''}
-                        scanBackUrl={card.Back_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}` : ''}
-                        cornersUrl={card.Corners_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}` : ''}
-                        setName={card.Set} subsetName={card.Subset} cardNumber={card['Card Number']}
-                        initialTmplFrontRel={card.Matched_Template_Front} initialTmplBackRel={card.Matched_Template_Back}
-                        heightClass="h-72"
-                      />
+                      {(() => {
+                        const cardCacheTag = encodeURIComponent(String(card.Updated_At || card.Date_Modified || card.Est_PSA || card.Corners_File || ''));
+                        const cacheQs = cardCacheTag ? `?v=${cardCacheTag}` : '';
+                        return (
+                          <SideBySideCardComparison
+                            scanFrontUrl={card.Front_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Front_File)}${cacheQs}` : ''}
+                            scanBackUrl={card.Back_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}${cacheQs}` : ''}
+                            cornersUrl={card.Corners_File ? `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Corners_File)}${cacheQs}` : ''}
+                            setName={card.Set} subsetName={card.Subset} cardNumber={card['Card Number']}
+                            initialTmplFrontRel={card.Matched_Template_Front} initialTmplBackRel={card.Matched_Template_Back}
+                            heightClass="h-72"
+                          />
+                        );
+                      })()}
                       <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
                         <div className="bg-slate-950 border border-slate-800 rounded-xl p-3"><div className="text-[10px] text-slate-400">Est. PSA / BGS</div><div className="text-base font-bold text-white font-mono">PSA {card.Est_PSA} / BGS {card.Est_BGS}</div></div>
                         <div className="bg-slate-950 border border-slate-800 rounded-xl p-3"><div className="text-[10px] text-slate-400">Centering (L/R | T/B)</div><div className="text-base font-bold text-sky-300 font-mono">{card.Centering_LR || '—'} | {card.Centering_TB || '—'}</div></div>

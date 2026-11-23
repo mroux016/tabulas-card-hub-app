@@ -1632,12 +1632,12 @@ def compute_tier_aware_roi_and_recommendation(
     existing_val_src = str(card_row.get("Valuation_Source") or "").strip()
     existing_raw = _safe_float(card_row.get("Raw_Price"), 0.0)
 
-    if comp_verified:
-        raw_val = _safe_float((comp_row or {}).get("Ungraded"), 0.0)
-        valuation_source = comp_src
-    elif existing_val_src.lower() == "manual" and existing_raw > 0.0:
+    if existing_val_src.lower() == "manual" and existing_raw > 0.0:
         raw_val = existing_raw
         valuation_source = "Manual"
+    elif comp_verified:
+        raw_val = _safe_float((comp_row or {}).get("Ungraded"), 0.0)
+        valuation_source = comp_src
     else:
         raw_val = 0.0
         valuation_source = "Uncomped"

@@ -80,6 +80,8 @@ def _cluster_and_nms_defects(defects: list[dict], dist_thresh: float = 0.035) ->
     def _boxes_close(a: dict, b: dict) -> bool:
         if str(a.get("side") or "") != str(b.get("side") or ""):
             return False
+        if str(a.get("category") or a.get("target") or "") != str(b.get("category") or b.get("target") or ""):
+            return False
         ba = a.get("bbox_norm")
         bb = b.get("bbox_norm")
         if not (isinstance(ba, list) and len(ba) == 4 and isinstance(bb, list) and len(bb) == 4):
@@ -1311,7 +1313,7 @@ def _detect_ink_spots(
         row_peers = sum(1 for o in cands if abs(o[1] - cy_b) < 12.0)
         if row_peers >= 4:
             continue
-        if area < 165.0 or max(bw, bh) <= 14:
+        if area <= 320.0 or max(bw, bh) <= 26 or (side_label.lower() == "back" and area <= 850.0):
             h_peers = 0
             v_peers = 0
             for gcx, gcy, gw, gh in glyphs:
@@ -1321,9 +1323,9 @@ def _detect_ink_spots(
                     h_peers += 1
                 if abs(gcx - cx_b) <= 28.0 and 4.0 <= abs(gcy - cy_b) <= 140.0 and gw <= 55:
                     v_peers += 1
-                if h_peers >= 2 or v_peers >= 2:
+                if h_peers >= 4 and v_peers >= 4:
                     break
-            if h_peers >= 2 or v_peers >= 2:
+            if (max(bw, bh) <= 26 and (h_peers >= 2 or v_peers >= 2)) or (h_peers >= 4 and v_peers >= 4):
                 continue
         filtered.append(c)
 

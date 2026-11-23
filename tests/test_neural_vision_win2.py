@@ -267,7 +267,8 @@ class TestNeuralVisionWin2(unittest.TestCase):
                 return _OomGpuSession(), "DmlExecutionProvider [DXGI #0: RX 9070 XT]"
             return _CpuSession(), "CPUExecutionProvider"
 
-        with mock.patch.object(nv, "create_onnx_session", side_effect=_fake_create):
+        with mock.patch.object(nv, "create_onnx_session", side_effect=_fake_create), \
+             mock.patch.object(nv, "get_recommended_neural_batch_size", return_value=16):
             eng = nv.NeuralEmbeddingEngine(model_path=dummy_model, prefer_gpu=True, claim_slot=False)
             crops = [_make_synthetic_card("base", player_seed=i) for i in range(10)]
             descs = eng.extract_descriptors_batch(crops, batch_size=32)

@@ -849,12 +849,13 @@ def _deskew_image_and_box(
     img: Image.Image,
     card_box: tuple[int, int, int, int],
     skew_deg: float,
+    min_abs_deg: float = 0.35,
 ) -> tuple[Image.Image, tuple[int, int, int, int], Optional[np.ndarray]]:
     """
     Rotates a working copy around the card center by `-skew_deg` (using OpenCV positive
-    CCW angle = +skew_deg) when abs(skew_deg) >= 0.35°, returning `(deskewed_img, box, M_inv)`.
+    CCW angle = +skew_deg) when abs(skew_deg) >= min_abs_deg, returning `(deskewed_img, box, M_inv)`.
     """
-    if abs(float(skew_deg)) < 0.35:
+    if abs(float(skew_deg)) < float(min_abs_deg):
         return img, card_box, None
     arr = np.array(img.convert("RGB"))
     ih, iw = arr.shape[:2]
@@ -889,16 +890,64 @@ def _map_bbox_norm_inverse(bbox_norm: list[float], iw: int, ih: int, M_inv: np.n
     mapped = corners @ M_inv.T
     xs = mapped[:, 0] / float(max(1, iw))
     ys = mapped[:, 1] / float(max(1, ih))
-    nx1 = float(np.clip(np.min(xs), 0.0, 1.0))
-    ny1 = float(np.clip(np.min(ys), 0.0, 1.0))
+    nx1 = float(np.clip(np.min(xs), 0.0, 0.998))
+    ny1 = float(np.clip(np.min(ys), 0.0, 0.998))
     nx2 = float(np.clip(np.max(xs), 0.0, 1.0))
     ny2 = float(np.clip(np.max(ys), 0.0, 1.0))
+    nw = min(1.0 - nx1, max(0.002, nx2 - nx1))
+    nh = min(1.0 - ny1, max(0.002, ny2 - ny1))
     return [
         round(nx1, 4),
         round(ny1, 4),
-        round(max(0.002, nx2 - nx1), 4),
-        round(max(0.002, ny2 - ny1), 4),
+        round(nw, 4),
+        round(nh, 4),
     ]
+
+
+def _map_point_norm_forward(pt_norm: list[float], iw: int, ih: int, M_fwd: np.ndarray) -> list[float]:
+    px = float(pt_norm[0]) * float(iw)
+    py = float(pt_norm[1]) * float(ih)
+    fx = float(M_fwd[0, 0] * px + M_fwd[0, 1] * py + M_fwd[0, 2])
+    fy = float(M_fwd[1, 0] * px + M_fwd[1, 1] * py + M_fwd[1, 2])
+    return [
+        float(np.clip(fx / float(max(1, iw)), 0.0, 1.0)),
+        float(np.clip(fy / float(max(1, ih)), 0.0, 1.0)),
+    ]
+
+
+def _map_rect_norm_forward(rect_norm: list[float], iw: int, ih: int, M_fwd: np.ndarray) -> list[float]:
+    rx, ry, rw, rh = [float(v) for v in rect_norm]
+    corners = np.array([
+        [rx * iw, ry * ih, 1.0],
+        [(rx + rw) * iw, ry * ih, 1.0],
+        [rx * iw, (ry + rh) * ih, 1.0],
+        [(rx + rw) * iw, (ry + rh) * ih, 1.0],
+    ], dtype=np.float64)
+    mapped = corners @ M_fwd.T
+    xs = mapped[:, 0] / float(max(1, iw))
+    ys = mapped[:, 1] / float(max(1, ih))
+    nx1 = float(np.clip(np.min(xs), 0.0, 0.998))
+    ny1 = float(np.clip(np.min(ys), 0.0, 0.998))
+    nx2 = float(np.clip(np.max(xs), 0.0, 1.0))
+    ny2 = float(np.clip(np.max(ys), 0.0, 1.0))
+    return [nx1, ny1, min(1.0 - nx1, max(0.002, nx2 - nx1)), min(1.0 - ny1, max(0.002, ny2 - ny1))]
+
+
+def _map_corners_norm_to_rect_forward(corners_dict: dict, iw: int, ih: int, M_fwd: Optional[np.ndarray]) -> list[float]:
+    pts = []
+    for ck in ("tl", "tr", "bl", "br"):
+        pt = corners_dict.get(ck)
+        if M_fwd is not None:
+            pts.append(_map_point_norm_forward(pt, iw, ih, M_fwd))
+        else:
+            pts.append([float(pt[0]), float(pt[1])])
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    nx1 = float(np.clip(min(xs), 0.0, 0.998))
+    ny1 = float(np.clip(min(ys), 0.0, 0.998))
+    nx2 = float(np.clip(max(xs), 0.0, 1.0))
+    ny2 = float(np.clip(max(ys), 0.0, 1.0))
+    return [nx1, ny1, min(1.0 - nx1, max(0.002, nx2 - nx1)), min(1.0 - ny1, max(0.002, ny2 - ny1))]
 
 
 def _score_edge_confidence(
@@ -5478,9 +5527,28 @@ def _measure_side_centering(
     iw, ih = img.size
     iw = max(40, int(iw))
     ih = max(40, int(ih))
+    fwd_matrix = cv2.invertAffineTransform(inv_matrix) if inv_matrix is not None else None
 
-    if isinstance(manual_outer_rect, list) and len(manual_outer_rect) == 4:
-        ox, oy, ow, oh = [float(v) for v in manual_outer_rect]
+    has_valid_manual_corners = (
+        isinstance(manual_corners, dict)
+        and all(
+            isinstance(manual_corners.get(ck), (list, tuple)) and len(manual_corners.get(ck)) == 2
+            for ck in ("tl", "tr", "bl", "br")
+        )
+    )
+    if has_valid_manual_corners:
+        ox, oy, ow, oh = _map_corners_norm_to_rect_forward(manual_corners, iw, ih, fwd_matrix)
+        x1 = max(0, min(iw - 40, int(round(ox * iw))))
+        y1 = max(0, min(ih - 40, int(round(oy * ih))))
+        x2 = max(x1 + 40, min(iw, int(round((ox + ow) * iw))))
+        y2 = max(y1 + 40, min(ih, int(round((oy + oh) * ih))))
+    elif isinstance(manual_outer_rect, list) and len(manual_outer_rect) == 4:
+        rect_o = (
+            _map_rect_norm_forward(manual_outer_rect, iw, ih, fwd_matrix)
+            if fwd_matrix is not None
+            else [float(v) for v in manual_outer_rect]
+        )
+        ox, oy, ow, oh = rect_o
         x1 = max(0, min(iw - 40, int(round(ox * iw))))
         y1 = max(0, min(ih - 40, int(round(oy * ih))))
         x2 = max(x1 + 40, min(iw, int(round((ox + ow) * iw))))
@@ -5508,7 +5576,12 @@ def _measure_side_centering(
     ch = max(40, y2 - y1)
 
     if isinstance(manual_inner_rect, list) and len(manual_inner_rect) == 4:
-        ix, iy, inw, inh = [float(v) for v in manual_inner_rect]
+        rect_i = (
+            _map_rect_norm_forward(manual_inner_rect, iw, ih, fwd_matrix)
+            if fwd_matrix is not None
+            else [float(v) for v in manual_inner_rect]
+        )
+        ix, iy, inw, inh = rect_i
         in_x1 = max(x1 + 2, min(x2 - 12, int(round(ix * iw))))
         in_y1 = max(y1 + 2, min(y2 - 12, int(round(iy * ih))))
         in_x2 = max(in_x1 + 10, min(x2 - 2, int(round((ix + inw) * iw))))
@@ -5893,24 +5966,39 @@ def recompute_grades_from_diagnostics(
     else:
         est_psa = est_bgs
 
-    num_defects = len(active_defects)
-    total_penalty = float(surf_pen + corn_pen + edge_pen)
-    has_heavy_structural = any(str(d.get("type") or "") in ("corner_crease", "edge_tear") for d in active_defects)
+    overridden_cats = {k for k, v in sub_ov.items() if v is not None}
+    ceiling_defects = [
+        d for d in active_defects
+        if str(d.get("category") or d.get("target") or "") not in overridden_cats
+    ]
+    num_defects = len(ceiling_defects)
+    total_penalty = float(sum(float(d.get("penalty", d.get("severity", 0.5))) for d in ceiling_defects))
+    has_heavy_structural = any(str(d.get("type") or "") in ("corner_crease", "edge_tear") for d in ceiling_defects)
 
     if num_defects >= 1:
         est_psa = min(est_psa, 9.0)
         est_bgs = min(est_bgs, 9.5)
     if num_defects >= 3 or total_penalty >= 1.5:
         est_psa = min(est_psa, 8.0)
+        est_bgs = min(est_bgs, 8.5)
     if has_heavy_structural or total_penalty >= 2.5:
         est_psa = min(est_psa, 7.0)
+        est_bgs = min(est_bgs, 7.5)
 
-    tier_lbl = (
-        "Gem Mint" if est_psa >= 10.0 else
-        ("Mint" if est_psa >= 9.0 else
-         ("NM-MT" if est_psa >= 8.0 else
-          ("NM" if est_psa >= 7.0 else "EX-MT")))
-    )
+    def _tier_for_grade(val: float) -> str:
+        if val >= 10.0:
+            return "Gem Mint"
+        if val >= 9.0:
+            return "Mint"
+        if val >= 8.0:
+            return "NM-MT"
+        if val >= 7.0:
+            return "NM"
+        return "EX-MT"
+
+    psa_tier_lbl = _tier_for_grade(est_psa)
+    bgs_tier_lbl = _tier_for_grade(est_bgs)
+    tier_lbl = psa_tier_lbl
     sub_map = {
         "centering": sub_centering,
         "corners": sub_corners,
@@ -5918,8 +6006,8 @@ def recompute_grades_from_diagnostics(
         "surface": sub_surface,
     }
     out_diag["grades"] = {
-        "psa": {"overall": est_psa, "tier": tier_lbl, "subgrades": dict(sub_map)},
-        "bgs": {"overall": est_bgs, "tier": tier_lbl, "subgrades": dict(sub_map)},
+        "psa": {"overall": est_psa, "tier": psa_tier_lbl, "subgrades": dict(sub_map)},
+        "bgs": {"overall": est_bgs, "tier": bgs_tier_lbl, "subgrades": dict(sub_map)},
     }
 
     # Build structured 4-box notes + concise CSV Grading_Notes
@@ -6036,18 +6124,24 @@ def estimate_card_pregrade(
         else:
             back_box, back_edge_meta = detect_physical_card_box(back_img, return_meta=True)
 
-    if fg.get("skew_deg") is not None:
+    front_manual_skew = fg.get("skew_deg") is not None
+    if front_manual_skew:
         front_skew = round(float(np.clip(float(fg.get("skew_deg")), -6.0, 6.0)), 2)
     else:
         front_skew = estimate_card_skew_deg(front_img, front_box)
 
-    if bg.get("skew_deg") is not None:
+    back_manual_skew = bg.get("skew_deg") is not None
+    if back_manual_skew:
         back_skew = round(float(np.clip(float(bg.get("skew_deg")), -6.0, 6.0)), 2)
     else:
         back_skew = estimate_card_skew_deg(back_img, back_box)
 
-    front_work_img, front_work_box, front_M_inv = _deskew_image_and_box(front_img, front_box, front_skew)
-    back_work_img, back_work_box, back_M_inv = _deskew_image_and_box(back_img, back_box, back_skew)
+    front_work_img, front_work_box, front_M_inv = _deskew_image_and_box(
+        front_img, front_box, front_skew, min_abs_deg=0.05 if front_manual_skew else 0.35
+    )
+    back_work_img, back_work_box, back_M_inv = _deskew_image_and_box(
+        back_img, back_box, back_skew, min_abs_deg=0.05 if back_manual_skew else 0.35
+    )
 
     win4_res = None
     try:
@@ -6105,18 +6199,28 @@ def estimate_card_pregrade(
         raw_confirmed = list(win4_res.get("raw_confirmed_defects") or win4_res.get("confirmed_defects") or [])
         superficial_artifacts = list(win4_res.get("superficial_artifacts") or [])
         if front_M_inv is not None or back_M_inv is not None:
+            from Core.surface_defect_engine import _stable_defect_id
+
             fw, fh = front_img.size
             bw_im, bh_im = back_img.size
             for d_list in (raw_confirmed, superficial_artifacts):
+                used_canon_ids: set[str] = set()
                 for d_item in d_list:
                     bb_n = d_item.get("bbox_norm")
                     if not (isinstance(bb_n, list) and len(bb_n) == 4):
                         continue
-                    is_back = str(d_item.get("side") or "Front").strip().lower() == "back"
+                    side_s = str(d_item.get("side") or "Front").strip()
+                    is_back = side_s.lower() == "back"
                     m_inv = back_M_inv if is_back else front_M_inv
                     if m_inv is not None:
                         iw_s, ih_s = (bw_im, bh_im) if is_back else (fw, fh)
                         d_item["bbox_norm"] = _map_bbox_norm_inverse(bb_n, iw_s, ih_s, m_inv)
+                    d_item["id"] = _stable_defect_id(
+                        side_s,
+                        str(d_item.get("type") or "defect"),
+                        d_item["bbox_norm"],
+                        used_canon_ids,
+                    )
         artifact_warning = str(win4_res.get("artifact_warning") or "").strip()
     else:
         used_fallback = True
@@ -6295,6 +6399,21 @@ def _apply_csv_grade_and_cache_roi(
     if is_inventory and saved_rec:
         df.at[r_idx, "Rec_Sale_Price"] = saved_rec
     return df
+
+
+def _load_card_sidecar_overrides(
+    target_type: str,
+    sku: str,
+    batch_name: str = "",
+) -> tuple[Optional[dict], Optional[Path]]:
+    """Loads existing per-card grading overrides and diagnostics path if SKU is present."""
+    sku_s = str(sku or "").strip()
+    if not sku_s:
+        return None, None
+    diag_path = get_grading_diagnostics_path(target_type, sku_s, batch_name=batch_name)
+    diag = load_grading_diagnostics(diag_path)
+    ov = diag.get("overrides") if isinstance(diag, dict) else None
+    return (ov if isinstance(ov, dict) else None), diag_path
 
 
 def inspect_card_grading_diagnostics(
@@ -7518,7 +7637,11 @@ def reidentify_batch_cards(
                 c_fname_r = str(row.get("Corners_File", "")).strip() or (f_path.name[:-6] + "_C.jpg")
                 c_im_r = build_corners_inspection_sheet(f_img, b_oriented, front_box=f_box, back_box=b_box)
                 c_im_r.save(batch_dir / c_fname_r, format="JPEG", quality=92)
-                g_upd_r = estimate_card_pregrade(f_img, b_oriented, front_box=f_box, back_box=b_box)
+                ov_r, diag_r = _load_card_sidecar_overrides("batch", str(row.get("SKU") or "").strip(), batch_name=batch_dir.name)
+                g_upd_r = estimate_card_pregrade(
+                    f_img, b_oriented, front_box=f_box, back_box=b_box,
+                    overrides=ov_r, diagnostics_path=diag_r,
+                )
                 for gk, gv in g_upd_r.items():
                     df.at[r_idx, gk] = gv
                 if log_cb:
@@ -7588,7 +7711,11 @@ def regrade_batch_cards(
                 b_im = Image.open(b_p).convert("RGB") if b_p.exists() else f_im
                 f_box = detect_physical_card_box(f_im)
                 b_box = detect_physical_card_box(b_im)
-                g_res = estimate_card_pregrade(f_im, b_im, front_box=f_box, back_box=b_box)
+                ov_b, diag_b = _load_card_sidecar_overrides("batch", str(row.get("SKU") or "").strip(), batch_name=batch_dir.name)
+                g_res = estimate_card_pregrade(
+                    f_im, b_im, front_box=f_box, back_box=b_box,
+                    overrides=ov_b, diagnostics_path=diag_b,
+                )
                 for k, v in g_res.items():
                     df.at[idx, k] = v
                 if regenerate_corner_sheets and c_p.name:
@@ -7643,7 +7770,11 @@ def regrade_inventory_cards(
                 b_im = Image.open(b_p).convert("RGB") if (b_p and b_p.exists()) else f_im
                 f_box = detect_physical_card_box(f_im)
                 b_box = detect_physical_card_box(b_im)
-                g_res = estimate_card_pregrade(f_im, b_im, front_box=f_box, back_box=b_box)
+                ov_i, diag_i = _load_card_sidecar_overrides("inventory", str(row.get("SKU") or "").strip())
+                g_res = estimate_card_pregrade(
+                    f_im, b_im, front_box=f_box, back_box=b_box,
+                    overrides=ov_i, diagnostics_path=diag_i,
+                )
                 for k, v in g_res.items():
                     out.at[idx, k] = v
                 if regenerate_corner_sheets and c_p:
@@ -7811,12 +7942,15 @@ def reprocess_single_batch_card(
             c_im_s.save(batch_dir / c_fname_s, format="JPEG", quality=92)
         except Exception:
             pass
+        ov_sb, diag_sb = _load_card_sidecar_overrides("batch", sku_s, batch_name=batch_dir.name)
         g_res = estimate_card_pregrade(
             f_img,
             b_oriented,
             front_box=f_box,
             back_box=b_box,
             front_patch_tokens=id_res.get("front_patch_tokens"),
+            overrides=ov_sb,
+            diagnostics_path=diag_sb,
         )
         for gk, gv in g_res.items():
             df.at[r_idx, gk] = gv
@@ -8145,13 +8279,16 @@ def reprocess_inventory_skus(
                         log_cb(f"    ↻ [Post-ID Orient SKU {sku_s}] Front ↻{front_rot_2}° ({front_rsn_2})")
 
             if regrade_too or front_rot_ang != 0 or back_rot_ang != 0:
+                ov_si, diag_si = _load_card_sidecar_overrides("inventory", sku_s)
                 g_res = estimate_card_pregrade(
-            f_img,
-            b_oriented,
-            front_box=f_box,
-            back_box=b_box,
-            front_patch_tokens=id_res.get("front_patch_tokens"),
-        )
+                    f_img,
+                    b_oriented,
+                    front_box=f_box,
+                    back_box=b_box,
+                    front_patch_tokens=id_res.get("front_patch_tokens"),
+                    overrides=ov_si,
+                    diagnostics_path=diag_si,
+                )
                 for gk, gv in g_res.items():
                     if gk in inv_df.columns:
                         inv_df.at[r_idx, gk] = gv
@@ -8332,6 +8469,8 @@ def fix_card_rotations_and_regrade(
         f_p: Optional[Path],
         b_p: Optional[Path],
         c_p: Optional[Path],
+        target_type_str: str = "inventory",
+        batch_name_str: str = "",
     ) -> Optional[dict]:
         nonlocal fronts_rot_cnt, backs_rot_cnt
         if f_p is None or not f_p.exists():
@@ -8407,7 +8546,11 @@ def fix_card_rotations_and_regrade(
             except Exception:
                 pass
 
-        grade_upd = estimate_card_pregrade(f_oriented, b_oriented, front_box=f_box, back_box=b_box)
+        ov_rot, diag_rot = _load_card_sidecar_overrides(target_type_str, sku_s, batch_name=batch_name_str)
+        grade_upd = estimate_card_pregrade(
+            f_oriented, b_oriented, front_box=f_box, back_box=b_box,
+            overrides=ov_rot, diagnostics_path=diag_rot,
+        )
         if log_cb:
             log_cb(
                 f"  ↻ [FIXED] SKU {sku_s} — {set_n} #{cnum_n} {plr_n} [{sub_n}] | "
@@ -8420,6 +8563,7 @@ def fix_card_rotations_and_regrade(
     # Phase 1: Master Inventory (_My_Collection)
     orig_inv_snapshot = inv_df.copy() if (inv_work and not inv_df.empty) else pd.DataFrame()
     inv_impacted_indices: list[int] = []
+    inv_grade_updates: dict[int, dict] = {}
     if inv_work and not inv_df.empty:
         for r_idx in inv_work:
             checked += 1
@@ -8435,13 +8579,12 @@ def fix_card_rotations_and_regrade(
                     sku_s, set_n, sub_n, cnum_n, plr_n,
                     str(row.get("Est_PSA") or ""), str(row.get("Est_BGS") or ""),
                     f_p, b_p, c_p,
+                    target_type_str="inventory",
                 )
                 if g_upd is not None:
                     impacted += 1
                     if not dry_run:
-                        for gk, gv in g_upd.items():
-                            if gk in inv_df.columns:
-                                inv_df.at[r_idx, gk] = gv
+                        inv_grade_updates[r_idx] = g_upd
                         inv_impacted_indices.append(r_idx)
             except Exception as e:
                 if log_cb:
@@ -8454,19 +8597,8 @@ def fix_card_rotations_and_regrade(
                 })
 
         if inv_impacted_indices and not dry_run:
-            # Recalculate ROI on impacted rows only while strictly preserving manual Raw_Price / Rec_Sale_Price
-            saved_prices = {
-                ri: (str(inv_df.at[ri, "Raw_Price"]), str(inv_df.at[ri, "Rec_Sale_Price"]))
-                for ri in inv_impacted_indices
-            }
-            sub_roi = recalculate_dataframe_multi_grader_roi(inv_df.loc[inv_impacted_indices].copy())
-            for col_c in sub_roi.columns:
-                if col_c not in inv_df.columns:
-                    inv_df[col_c] = ""
-                inv_df.loc[inv_impacted_indices, col_c] = sub_roi[col_c]
-            for ri, (orig_raw, orig_rec) in saved_prices.items():
-                inv_df.at[ri, "Raw_Price"] = orig_raw
-                inv_df.at[ri, "Rec_Sale_Price"] = orig_rec
+            for ri in inv_impacted_indices:
+                _apply_csv_grade_and_cache_roi(inv_df, ri, inv_grade_updates[ri], is_inventory=True)
             inv_df = merge_inventory_updates_by_sku(
                 inv_df.loc[inv_impacted_indices].copy(),
                 baseline_df=orig_inv_snapshot,
@@ -8494,6 +8626,8 @@ def fix_card_rotations_and_regrade(
                     sku_s, set_n, sub_n, cnum_n, plr_n,
                     str(row.get("Est_PSA") or ""), str(row.get("Est_BGS") or ""),
                     f_p, b_p, c_p,
+                    target_type_str="batch",
+                    batch_name_str=b_dir.name,
                 )
                 if g_upd is not None:
                     impacted += 1
@@ -8755,23 +8889,16 @@ def replace_card_images_from_bytes(
         except Exception:
             pass
 
-        g_res = estimate_card_pregrade(final_f, final_b, front_box=f_box, back_box=b_box)
-        for gk, gv in g_res.items():
-            if gk in df.columns:
-                df.at[r_idx, gk] = gv
-
-        saved_raw = str(df.at[r_idx, "Raw_Price"]) if "Raw_Price" in df.columns else ""
-        saved_rec = str(df.at[r_idx, "Rec_Sale_Price"]) if "Rec_Sale_Price" in df.columns else ""
-        sub_roi = recalculate_dataframe_multi_grader_roi(df.loc[[r_idx]].copy())
-        for col_c in sub_roi.columns:
-            if col_c not in df.columns:
-                df[col_c] = ""
-            df.at[r_idx, col_c] = sub_roi.iloc[0][col_c]
-        if is_inventory:
-            if saved_raw:
-                df.at[r_idx, "Raw_Price"] = saved_raw
-            if saved_rec:
-                df.at[r_idx, "Rec_Sale_Price"] = saved_rec
+        ov_rep, diag_rep = _load_card_sidecar_overrides(
+            "inventory" if is_inventory else "batch",
+            sku,
+            batch_name=batch_name,
+        )
+        g_res = estimate_card_pregrade(
+            final_f, final_b, front_box=f_box, back_box=b_box,
+            overrides=ov_rep, diagnostics_path=diag_rep,
+        )
+        _apply_csv_grade_and_cache_roi(df, r_idx, g_res, is_inventory=is_inventory)
 
     if is_inventory:
         saved_df = save_inventory_df(df)
