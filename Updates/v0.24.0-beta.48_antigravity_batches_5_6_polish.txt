@@ -1,0 +1,13 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.24.0-beta.48
+TIMESTAMP: 2026-11-21 17:00:00
+TITLE: Antigravity Batches 5-6 & Audit Polish: Atomic Persistence & Locking
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Batch 5 (67d437d): Added atomic file persistence, cross-process file locking, RLock protection for neural embedding caches, and worker race-condition hardening.
+- Batch 6 (0e24ea5): Delivered UI polish, improved error handling and loading states, and removed dead code across App.jsx and launch_tabulas_hub.py.
+- Audit Polish (405d92b): Fixed benchmark GPU slot leak, added Guided Review bulk auto-clear, and ensured atomic checklist writes.
+=== CHANGELOG_END ===

@@ -1,0 +1,15 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.4
+TIMESTAMP: 2026-11-22 14:00:00
+TITLE: Track 2C: Deep-Dive Grading UI, Centering Gauge, CV Pass & TCDB Breaker
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Zero-Scrollbar Deep-Dive UI (cc3efd8, f3e9fe6, 5da6458): Viewport-locked Grading Deep-Dive layout with 10x corner loupes, zoom/pan, Flag Error loop, and PSA/BGS slab labels.
+- Virtual Centering Gauge & Re-Evaluate (5257e0e): Added Legends-style Virtual Centering Gauge with interactive geometry editing, virtual deskew, and `Apply Gauge & Re-Evaluate`.
+- Drop-Shadow Edge Detection & Guarded 3-Edge Solver (5257e0e, da96004, 4331bd0): Added drop-shadow edge detection, multi-format detection (Standard + A&G Mini), Stadium Club back recovery, and guarded 3-edge solver.
+- Defect Recall & Precision Pass (274b712, d7694aa, da96004): Tuned pinstripe, margin-bleed, bio-text `ink_spot`, and foil-tear calibration with PSA/BGS sub-grade ceilings.
+- TCDB 403 Circuit Breaker (4331bd0): Added automated 403 circuit breaker and backoff protections to TCDB scraping pipelines.
+=== CHANGELOG_END ===

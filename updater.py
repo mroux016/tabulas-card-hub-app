@@ -236,6 +236,7 @@ def parse_update_package_file(txt_path: Path) -> dict:
     version = _extract_header("VERSION", "")
     timestamp = _extract_header("TIMESTAMP", datetime.fromtimestamp(txt_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
     title = _extract_header("TITLE", txt_path.stem)
+    pkg_type = _extract_header("PACKAGE_TYPE", "").upper()
 
     # Extract Changelog bullets
     changelog_lines = []
@@ -295,15 +296,18 @@ def parse_update_package_file(txt_path: Path) -> dict:
             "operations": operations,
         })
 
+    is_changelog_only = (pkg_type == "CHANGELOG_ONLY") or (bool(version and changelog_lines) and not file_updates)
     return {
         "package_file": txt_path.name,
         "package_path": str(txt_path),
         "version": version,
         "timestamp": timestamp,
         "title": title,
+        "package_type": "CHANGELOG_ONLY" if is_changelog_only else "PATCH",
+        "is_changelog_only": is_changelog_only,
         "changelog": changelog_lines,
         "file_updates": file_updates,
-        "is_valid_package": bool(version and file_updates),
+        "is_valid_package": bool(version and (file_updates or changelog_lines)),
     }
 
 
@@ -566,6 +570,43 @@ def apply_update_package(pkg: dict, dry_run: bool = False) -> dict:
     cur_ver = reg.get("current_release_version", "0.22.0-beta.8")
     target_ver = pkg["version"]
     ts_str = pkg.get("timestamp") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if pkg.get("is_changelog_only") and not pkg.get("file_updates"):
+        if dry_run:
+            return {
+                "success": True,
+                "dry_run": True,
+                "changelog_only": True,
+                "version": target_ver,
+                "package_file": pkg["package_file"],
+                "files_modified": [],
+                "logs": ["  + [CHANGELOG_ONLY] Validated changelog record (no code diffs to apply)"],
+            }
+        reg["current_release_version"] = target_ver
+        if pkg["package_file"] not in reg.get("applied_packages", []):
+            reg.setdefault("applied_packages", []).append(pkg["package_file"])
+        reg.setdefault("version_history", []).append({
+            "version": target_ver,
+            "timestamp": ts_str,
+            "applied_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "title": pkg["title"],
+            "package_file": pkg["package_file"],
+            "files_modified": [],
+            "changelog": pkg["changelog"],
+        })
+        save_version_registry(reg)
+        _log_updater_event(f"RECORDED CHANGELOG v{target_ver} ({pkg['package_file']}) — {pkg['title']}")
+        return {
+            "success": True,
+            "dry_run": False,
+            "changelog_only": True,
+            "version": target_ver,
+            "package_file": pkg["package_file"],
+            "title": pkg["title"],
+            "files_modified": [],
+            "changelog": pkg["changelog"],
+            "logs": ["  + [CHANGELOG_ONLY] Recorded changelog entry in version_registry.json"],
+        }
 
     staged_writes: dict[str, str] = {}
     op_logs: list[str] = []

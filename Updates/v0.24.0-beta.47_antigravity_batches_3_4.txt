@@ -1,0 +1,12 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.24.0-beta.47
+TIMESTAMP: 2026-11-21 16:00:00
+TITLE: Antigravity Batches 3-4: REST API Guards, Comps Cache & Listing Writer
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Batch 3 (c8d69ac): Fixed REST API route handling, added static path traversal guards, exposed daily logs endpoints, and hardened safe Sale_ID generation.
+- Batch 4 (507dbbe): Restored Inventory Replace Scans & Comps Cache workflows, fixed Listing Writer saves, resolved stale poller closures, and stabilized client-side ID generation.
+=== CHANGELOG_END ===

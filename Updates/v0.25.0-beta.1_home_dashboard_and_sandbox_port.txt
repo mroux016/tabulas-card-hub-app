@@ -1,0 +1,12 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.1
+TIMESTAMP: 2026-11-21 18:45:00
+TITLE: Home Dashboard, Logo Navigation & Configurable Sandbox Port
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Home Dashboard (9790d0a): Added Home Dashboard overview, top-left logo home navigation, and `/api/dashboard/summary` backend aggregation endpoint.
+- Sandbox Port & Origin Support (c3a08d3, 2eb2fe0): Added configurable `--port` support in launch_tabulas_hub.py and dynamic `API_ORIGIN` resolution with `http://localhost:5000` fallback in App.jsx.
+=== CHANGELOG_END ===

@@ -1,0 +1,12 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.2
+TIMESTAMP: 2026-11-21 20:00:00
+TITLE: Track 1 & Polish: Incremental TCDB Checkpointing & Plan Preview
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Track 1 (0bdee4a): Implemented incremental TCDB scraping with per-set checkpointing, tier hints, smart image sync, and pre-run plan previews.
+- Track 1 Polish (e0aa46a): Added single-pass multi-mode plan preview, mtime-based checklist cache invalidation, and instant tab switching in the Set Scraper UI.
+=== CHANGELOG_END ===

@@ -1622,6 +1622,16 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json(cli.load_all_scheduled_jobs(query_live_os_status=True))
             return
 
+        if route == "/api/maintenance/schedule":
+            from Core.maintenance_scheduler import is_worker_pool_busy, load_maintenance_schedule
+            busy, reason = is_worker_pool_busy()
+            self._send_json({
+                "schedule": load_maintenance_schedule(),
+                "worker_busy": busy,
+                "busy_reason": reason,
+            })
+            return
+
         if route == "/api/config/tracked-sets":
             self._send_json(_load_tracked_sets_list())
             return
@@ -3025,6 +3035,52 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "schedules": synced, "messages": msgs})
             return
 
+        if route == "/api/maintenance/schedule" and isinstance(payload, dict):
+            from Core.maintenance_scheduler import update_maintenance_schedule
+            saved_ms = update_maintenance_schedule(payload)
+            self._send_json({"success": True, "schedule": saved_ms})
+            return
+
+        if route == "/api/maintenance/run-now" and isinstance(payload, dict):
+            import threading
+            from Core.maintenance_scheduler import (
+                TASK_DEFINITIONS,
+                is_worker_pool_busy,
+                load_maintenance_schedule,
+                run_maintenance_task,
+            )
+            task_id = str(payload.get("task_id") or "").strip()
+            if task_id not in TASK_DEFINITIONS:
+                self._send_json({"success": False, "error": f"Unknown maintenance task: {task_id}"}, status=400)
+                return
+            force_run = bool(payload.get("force", False))
+            sync_run = bool(payload.get("sync", False))
+            if not force_run:
+                busy, reason = is_worker_pool_busy()
+                if busy:
+                    def_res = run_maintenance_task(task_id, manual=True, respect_idle_guard=True)
+                    self._send_json(def_res)
+                    return
+            if sync_run:
+                res = run_maintenance_task(task_id, manual=True, respect_idle_guard=not force_run)
+                self._send_json(res)
+                return
+            threading.Thread(
+                target=run_maintenance_task,
+                args=(task_id,),
+                kwargs={"manual": True, "respect_idle_guard": not force_run},
+                name=f"tabulas-maint-{task_id}",
+                daemon=True,
+            ).start()
+            self._send_json({
+                "success": True,
+                "started": True,
+                "task_id": task_id,
+                "message": f"Started '{TASK_DEFINITIONS[task_id]['label']}' in background.",
+                "schedule": load_maintenance_schedule(),
+            })
+            return
+
         if route == "/api/sales/drafts/update" and isinstance(payload, dict):
             from Core.sales_engine import load_listing_drafts_df, save_listing_drafts_df
             draft_id = str(payload.get("Draft_ID") or "").strip()
@@ -3196,6 +3252,11 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
 
     # Pre-warm Master Checklist, Set Directory & Inventory caches asynchronously while window opens
     _start_background_cache_prewarm()
+    try:
+        from Core.maintenance_scheduler import start_maintenance_scheduler_daemon
+        start_maintenance_scheduler_daemon(poll_seconds=60)
+    except Exception:
+        pass
 
     if not force_browser:
         # Mode 1: Native Desktop App Window via pywebview (zero Chrome/browser tabs!)

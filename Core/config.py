@@ -241,6 +241,7 @@ LOGS_ROOT_DIR = BASE_DIR / "Logs"
 DAILY_LOGS_ROOT = LOGS_ROOT_DIR / "Logs"
 REPORTS_DIR = LOGS_ROOT_DIR / "Reports"
 DATA_DIR = BASE_DIR / "Data"
+MAINTENANCE_SCHEDULE_FILE = DATA_DIR / "maintenance_schedule.json"
 
 if IS_REORGANIZED_V24 or (SET_LIBRARY_ROOT / "Reference_Library").exists():
     REVIEWED_CARDS_DIR = SET_LIBRARY_ROOT / "_My_Collection"

@@ -14,7 +14,7 @@ const NODE_API_BASE = `${API_ORIGIN}/api`;
 // Authentic 9 Chrome-Pulse 3D Skins (Restored from Chrome-Pulse v4.5)
 const CHROME_PULSE_SKINS = {
   screenshot_signature_3d: {
-    name: '1. Chrome-Pulse 3D (Default)',
+    name: 'Chrome-Pulse 3D (Default)',
     tagline: 'Midnight Navy & Emerald/Cyan beveled 3D depth',
     swatch: 'linear-gradient(135deg, #10b981, #06b6d4)',
     appBg: 'bg-gradient-to-b from-[#080d18] via-[#060a12] to-[#04070d]',
@@ -28,7 +28,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-slate-100',
   },
   classic_bronze_3d: {
-    name: '2. Classic Warm Bronze & Obsidian 3D',
+    name: 'Classic Warm Bronze & Obsidian 3D',
     tagline: 'Warm amber-bronze accents paired with deep obsidian-cyan',
     swatch: 'linear-gradient(135deg, #f59e0b, #06b6d4)',
     appBg: 'bg-gradient-to-b from-[#141008] via-[#0a101f] to-[#04070d]',
@@ -42,7 +42,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-amber-50',
   },
   superfractor_gold: {
-    name: '3. Superfractor 1/1 (Gold Foil & Carbon)',
+    name: 'Superfractor 1/1 (Gold Foil & Carbon)',
     tagline: 'Brushed carbon slate with metallic 24k gold foil trim',
     swatch: 'linear-gradient(135deg, #eab308, #fde047)',
     appBg: 'bg-gradient-to-b from-[#121216] via-[#0c0c0e] to-[#08080a]',
@@ -56,7 +56,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-zinc-100',
   },
   sapphire_edition: {
-    name: '4. Topps Sapphire Chrome (Cracked Ice)',
+    name: 'Topps Sapphire Chrome (Cracked Ice)',
     tagline: 'Deep crystalline sapphire blue with ice-blue refractor borders',
     swatch: 'linear-gradient(135deg, #38bdf8, #3b82f6)',
     appBg: 'bg-gradient-to-b from-[#061330] via-[#040d21] to-[#030917]',
@@ -70,7 +70,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-sky-50',
   },
   quant_terminal: {
-    name: '5. Quant Drop Terminal (OLED Pro)',
+    name: 'Quant Drop Terminal (OLED Pro)',
     tagline: 'Pitch-black OLED institutional terminal & neon telemetry',
     swatch: 'linear-gradient(135deg, #10b981, #f59e0b)',
     appBg: 'bg-[#020408]',
@@ -84,7 +84,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-emerald-50',
   },
   finest_refractor: {
-    name: "6. Finest '93 Refractor (Holo Prism)",
+    name: "Finest '93 Refractor (Holo Prism)",
     tagline: '90s Topps Finest violet-indigo glass with fuchsia-cyan holo sheen',
     swatch: 'linear-gradient(135deg, #e879f9, #22d3ee)',
     appBg: 'bg-gradient-to-br from-[#120924] via-[#0c061a] to-[#070310]',
@@ -98,7 +98,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-slate-100',
   },
   stadium_club: {
-    name: '7. Stadium Club Modern (Slate & Crimson)',
+    name: 'Stadium Club Modern (Slate & Crimson)',
     tagline: 'Brushed zinc-slate 3D surfaces with iconic Topps crimson-red',
     swatch: 'linear-gradient(135deg, #f43f5e, #38bdf8)',
     appBg: 'bg-gradient-to-b from-zinc-900 via-zinc-950 to-[#09090b]',
@@ -112,7 +112,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-zinc-100',
   },
   bowman_turf_3d: {
-    name: '8. Bowman Draft Emerald Turf 3D',
+    name: 'Bowman Draft Emerald Turf 3D',
     tagline: 'Deep stadium forest-emerald 3D surfaces with lime-gold highlights',
     swatch: 'linear-gradient(135deg, #34d399, #a3e635)',
     appBg: 'bg-gradient-to-b from-[#061a12] via-[#04140e] to-[#030d09]',
@@ -126,7 +126,7 @@ const CHROME_PULSE_SKINS = {
     textMain: 'text-emerald-50',
   },
   cosmic_chrome_3d: {
-    name: '9. Cosmic Chrome Nebula 3D',
+    name: 'Cosmic Chrome Nebula 3D',
     tagline: 'Deep-space ultraviolet & electric cyan planetary glow',
     swatch: 'linear-gradient(135deg, #818cf8, #22d3ee)',
     appBg: 'bg-gradient-to-b from-[#0b0924] via-[#070617] to-[#04030e]',
@@ -4078,11 +4078,16 @@ export default function App() {
     skins: { collapsed: false, wide: false },
     alerts: { collapsed: false, wide: false },
     scheduler: { collapsed: false, wide: false },
+    maintenance: { collapsed: false, wide: true },
     storage: { collapsed: false, wide: false },
     hardware: { collapsed: false, wide: true },
     devtools: { collapsed: false, wide: true },
     telemetry: { collapsed: false, wide: true },
   });
+  const [maintenanceSchedule, setMaintenanceSchedule] = useState(null);
+  const [maintenanceWorkerBusy, setMaintenanceWorkerBusy] = useState({ busy: false, reason: '' });
+  const [savingMaintSchedule, setSavingMaintSchedule] = useState(false);
+  const [runningMaintTask, setRunningMaintTask] = useState('');
   const [computeStatus, setComputeStatus] = useState(null);
   const [computeBench, setComputeBench] = useState(null);
   const [runningComputeBench, setRunningComputeBench] = useState(false);
@@ -4104,11 +4109,62 @@ export default function App() {
       skins: { collapsed: false, wide: false },
       alerts: { collapsed: false, wide: false },
       scheduler: { collapsed: false, wide: false },
+      maintenance: { collapsed: false, wide: true },
       storage: { collapsed: false, wide: false },
       hardware: { collapsed: false, wide: true },
       devtools: { collapsed: false, wide: true },
       telemetry: { collapsed: false, wide: true },
     });
+  };
+
+  const refreshMaintenanceSchedule = () => {
+    fetch(`${NODE_API_BASE}/maintenance/schedule`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.schedule) setMaintenanceSchedule(d.schedule);
+        if (d) setMaintenanceWorkerBusy({ busy: !!d.worker_busy, reason: String(d.busy_reason || '') });
+      })
+      .catch(() => {});
+  };
+
+  const saveMaintenanceScheduleConfig = () => {
+    if (!maintenanceSchedule || !maintenanceSchedule.tasks) return;
+    setSavingMaintSchedule(true);
+    fetch(`${NODE_API_BASE}/maintenance/schedule`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tasks: maintenanceSchedule.tasks }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && res.schedule) setMaintenanceSchedule(res.schedule);
+        pushNotification('Maintenance Schedule Saved', 'Saved local-first maintenance configuration to Data/maintenance_schedule.json.', 'Scheduler', 'success');
+      })
+      .catch((e) => pushNotification('Maintenance Save Error', e.message || 'Failed to save schedule', 'Scheduler', 'error'))
+      .finally(() => setSavingMaintSchedule(false));
+  };
+
+  const triggerMaintenanceRunNow = (taskId) => {
+    setRunningMaintTask(taskId);
+    fetch(`${NODE_API_BASE}/maintenance/run-now`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_id: taskId }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && res.schedule) setMaintenanceSchedule(res.schedule);
+        if (res && res.deferred) {
+          pushNotification('Maintenance Deferred (Worker Busy)', res.message || 'Deferred until worker pool is idle.', 'Scheduler', 'warning');
+        } else if (res && res.success) {
+          pushNotification('Maintenance Task Started', res.message || `Started ${taskId}.`, 'Scheduler', 'info');
+          setTimeout(refreshMaintenanceSchedule, 2000);
+        } else {
+          pushNotification('Maintenance Task Error', res?.error || res?.message || 'Failed to start task', 'Scheduler', 'error');
+        }
+      })
+      .catch((e) => pushNotification('Maintenance Run Error', e.message || 'Request failed', 'Scheduler', 'error'))
+      .finally(() => setRunningMaintTask(''));
   };
 
   const refreshComputeStatus = (forceRefresh = false) => {
@@ -4250,6 +4306,7 @@ export default function App() {
     }).catch(() => {});
     fetch(`${NODE_API_BASE}/sold-cards`).then((r) => r.json()).then((sc) => sc && Array.isArray(sc.rows) && setSoldCards(sc.rows)).catch(() => {});
     fetch(`${NODE_API_BASE}/schedules`).then((r) => r.json()).then((sc) => Array.isArray(sc) && setSchedules(sc)).catch(() => {});
+    refreshMaintenanceSchedule();
     fetch(`${NODE_API_BASE}/notifications`).then((r) => r.json()).then((nt) => nt && Array.isArray(nt.notifications) && setNotifications(nt.notifications)).catch(() => {});
     fetch(`${NODE_API_BASE}/rate-learner`).then((r) => r.json()).then((rl) => rl && setRateLearnerStats(rl)).catch(() => {});
     fetch(`${NODE_API_BASE}/dashboard/summary`).then((r) => r.json()).then((ds) => {
@@ -11359,6 +11416,153 @@ export default function App() {
                                   </tr>
                                 ))
                               )}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* MODULE 3B: LOCAL-FIRST MAINTENANCE SCHEDULER */}
+                    <div className={`${modSpan('maintenance', 'lg:col-span-12')} ${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3 transition-all duration-200`}>
+                      <ModHeader
+                        modKey="maintenance"
+                        icon="🧹"
+                        title="Local Maintenance Scheduler (Caches, Indexes & Hygiene)"
+                        subtitle="Local-first background maintenance in Data/maintenance_schedule.json — automatically defers when any worker slot is active"
+                        accentCls="text-teal-300"
+                        extra={
+                          !settingsLayout.maintenance?.collapsed && (
+                            <div className="flex items-center gap-2">
+                              {maintenanceWorkerBusy.busy && (
+                                <span className="px-2 py-0.5 rounded-full bg-amber-950/80 border border-amber-500/40 text-[10px] font-semibold text-amber-300" title={maintenanceWorkerBusy.reason}>
+                                  ⏸️ Worker Busy (Auto-Defer Active)
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={refreshMaintenanceSchedule}
+                                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] font-semibold text-slate-200"
+                              >
+                                🔄 Refresh
+                              </button>
+                              <button
+                                type="button"
+                                disabled={savingMaintSchedule}
+                                onClick={saveMaintenanceScheduleConfig}
+                                className={`px-2.5 py-1 rounded-lg font-bold text-[11px] disabled:opacity-50 ${skin.accentBtn}`}
+                              >
+                                {savingMaintSchedule ? 'Saving...' : '💾 Save Schedule'}
+                              </button>
+                            </div>
+                          )
+                        }
+                      />
+                      {!settingsLayout.maintenance?.collapsed && (
+                        <div className="overflow-auto border border-slate-800 rounded-xl">
+                          <table className="w-full text-left text-xs whitespace-nowrap">
+                            <thead className="bg-slate-950 text-slate-400">
+                              <tr>
+                                <th className="p-2">Enabled</th>
+                                <th className="p-2">Maintenance Task</th>
+                                <th className="p-2">Interval</th>
+                                <th className="p-2">Time (24h)</th>
+                                <th className="p-2">Last Run</th>
+                                <th className="p-2">Status</th>
+                                <th className="p-2">Action</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800">
+                              {Object.values((maintenanceSchedule && maintenanceSchedule.tasks) || {}).map((t) => {
+                                const st = String(t.last_status || 'idle').toLowerCase();
+                                const stCls = st === 'ok'
+                                  ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
+                                  : st === 'deferred'
+                                  ? 'bg-amber-950 text-amber-300 border-amber-700'
+                                  : st === 'error'
+                                  ? 'bg-rose-950 text-rose-300 border-rose-700'
+                                  : 'bg-slate-900 text-slate-400 border-slate-700';
+                                return (
+                                  <tr key={t.task_id}>
+                                    <td className="p-2">
+                                      <input
+                                        type="checkbox"
+                                        checked={!!t.enabled}
+                                        onChange={(e) => {
+                                          const checked = e.target.checked;
+                                          setMaintenanceSchedule((prev) => ({
+                                            ...(prev || {}),
+                                            tasks: {
+                                              ...((prev && prev.tasks) || {}),
+                                              [t.task_id]: { ...t, enabled: checked },
+                                            },
+                                          }));
+                                        }}
+                                      />
+                                    </td>
+                                    <td className="p-2 max-w-[340px]">
+                                      <div className="font-bold text-slate-100 truncate">{t.label}</div>
+                                      <div className="text-[10px] text-slate-400 truncate" title={t.last_message || t.description}>
+                                        {t.last_message || t.description}
+                                      </div>
+                                    </td>
+                                    <td className="p-2">
+                                      <select
+                                        value={t.cron_or_interval || 'daily'}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setMaintenanceSchedule((prev) => ({
+                                            ...(prev || {}),
+                                            tasks: {
+                                              ...((prev && prev.tasks) || {}),
+                                              [t.task_id]: { ...t, cron_or_interval: val },
+                                            },
+                                          }));
+                                        }}
+                                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs"
+                                      >
+                                        <option value="daily">Daily</option>
+                                        <option value="every_12h">Every 12h</option>
+                                        <option value="every_6h">Every 6h</option>
+                                        <option value="hourly">Hourly</option>
+                                        <option value="weekly">Weekly</option>
+                                      </select>
+                                    </td>
+                                    <td className="p-2">
+                                      <input
+                                        type="time"
+                                        value={t.time_of_day || '03:00'}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setMaintenanceSchedule((prev) => ({
+                                            ...(prev || {}),
+                                            tasks: {
+                                              ...((prev && prev.tasks) || {}),
+                                              [t.task_id]: { ...t, time_of_day: val },
+                                            },
+                                          }));
+                                        }}
+                                        className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 font-mono text-xs"
+                                      />
+                                    </td>
+                                    <td className="p-2 font-mono text-[11px] text-slate-300">{t.last_run || 'Never'}</td>
+                                    <td className="p-2">
+                                      <span className={`px-2 py-0.5 rounded-full border text-[10px] font-bold uppercase ${stCls}`}>
+                                        {st}{t.deferred_count > 0 ? ` (${t.deferred_count})` : ''}
+                                      </span>
+                                    </td>
+                                    <td className="p-2">
+                                      <button
+                                        type="button"
+                                        disabled={runningMaintTask === t.task_id}
+                                        onClick={() => triggerMaintenanceRunNow(t.task_id)}
+                                        className="px-2.5 py-1 rounded-lg bg-emerald-950 hover:bg-emerald-800 border border-emerald-700 text-emerald-200 text-[11px] font-bold disabled:opacity-40"
+                                      >
+                                        {runningMaintTask === t.task_id ? '⏳ Running...' : '▶️ Run Now'}
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
                             </tbody>
                           </table>
                         </div>

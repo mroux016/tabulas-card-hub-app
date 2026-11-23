@@ -1,0 +1,13 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.5
+TIMESTAMP: 2026-11-22 20:00:00
+TITLE: Audit Waves 1 & 2 + Wave 3A: Concurrency, Geometry & Learned Set Priors
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Audit Wave 1 (d7b525d): Added PID-safe file locks, atomic Inventory/Master Checklist writes, TCDB queue gate, and tracked driver cleanup.
+- Audit Wave 2 (d85424f): Unified deskew coordinate consistency, added 0.1 degree rotation controls, added back-emblem `ink_spot` guard, and hardened App.jsx fetch hygiene.
+- Wave 3A Learned Set & Mini Priors (203d8ff): Added `learned_set_priors.json` 3-tier hierarchy `(set, subset, side)` -> `(set, side)` -> `(card_format, side)` and `rebuild_learned_set_priors()` from `grading_feedback_log.jsonl`.
+=== CHANGELOG_END ===

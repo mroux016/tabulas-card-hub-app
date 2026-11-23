@@ -1,0 +1,13 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.3
+TIMESTAMP: 2026-11-21 22:00:00
+TITLE: Tracks 2A, 2B & 3: DirectML DINOv2, Surface Defects & Market Comps
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Track 2A (9049e44): Added micro-batched DirectML DINOv2 neural vision embeddings with multi-region spatial patches and color/foil parallel matching.
+- Track 2B (ca8fd9e): Introduced GPU Win #4 through-sleeve surface defect and artifact discrimination engine (`Core/surface_defect_engine.py`).
+- Track 3 (6df3cb4): Added exact-card trimmed median comps, `Valuation_Source` tracking, and auto-recalculating Sales Strategy pricing.
+=== CHANGELOG_END ===

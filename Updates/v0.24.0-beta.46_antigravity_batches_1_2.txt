@@ -1,0 +1,12 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.24.0-beta.46
+TIMESTAMP: 2026-11-21 15:30:00
+TITLE: Antigravity Batches 1-2: Stability, 3-Drive Scheduler & GPU Decoupling
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Batch 1 (46067a3): Fixed critical crashes and data-safety issues across Core/database.py, Core/rate_learner.py, Core/scraper_engine.py, Core/vision_grader.py, and cli.py.
+- Batch 2 (574bd42): Standardized 3-drive scheduler paths, deduplicated parallel worker slots, enforced cache-only market comps lookups, and decoupled GPU compute settings from vision grading.
+=== CHANGELOG_END ===

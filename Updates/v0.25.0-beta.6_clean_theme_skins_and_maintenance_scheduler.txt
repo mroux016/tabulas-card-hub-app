@@ -1,0 +1,14 @@
+===========================================================================
+TABULAS_UPDATE_PACKAGE: v1
+PACKAGE_TYPE: CHANGELOG_ONLY
+VERSION: 0.25.0-beta.6
+TIMESTAMP: 2026-11-23 11:00:00
+TITLE: Clean Theme Skins, Local Maintenance Scheduler & Changelog-Only Updates
+AUTHOR: Antigravity
+===========================================================================
+=== CHANGELOG_START ===
+- Unnumbered Theme Skins: Removed leading numeric prefixes from all 9 Chrome-Pulse 3D skin display names in App.jsx while preserving underlying theme keys and `LEGACY_SKIN_KEY_MAP` compatibility.
+- Local-First Maintenance Scheduler (`Core/maintenance_scheduler.py`, `Data/maintenance_schedule.json`): Added atomic, lock-safe scheduling and UI `Run Now` controls for Neural Embedding Cache & Visual Index Rebuild, Master Checklist & Template Rollup, Learned Set Priors Refresh, and Housekeeping & Hygiene.
+- Worker Idle-Guard Deferral: Scheduled and manual maintenance tasks automatically defer when any worker slot (`slot_1`..`slot_8`) or stop-signal is active.
+- Changelog-Only Update Packages (`updater.py`): Added `PACKAGE_TYPE: CHANGELOG_ONLY` parsing and dry-run/apply support for historical release records.
+=== CHANGELOG_END ===
