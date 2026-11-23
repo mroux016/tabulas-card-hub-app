@@ -76,6 +76,8 @@ from Core.sales_engine import (
     save_listing_drafts_df,
 )
 from Core.scraper_engine import (
+    CloudflareEdgeBlockPaused,
+    DEFAULT_MAX_CARDS_PER_RUN,
     archive_existing_checklists_for_clean_slate,
     crawl_tcdb_master_set_directory,
     load_schedule_config,
@@ -94,6 +96,7 @@ from Core.scraper_engine import (
     run_tcdb_checklist_pipeline,
     set_log_callback,
     set_progress_callback,
+    set_stop_check_callback,
     sync_set_library_download_status,
 )
 from Core.vision_grader import (
@@ -1365,8 +1368,22 @@ def run_background_job_from_file(payload_path: Path):
 
     threading.Thread(target=_heartbeat_loop, name=f"hb-{target_lane}", daemon=True).start()
 
+    def _stop_check_cb() -> bool:
+        if _hb_stop.is_set():
+            return True
+        try:
+            sf_chk = get_lane_state_file(target_lane)
+            if sf_chk.exists():
+                st_chk = json.loads(sf_chk.read_text(encoding="utf-8-sig"))
+                if str(st_chk.get("status", "")).upper() == "STOPPED":
+                    return True
+        except Exception:
+            pass
+        return False
+
     set_log_callback(_worker_log_cb)
     set_progress_callback(_structured_progress_cb)
+    set_stop_check_callback(_stop_check_cb)
 
     # Initialize GPU acceleration (DirectML/CUDA OCR + OpenCL UMat) & claim VRAM guardrail slot for vision jobs
     init_worker_compute_backend(job_type=job_type, log_cb=_worker_log_cb)
@@ -1803,7 +1820,12 @@ def run_background_job_from_file(payload_path: Path):
                 force_refresh=bool(payload.get("force_refresh", False)),
             )
         elif job_type == "tcdb_download_all_images":
-            mode_download_all_catalog_images(target_queue=payload.get("target_queue"))
+            raw_max = payload.get("max_cards_per_run", DEFAULT_MAX_CARDS_PER_RUN)
+            max_cards = None if raw_max in (None, "", 0, "0") else int(raw_max)
+            mode_download_all_catalog_images(
+                target_queue=payload.get("target_queue"),
+                max_cards_per_run=max_cards,
+            )
         elif job_type == "tcdb_checklist_and_images":
             mode_checklist_and_images_card_by_card(
                 target_queue=payload.get("target_queue") or payload.get("selected_tcdb_sets"),
@@ -1955,6 +1977,21 @@ def run_background_job_from_file(payload_path: Path):
             total_cards=int(state_tracker.get("total_cards") or 0),
         )
         append_job_log(f"FINISHED [OK]: {title} (PID {my_pid}) | Elapsed: {el_fmt} ({total_el_s}s).", lane=target_lane, run_log_file=run_log_path)
+    except CloudflareEdgeBlockPaused as cf_pause:
+        append_job_log(f"⏸️ PAUSED SAFELY: {cf_pause}", lane=target_lane, run_log_file=run_log_path)
+        write_job_state(
+            "PAUSED",
+            job_type,
+            title,
+            current=state_tracker["current"],
+            total=state_tracker["total"],
+            current_item=str(cf_pause),
+            start_epoch=start_ep,
+            pid=0,
+            lane=target_lane,
+            completed_cards=int(state_tracker.get("completed_cards") or 0),
+            total_cards=int(state_tracker.get("total_cards") or 0),
+        )
     except Exception as e:
         tb_str = traceback.format_exc()
         append_job_log(f"ERROR [EXCEPTION]: {e}\n{tb_str}", lane=target_lane, run_log_file=run_log_path)
@@ -1964,6 +2001,7 @@ def run_background_job_from_file(payload_path: Path):
         release_gpu_worker_slot()
         set_log_callback(None)
         set_progress_callback(None)
+        set_stop_check_callback(None)
         base_lane = base_lane_from_slot(target_lane)
         pending_q = load_lane_job_queue(base_lane)
         if pending_q:

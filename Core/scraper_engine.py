@@ -8,8 +8,10 @@ import csv
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -57,6 +59,7 @@ from Core.config import (
     CHECKLIST_PATH,
     DEAD_BACKS_CACHE_PATH,
     DEAD_FRONTS_CACHE_PATH,
+    DOWNLOADED_FILES_DIR,
     INVENTORY_DIR,
     IS_REORGANIZED_V24,
     LOGS_DIR,
@@ -164,8 +167,17 @@ RUN_METRICS: dict = {
     "sets": {},
 }
 
+IMAGE_CARD_JITTER_MIN_S = 3.5
+IMAGE_CARD_JITTER_MAX_S = 7.5
+IMAGE_BREATHER_EVERY_CARDS = 500
+IMAGE_BREATHER_MIN_S = 180.0
+IMAGE_BREATHER_MAX_S = 300.0
+DEFAULT_MAX_CARDS_PER_RUN = 4000
+CLOUDFLARE_COOLDOWN_SCHEDULE_S = (900.0, 1800.0, 3600.0)
+
 _LOG_CALLBACK: Optional[Callable[[str], None]] = None
 _PROGRESS_CALLBACK: Optional[Callable[[dict], None]] = None
+_STOP_CHECK_CALLBACK: Optional[Callable[[], bool]] = None
 
 
 def set_log_callback(cb: Optional[Callable[[str], None]]):
@@ -176,6 +188,20 @@ def set_log_callback(cb: Optional[Callable[[str], None]]):
 def set_progress_callback(cb: Optional[Callable[[dict], None]]):
     global _PROGRESS_CALLBACK
     _PROGRESS_CALLBACK = cb
+
+
+def set_stop_check_callback(cb: Optional[Callable[[], bool]]):
+    global _STOP_CHECK_CALLBACK
+    _STOP_CHECK_CALLBACK = cb
+
+
+def is_stop_requested() -> bool:
+    if _STOP_CHECK_CALLBACK is not None:
+        try:
+            return bool(_STOP_CHECK_CALLBACK())
+        except Exception:
+            return False
+    return False
 
 
 def emit_progress(**kwargs):
@@ -320,19 +346,66 @@ class StealthBrowserError(Exception):
     pass
 
 
-def cleanup_orphaned_drivers():
-    if os.name != "nt":
-        return
-    for proc in ("uc_driver.exe", "chromedriver.exe"):
+class CloudflareEdgeBlockPaused(Exception):
+    """Raised when Cloudflare /Images/ rate-limiting persists across all circuit-breaker cooldowns or stop is requested."""
+    pass
+
+
+def cleanup_stale_driver_locks(
+    max_age_seconds: float = 0.0,
+    extra_dirs: Optional[list[Path]] = None,
+) -> list[Path]:
+    """
+    Removes stale SeleniumBase `driver_fixing.lock` files across candidate `downloaded_files`
+    directories so a crashed stealth-browser launch never blocks future retries.
+    """
+    removed: list[Path] = []
+    candidate_dirs = [
+        Path.cwd() / "downloaded_files",
+        BASE_DIR / "downloaded_files",
+        DOWNLOADED_FILES_DIR,
+    ]
+    if extra_dirs:
+        candidate_dirs.extend(extra_dirs)
+
+    seen: set[str] = set()
+    now = time.time()
+    for d in candidate_dirs:
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", proc, "/T"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
+            lock_path = Path(d) / "driver_fixing.lock"
+            key = str(lock_path.resolve()) if lock_path.exists() else str(lock_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if lock_path.exists() and lock_path.is_file():
+                if max_age_seconds > 0:
+                    age = now - float(lock_path.stat().st_mtime)
+                    if age < max_age_seconds:
+                        continue
+                try:
+                    os.chmod(lock_path, stat.S_IWRITE)
+                except Exception:
+                    pass
+                lock_path.unlink(missing_ok=True)
+                removed.append(lock_path)
         except Exception:
-            pass
+            continue
+    return removed
+
+
+def cleanup_orphaned_drivers():
+    if os.name == "nt":
+        for proc in ("uc_driver.exe", "chromedriver.exe"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", proc, "/T"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+    cleanup_stale_driver_locks()
 
 
 def sanitize_header_value(val):
@@ -357,6 +430,8 @@ def connect_session(existing_session=None, max_attempts: int = 5, target_domain:
         return requests.Session()
 
     for attempt in range(1, max_attempts + 1):
+        if is_stop_requested():
+            raise CloudflareEdgeBlockPaused("Cancelled during stealth browser launch")
         try:
             cleanup_orphaned_drivers()
             time.sleep(1.5)
@@ -385,13 +460,117 @@ def connect_session(existing_session=None, max_attempts: int = 5, target_domain:
                 log_msg("✅ Cloudflare clearance acquired!")
                 return req_session
 
+        except CloudflareEdgeBlockPaused:
+            raise
         except Exception as e:
             err_line = str(e).splitlines()[0] if str(e) else "Unknown Error"
             wait_s = 4 * attempt
+            cleanup_orphaned_drivers()
             log_msg(f"  ⚠️ Stealth browser handshake failed ({err_line}). Retrying in {wait_s}s ({attempt}/{max_attempts})...")
             time.sleep(wait_s)
 
     raise StealthBrowserError("Failed to establish Stealth Browser session after maximum retries.")
+
+
+class CloudflareImageCircuitBreaker:
+    """
+    Guards TCDB image downloads against Cloudflare edge 403/429 death loops:
+      - Allows at most 1 stealth-browser re-auth attempt per block burst.
+      - If the very next request after re-auth still returns 403 (or 429 exhausts),
+        trips exponential cooldowns (15m -> 30m -> 60m) polling stop signals every 2s.
+      - After 3 failed cooldowns, raises `CloudflareEdgeBlockPaused` cleanly.
+    """
+
+    def __init__(
+        self,
+        cooldown_schedule: tuple[float, ...] = CLOUDFLARE_COOLDOWN_SCHEDULE_S,
+        stop_poll_interval: float = 2.0,
+        stop_check: Optional[Callable[[], bool]] = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        reauth_fn: Optional[Callable[..., object]] = None,
+    ):
+        self.cooldown_schedule = tuple(float(x) for x in cooldown_schedule)
+        self.stop_poll_interval = max(0.05, float(stop_poll_interval))
+        self.stop_check = stop_check
+        self.sleep_fn = sleep_fn
+        self.reauth_fn = reauth_fn
+        self.consecutive_blocks = 0
+        self.reauth_attempted_in_burst = False
+        self.awaiting_post_reauth_probe = False
+        self.cooldown_stage = 0
+        self.total_reauths = 0
+        self.total_cooldowns = 0
+        self.tripped_pause = False
+
+    def _is_stopped(self) -> bool:
+        if self.stop_check is not None:
+            try:
+                if self.stop_check():
+                    return True
+            except Exception:
+                pass
+        return is_stop_requested()
+
+    def record_success(self):
+        self.consecutive_blocks = 0
+        self.reauth_attempted_in_burst = False
+        self.awaiting_post_reauth_probe = False
+        self.cooldown_stage = 0
+
+    def interruptible_sleep(self, seconds: float, reason: str = "") -> bool:
+        remaining = max(0.0, float(seconds))
+        while remaining > 0.0:
+            if self._is_stopped():
+                if reason:
+                    log_msg(f"🛑 Stop requested during {reason}; exiting cleanly.")
+                return False
+            chunk = min(self.stop_poll_interval, remaining)
+            self.sleep_fn(chunk)
+            remaining -= chunk
+        return not self._is_stopped()
+
+    def handle_block(self, status_code: int, url: str, req_session) -> str:
+        self.consecutive_blocks += 1
+
+        if status_code == 403 and not self.reauth_attempted_in_burst:
+            self.reauth_attempted_in_burst = True
+            self.awaiting_post_reauth_probe = True
+            self.total_reauths += 1
+            log_msg(
+                f"  🛡️ [HTTP 403 Circuit Breaker] Burst #{self.consecutive_blocks} on {url} — "
+                f"Running single stealth-browser re-auth attempt (1/1)..."
+            )
+            reauth_callable = self.reauth_fn or connect_session
+            reauth_callable(existing_session=req_session, target_domain=BASE_URL)
+            if not self.interruptible_sleep(3.0, reason="post-reauth settle"):
+                raise CloudflareEdgeBlockPaused("Cancelled during Cloudflare re-auth")
+            return "retry"
+
+        self.awaiting_post_reauth_probe = False
+        if self.cooldown_stage >= len(self.cooldown_schedule):
+            self.tripped_pause = True
+            msg = "Cloudflare /Images/ rate-limit active — paused safely"
+            log_msg(
+                f"🛑 {msg} (HTTP {status_code} persisted after {len(self.cooldown_schedule)} cooldowns: "
+                f"{' -> '.join(f'{int(s // 60)}m' for s in self.cooldown_schedule)})."
+            )
+            emit_progress(current_item=msg)
+            raise CloudflareEdgeBlockPaused(msg)
+
+        wait_s = self.cooldown_schedule[self.cooldown_stage]
+        self.cooldown_stage += 1
+        self.total_cooldowns += 1
+        wait_mins = wait_s / 60.0
+        log_msg(
+            f"🛑 [Cloudflare Edge Block Circuit Breaker] HTTP {status_code} persisted on {url}. "
+            f"Sleeping {wait_mins:.1f}m (cooldown {self.cooldown_stage}/{len(self.cooldown_schedule)})..."
+        )
+        emit_progress(
+            current_item=f"⏸️ Cloudflare /Images/ cooldown ({wait_mins:.0f}m, stage {self.cooldown_stage}/{len(self.cooldown_schedule)})..."
+        )
+        if not self.interruptible_sleep(wait_s, reason=f"Cloudflare cooldown {self.cooldown_stage}/{len(self.cooldown_schedule)}"):
+            raise CloudflareEdgeBlockPaused("Cancelled during Cloudflare cooldown")
+        return "retry"
 
 
 class AdaptiveRateController:
@@ -440,17 +619,26 @@ def safe_get(
     timeout: int = 30,
     silent_404: bool = False,
     max_403_retries: Optional[int] = None,
+    status_out: Optional[dict] = None,
+    circuit_breaker: Optional[CloudflareImageCircuitBreaker] = None,
 ):
     """
     Adaptive rate-aware HTTP GET sharing the unified `tcdb_domain` sliding-window bucket:
       - Separates HTTP 429 retries (up to 5 window-aware retries) from normal retries.
       - Supports `max_403_retries=1` for optional pages like `Errors.cfm` so disabled
         pages never loop Stealth Browser launches.
+      - Supports `status_out` for strict HTTP status reporting and `circuit_breaker`
+        for Cloudflare /Images/ 403/429 edge-block protection.
     """
     clean_url = quote(str(url), safe=":/?=&%-")
     clean_headers = {k: sanitize_header_value(v) for k, v in (headers or {}).items()}
     learner = get_rate_learner()
     ep_key = learner.classify_tcdb_endpoint(clean_url)
+
+    def _record_status(code: int, err: str = ""):
+        if isinstance(status_out, dict):
+            status_out["status_code"] = int(code)
+            status_out["error"] = err
 
     net_attempt = 0
     rl_attempt = 0
@@ -458,6 +646,8 @@ def safe_get(
     max_rl_retries = 5
 
     while net_attempt < retries:
+        if is_stop_requested():
+            raise CloudflareEdgeBlockPaused("Cancelled during HTTP fetch")
         learner.wait_before_request(ep_key)
         t0 = time.time()
         try:
@@ -469,23 +659,41 @@ def safe_get(
                 if "image" not in ct:
                     txt_head = (res.text or "")[:600]
                     if "Just a moment..." in txt_head or "cf-browser-verification" in txt_head:
-                        net_attempt += 1
+                        _record_status(403, "cf_challenge_200")
                         learner.record_cf_challenge(ep_key)
+                        if circuit_breaker is not None:
+                            action = circuit_breaker.handle_block(403, clean_url, req_session)
+                            if action == "retry":
+                                continue
+                            return None
+                        net_attempt += 1
                         log_msg(f"  🛡️ [HTTP 200 CF-Challenge | {elapsed_ms}ms] {clean_url} — Refreshing session ({net_attempt}/{retries})")
                         connect_session(existing_session=req_session, target_domain=BASE_URL)
                         time.sleep(3)
                         continue
+                _record_status(200, "")
                 learner.record_success(ep_key, elapsed_ms=elapsed_ms, status_code=200)
+                if circuit_breaker is not None:
+                    circuit_breaker.record_success()
                 return res
             elif res.status_code == 404:
+                _record_status(404, "404")
                 learner.record_success(ep_key, elapsed_ms=elapsed_ms, status_code=404)
+                if circuit_breaker is not None:
+                    circuit_breaker.record_success()
                 if not silent_404:
                     log_msg(f"  [HTTP 404 Not Found | {elapsed_ms}ms] {clean_url}")
                 return None
             elif res.status_code == 403:
+                _record_status(403, "403")
+                learner.record_cf_challenge(ep_key)
+                if circuit_breaker is not None:
+                    action = circuit_breaker.handle_block(403, clean_url, req_session)
+                    if action == "retry":
+                        continue
+                    return None
                 net_attempt += 1
                 cf_403_attempt += 1
-                learner.record_cf_challenge(ep_key)
                 if max_403_retries is not None and cf_403_attempt > max_403_retries:
                     log_msg(f"  ℹ️ [HTTP 403 Guard | {elapsed_ms}ms] {clean_url} still 403 after {max_403_retries} refresh(es) — skipping optional page.")
                     return None
@@ -494,6 +702,7 @@ def safe_get(
                 time.sleep(3)
                 continue
             elif res.status_code == 429:
+                _record_status(429, "429")
                 rl_attempt += 1
                 ra_hdr = res.headers.get("Retry-After") if hasattr(res, "headers") else None
                 wait_time, learn_note = learner.record_rate_limit(ep_key, retry_after_header=ra_hdr)
@@ -502,11 +711,17 @@ def safe_get(
                     f"Window-aware cooldown {wait_time:.0f}s ({rl_attempt}/{max_rl_retries}) | 🧠 {learn_note}"
                 )
                 if rl_attempt >= max_rl_retries:
+                    if circuit_breaker is not None:
+                        action = circuit_breaker.handle_block(429, clean_url, req_session)
+                        if action == "retry":
+                            rl_attempt = 0
+                            continue
                     log_msg(f"  ❌ [HTTP 429 Exhausted] Giving up on {clean_url} after {max_rl_retries} rate-limit retries.")
                     return None
                 time.sleep(wait_time)
                 continue
             elif res.status_code in (500, 502, 503, 504):
+                _record_status(res.status_code, f"http_{res.status_code}")
                 net_attempt += 1
                 log_msg(f"  ⚠️ [HTTP {res.status_code} Server Error | {elapsed_ms}ms] {clean_url} — Retry ({net_attempt}/{retries})")
                 if net_attempt < retries:
@@ -514,13 +729,15 @@ def safe_get(
                     continue
                 return None
             else:
+                _record_status(res.status_code, f"http_{res.status_code}")
                 net_attempt += 1
                 log_msg(f"  ⚠️ [HTTP {res.status_code} | {elapsed_ms}ms] {clean_url} — Attempt ({net_attempt}/{retries})")
                 if net_attempt < retries:
                     time.sleep(8 * net_attempt)
-        except StealthBrowserError:
+        except (StealthBrowserError, CloudflareEdgeBlockPaused):
             raise
         except Exception as e:
+            _record_status(0, "network_error")
             net_attempt += 1
             elapsed_ms = int((time.time() - t0) * 1000)
             err_line = str(e).splitlines()[0] if str(e) else type(e).__name__
@@ -3818,6 +4035,7 @@ def scrape_tcdb_checklist_set(
     dead_fronts = load_dead_fronts_cache() if download_images_card_by_card else {}
     dead_backs_dirty = False
     dead_fronts_dirty = False
+    img_circuit_breaker = CloudflareImageCircuitBreaker(stop_check=is_stop_requested) if download_images_card_by_card else None
     img_stats = {"front_dl": 0, "back_dl": 0, "front_skip": 0, "back_skip": 0, "no_back": 0, "back_only_skip": 0, "no_img": 0, "cards_seen": 0}
 
     def _download_card_immediately(c_row: dict):
@@ -3904,6 +4122,7 @@ def scrape_tcdb_checklist_set(
             img_stats["no_img"] += 1
             f_note = "Skip(DeadFrontCached)"
         else:
+            f_out: dict = {}
             q_f = _download_single_template_side(
                 req_session,
                 f_urls["rep"],
@@ -3913,6 +4132,8 @@ def scrape_tcdb_checklist_set(
                 set_key=cat_key,
                 thumb_url=f_thumb,
                 preferred_tier=f_hint,
+                outcome_out=f_out,
+                circuit_breaker=img_circuit_breaker,
             )
             if q_f:
                 has_front = True
@@ -3923,10 +4144,13 @@ def scrape_tcdb_checklist_set(
                 entry["front"] = {"quality": q_f, "file": f_fname}
                 kb_f = f_path.stat().st_size / 1024.0 if f_path.exists() else 0.0
                 f_note = f"{q_f}-Tier OK ({kb_f:.1f}KB)"
-            else:
+            elif f_out.get("confirmed_404"):
                 dead_fronts[cid] = time.time()
                 dead_fronts_dirty = True
                 f_note = "Miss(404->Cached)"
+            else:
+                err_c = int(f_out.get("status_code", 0) or 0)
+                f_note = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
 
         existing_b_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
         if existing_b_note:
@@ -3945,6 +4169,7 @@ def scrape_tcdb_checklist_set(
             img_stats["no_back"] += 1
             b_note = "Skip(DeadBackCached)"
         else:
+            b_out: dict = {}
             q_b = _download_single_template_side(
                 req_session,
                 b_urls["rep"],
@@ -3954,6 +4179,8 @@ def scrape_tcdb_checklist_set(
                 set_key=cat_key,
                 thumb_url=b_thumb,
                 preferred_tier=b_hint or q_f_winner,
+                outcome_out=b_out,
+                circuit_breaker=img_circuit_breaker,
             )
             if q_b:
                 img_stats["back_dl"] += 1
@@ -3962,10 +4189,13 @@ def scrape_tcdb_checklist_set(
                 entry["back"] = {"quality": q_b, "file": b_fname}
                 kb_b = b_path.stat().st_size / 1024.0 if b_path.exists() else 0.0
                 b_note = f"{q_b}-Tier OK ({kb_b:.1f}KB)"
-            else:
+            elif b_out.get("confirmed_404"):
                 dead_backs[cid] = time.time()
                 dead_backs_dirty = True
                 b_note = "Miss(404->Cached)"
+            else:
+                err_c = int(b_out.get("status_code", 0) or 0)
+                b_note = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
 
         log_msg(f"        [Card #{cnum}] {plr} [{sub_n} | CID {cid}] -> Front: {f_note} | Back: {b_note}")
 
@@ -4010,11 +4240,14 @@ def scrape_tcdb_checklist_set(
                 elif cid_s in dead_fronts:
                     img_stats["no_img"] += 1
                 else:
+                    f_out: dict = {}
                     q_f = _download_single_template_side(
                         req_session, url_rep_f, url_std_f, referer, f_path,
                         set_key=cat_key,
                         thumb_url=str(entry.get("front_thumb") or ""),
                         preferred_tier=str(entry.get("front_tier_hint") or ""),
+                        outcome_out=f_out,
+                        circuit_breaker=img_circuit_breaker,
                     )
                     if q_f:
                         has_front = True
@@ -4024,24 +4257,27 @@ def scrape_tcdb_checklist_set(
                         entry["front"] = {"quality": q_f, "file": f_fname}
                         if p_ctx.get("est_remaining_dl_cards") is not None:
                             p_ctx["est_remaining_dl_cards"] = max(0, int(p_ctx["est_remaining_dl_cards"]) - 1)
-                    else:
+                    elif f_out.get("confirmed_404"):
                         dead_fronts[cid_s] = time.time()
                         dead_fronts_dirty = True
 
                 if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "B", b_path):
                     img_stats["back_skip"] += 1
                 elif has_front and (url_rep_b or url_std_b) and cid_s not in dead_backs:
+                    b_out: dict = {}
                     q_b = _download_single_template_side(
                         req_session, url_rep_b, url_std_b, referer, b_path,
                         set_key=cat_key,
                         thumb_url=str(entry.get("back_thumb") or ""),
                         preferred_tier=str(entry.get("back_tier_hint") or q_f_winner),
+                        outcome_out=b_out,
+                        circuit_breaker=img_circuit_breaker,
                     )
                     if q_b:
                         img_stats["back_dl"] += 1
                         disk_cid_index[(cid_s, "B")] = b_path
                         entry["back"] = {"quality": q_b, "file": b_fname}
-                    else:
+                    elif b_out.get("confirmed_404"):
                         dead_backs[cid_s] = time.time()
                         dead_backs_dirty = True
 
@@ -4484,12 +4720,15 @@ def _download_single_template_side(
     thumb_url: str = "",
     force_rep_first: bool = False,
     preferred_tier: str = "",
+    outcome_out: Optional[dict] = None,
+    circuit_breaker: Optional[CloudflareImageCircuitBreaker] = None,
 ) -> Optional[str]:
     """
     Thumbnail-Direct & Front-Tier-Aware image downloader powered by `AdaptiveRateLearner`:
       - Trusts `"rep" in thumb_url.lower()` from Card #1 (zero exploration 404s).
       - Inherits `preferred_tier` (e.g., Front's winning tier) when no thumbnail URL is available.
       - Always falls back to the alternate tier if the first probe returns 404.
+      - Sets `outcome_out["confirmed_404"] = True` ONLY when every probed URL literally returned HTTP 404.
     """
     learner = get_rate_learner()
     try_rep_first = learner.should_probe_rep_first(
@@ -4499,11 +4738,21 @@ def _download_single_template_side(
         preferred_tier=preferred_tier,
     )
 
+    probed_codes: list[int] = []
     order = [("R", url_rep), ("S", url_std)] if try_rep_first else [("S", url_std), ("R", url_rep)]
     for tier_code, cand_url in order:
         if not cand_url:
             continue
-        res = safe_get(req_session, cand_url, headers={"Referer": referer}, retries=2, silent_404=True)
+        st: dict = {}
+        res = safe_get(
+            req_session,
+            cand_url,
+            headers={"Referer": referer},
+            retries=2,
+            silent_404=True,
+            status_out=st,
+            circuit_breaker=circuit_breaker,
+        )
         if res and res.status_code == 200 and is_valid_image_payload(res.content):
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             dest_path.write_bytes(res.content)
@@ -4512,7 +4761,22 @@ def _download_single_template_side(
                 quality_tier=tier_code,
                 skipped_rep_probe=(not try_rep_first and tier_code == "S"),
             )
+            if isinstance(outcome_out, dict):
+                outcome_out["confirmed_404"] = False
+                outcome_out["status_code"] = 200
+                outcome_out["outcome"] = "ok"
             return tier_code
+        code = -1 if (res is not None and res.status_code == 200) else int(st.get("status_code", 0) or 0)
+        probed_codes.append(code)
+        if code in (403, 429):
+            break
+
+    confirmed_404 = bool(probed_codes) and all(c == 404 for c in probed_codes)
+    last_code = probed_codes[-1] if probed_codes else 0
+    if isinstance(outcome_out, dict):
+        outcome_out["confirmed_404"] = confirmed_404
+        outcome_out["status_code"] = last_code
+        outcome_out["outcome"] = "404" if confirmed_404 else (f"http_{last_code}" if last_code > 0 else "network_error")
     return None
 
 
@@ -4578,11 +4842,20 @@ def _count_pending_catalog_downloads(
     return pending_f, pending_b
 
 
-def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = None):
+def mode_download_all_catalog_images(
+    target_queue: Optional[dict[str, str]] = None,
+    max_cards_per_run: Optional[int] = DEFAULT_MAX_CARDS_PER_RUN,
+    card_delay_range: tuple[float, float] = (IMAGE_CARD_JITTER_MIN_S, IMAGE_CARD_JITTER_MAX_S),
+    breather_every_cards: int = IMAGE_BREATHER_EVERY_CARDS,
+    breather_duration_range: tuple[float, float] = (IMAGE_BREATHER_MIN_S, IMAGE_BREATHER_MAX_S),
+    circuit_breaker: Optional[CloudflareImageCircuitBreaker] = None,
+):
     """
     PURE IMAGE DOWNLOADER ONLY (No checklist re-scraping):
     Reads each set's already-indexed `<set>_catalog.json` and downloads every missing
     Front (`_F.jpg`) and Back (`_B.jpg`) image directly into `D:\\Tabulas Set Library\\<Set>\\`.
+    Includes strict 404-only missing caching, Cloudflare 403/429 circuit breaker,
+    randomized human-like card jitter, periodic breathers, and optional per-run card cap.
     """
     ensure_directories()
     meta_map = load_tracked_sets_meta(prioritize=True)
@@ -4599,10 +4872,12 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
         log_msg(f"✅ [FAST-SKIP] All {len(queue_items)} queued set(s) have 0 pending catalog image downloads on disk.")
         return
 
-    log_msg(f"📥 Launching PURE Front & Back Image Download (Catalog-Only, {pend_f:,} fronts / {pend_b:,} backs pending) for {len(queue)} set(s)...")
+    cap_note = f", cap={max_cards_per_run:,}/run" if (max_cards_per_run is not None and max_cards_per_run > 0) else ""
+    log_msg(f"📥 Launching PURE Front & Back Image Download (Catalog-Only, {pend_f:,} fronts / {pend_b:,} backs pending{cap_note}) for {len(queue)} set(s)...")
     req_session = connect_session(target_domain=BASE_URL)
     total_sets = len(queue_items)
     learner = get_rate_learner()
+    cb = circuit_breaker or CloudflareImageCircuitBreaker(stop_check=is_stop_requested)
 
     try:
         pre = prescan_queue_card_metrics(req_session, queue_items, mode_key="images_only")
@@ -4611,8 +4886,13 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
         completed_subsets_all = 0
         total_subsets_all = int(pre["total_subsets"])
         est_rem_dl_all = int(pre["est_remaining_dl_cards"])
+        downloaded_cards_this_run = 0
+        need_card_jitter = False
+        stop_run = False
 
         for idx, (set_url, folder_name) in enumerate(queue_items, 1):
+            if stop_run or is_stop_requested():
+                break
             set_t0 = time.time()
             chk_title = canonicalize_checklist_set_title(folder_name.replace("_", " ").strip())
             set_stats_key = sanitize_filename_part(chk_title)
@@ -4663,160 +4943,232 @@ def mode_download_all_catalog_images(target_queue: Optional[dict[str, str]] = No
             dl_f, dl_b, skip_f, skip_b, skip_noback, miss_f, miss_b = 0, 0, 0, 0, 0, 0, 0
             c_idx = 0
 
-            for sub_name, sub_items in grouped_by_sub:
-                sub_clean = clean_tcdb_subset_title(sub_name, checklist_set_name=chk_title) or sub_name
-                sub_t0 = time.time()
-                sub_tot = len(sub_items)
-                sub_dl_start = dl_f
-                sub_skip_start = skip_f
-
-                # Fast subset-level skip when all imaged cards in this subset are already on disk or dead-cached
-                sub_has_pending = False
-                for cid_chk, ent_chk in sub_items:
-                    cid_chk_n = normalize_numeric_tcdb_cid(cid_chk)
-                    f_f = str(ent_chk.get("front_file") or "")
-                    b_f = str(ent_chk.get("back_file") or "")
-                    has_f_d = (cid_chk_n, "F") in disk_cid_index or (f_f and (set_dir / f_f).exists())
-                    has_b_d = (cid_chk_n, "B") in disk_cid_index or (b_f and (set_dir / b_f).exists())
-                    has_b_u = bool(ent_chk.get("url_rep_back") or ent_chk.get("url_std_back"))
-                    if (not has_f_d and cid_chk_n not in dead_fronts and str(cid_chk) not in dead_fronts) or (
-                        has_f_d and has_b_u and not has_b_d and cid_chk_n not in dead_backs and str(cid_chk) not in dead_backs
-                    ):
-                        sub_has_pending = True
+            try:
+                for sub_name, sub_items in grouped_by_sub:
+                    if stop_run:
                         break
-                if not sub_has_pending:
-                    skip_f += sub_tot
-                    c_idx += sub_tot
-                    completed_cards_all += sub_tot
-                    completed_subsets_all += 1
-                    continue
+                    sub_clean = clean_tcdb_subset_title(sub_name, checklist_set_name=chk_title) or sub_name
+                    sub_t0 = time.time()
+                    sub_tot = len(sub_items)
+                    sub_dl_start = dl_f
+                    sub_skip_start = skip_f
 
-                for sub_pos, (cid, entry) in enumerate(sub_items, 1):
-                    c_idx += 1
-                    completed_cards_all += 1
-                    total_cards_all = max(total_cards_all, completed_cards_all)
+                    # Fast subset-level skip when all imaged cards in this subset are already on disk or dead-cached
+                    sub_has_pending = False
+                    for cid_chk, ent_chk in sub_items:
+                        cid_chk_n = normalize_numeric_tcdb_cid(cid_chk)
+                        f_f = str(ent_chk.get("front_file") or "")
+                        b_f = str(ent_chk.get("back_file") or "")
+                        has_f_d = (cid_chk_n, "F") in disk_cid_index or (f_f and (set_dir / f_f).exists())
+                        has_b_d = (cid_chk_n, "B") in disk_cid_index or (b_f and (set_dir / b_f).exists())
+                        has_b_u = bool(ent_chk.get("url_rep_back") or ent_chk.get("url_std_back"))
+                        if (not has_f_d and cid_chk_n not in dead_fronts and str(cid_chk) not in dead_fronts) or (
+                            has_f_d and has_b_u and not has_b_d and cid_chk_n not in dead_backs and str(cid_chk) not in dead_backs
+                        ):
+                            sub_has_pending = True
+                            break
+                    if not sub_has_pending:
+                        skip_f += sub_tot
+                        c_idx += sub_tot
+                        completed_cards_all += sub_tot
+                        completed_subsets_all += 1
+                        continue
 
-                    cnum = str(entry.get("card_number") or "0").strip().lstrip("#")
-                    plr_raw = str(entry.get("player") or "Unknown Player").strip()
-                    plr_clean, _, _ = _strip_inline_tags_errors_and_occupations(plr_raw, team_str=str(entry.get("team") or ""))
-                    plr = plr_clean or plr_raw
-                    f_fname, b_fname = build_template_image_filenames(chk_title, sub_clean, cnum, plr, cid)
-                    entry["player"] = plr
-                    entry["front_file"] = f_fname
-                    entry["back_file"] = b_fname
+                    for sub_pos, (cid, entry) in enumerate(sub_items, 1):
+                        if stop_run or is_stop_requested():
+                            stop_run = True
+                            break
+                        c_idx += 1
+                        completed_cards_all += 1
+                        total_cards_all = max(total_cards_all, completed_cards_all)
 
-                    f_path = set_dir / f_fname
-                    b_path = set_dir / b_fname
-                    referer = str(entry.get("referer") or set_url)
-                    url_rep_f = str(entry.get("url_rep_front") or "")
-                    url_std_f = str(entry.get("url_std_front") or "")
-                    url_rep_b = str(entry.get("url_rep_back") or "")
-                    url_std_b = str(entry.get("url_std_back") or "")
-                    f_thumb_u = str(entry.get("front_thumb") or "")
-                    b_thumb_u = str(entry.get("back_thumb") or "")
-                    f_hint_t = str(entry.get("front_tier_hint") or "")
-                    b_hint_t = str(entry.get("back_tier_hint") or "")
+                        cnum = str(entry.get("card_number") or "0").strip().lstrip("#")
+                        plr_raw = str(entry.get("player") or "Unknown Player").strip()
+                        plr_clean, _, _ = _strip_inline_tags_errors_and_occupations(plr_raw, team_str=str(entry.get("team") or ""))
+                        plr = plr_clean or plr_raw
+                        f_fname, b_fname = build_template_image_filenames(chk_title, sub_clean, cnum, plr, cid)
+                        entry["player"] = plr
+                        entry["front_file"] = f_fname
+                        entry["back_file"] = b_fname
 
-                    q_f_winner = ""
-                    has_front = False
-                    existing_f = _check_or_rename_existing_cid_file(disk_cid_index, cid, "F", f_path)
-                    if existing_f:
-                        has_front = True
-                        skip_f += 1
-                        f_status = existing_f
-                        if isinstance(entry.get("front"), dict):
-                            q_f_winner = str(entry["front"].get("quality") or "")
-                    elif cid in dead_fronts or normalize_numeric_tcdb_cid(cid) in dead_fronts:
-                        skip_noback += 1
-                        f_status = "Skip(DeadFrontCached)"
-                    elif url_rep_f or url_std_f:
-                        q_f = _download_single_template_side(
-                            req_session, url_rep_f, url_std_f, referer, f_path,
-                            set_key=folder_name, thumb_url=f_thumb_u, preferred_tier=f_hint_t,
+                        f_path = set_dir / f_fname
+                        b_path = set_dir / b_fname
+                        referer = str(entry.get("referer") or set_url)
+                        url_rep_f = str(entry.get("url_rep_front") or "")
+                        url_std_f = str(entry.get("url_std_front") or "")
+                        url_rep_b = str(entry.get("url_rep_back") or "")
+                        url_std_b = str(entry.get("url_std_back") or "")
+                        f_thumb_u = str(entry.get("front_thumb") or "")
+                        b_thumb_u = str(entry.get("back_thumb") or "")
+                        f_hint_t = str(entry.get("front_tier_hint") or "")
+                        b_hint_t = str(entry.get("back_tier_hint") or "")
+
+                        existing_f = _check_or_rename_existing_cid_file(disk_cid_index, cid, "F", f_path)
+                        existing_b = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
+                        need_net_f = (
+                            not existing_f
+                            and cid not in dead_fronts
+                            and normalize_numeric_tcdb_cid(cid) not in dead_fronts
+                            and bool(url_rep_f or url_std_f)
                         )
-                        if q_f:
+                        need_net_b = (
+                            not existing_b
+                            and bool(existing_f or need_net_f)
+                            and bool(url_rep_b or url_std_b)
+                            and cid not in dead_backs
+                            and normalize_numeric_tcdb_cid(cid) not in dead_backs
+                        )
+                        will_hit_network = need_net_f or need_net_b
+                        if will_hit_network and need_card_jitter and card_delay_range[1] > 0:
+                            jitter_s = random.uniform(float(card_delay_range[0]), float(card_delay_range[1]))
+                            if not cb.interruptible_sleep(jitter_s, reason="card pacing"):
+                                stop_run = True
+                                break
+                            need_card_jitter = False
+
+                        q_f_winner = ""
+                        has_front = False
+                        card_downloaded = False
+                        if existing_f:
                             has_front = True
-                            q_f_winner = q_f
-                            dl_f += 1
-                            est_rem_dl_all = max(0, est_rem_dl_all - 1)
-                            disk_cid_index[(cid, "F")] = f_path
-                            entry["front"] = {"quality": q_f, "file": f_fname}
-                            kb_f = f_path.stat().st_size / 1024.0 if f_path.exists() else 0.0
-                            f_status = f"{q_f}-Tier OK ({kb_f:.1f}KB)"
+                            skip_f += 1
+                            f_status = existing_f
+                            if isinstance(entry.get("front"), dict):
+                                q_f_winner = str(entry["front"].get("quality") or "")
+                        elif cid in dead_fronts or normalize_numeric_tcdb_cid(cid) in dead_fronts:
+                            skip_noback += 1
+                            f_status = "Skip(DeadFrontCached)"
+                        elif url_rep_f or url_std_f:
+                            f_out: dict = {}
+                            q_f = _download_single_template_side(
+                                req_session, url_rep_f, url_std_f, referer, f_path,
+                                set_key=folder_name, thumb_url=f_thumb_u, preferred_tier=f_hint_t,
+                                outcome_out=f_out, circuit_breaker=cb,
+                            )
+                            if q_f:
+                                has_front = True
+                                card_downloaded = True
+                                q_f_winner = q_f
+                                dl_f += 1
+                                est_rem_dl_all = max(0, est_rem_dl_all - 1)
+                                disk_cid_index[(cid, "F")] = f_path
+                                entry["front"] = {"quality": q_f, "file": f_fname}
+                                kb_f = f_path.stat().st_size / 1024.0 if f_path.exists() else 0.0
+                                f_status = f"{q_f}-Tier OK ({kb_f:.1f}KB)"
+                            elif f_out.get("confirmed_404"):
+                                miss_f += 1
+                                dead_fronts[cid] = time.time()
+                                dead_fronts_dirty = True
+                                f_status = "Miss(404->Cached)"
+                            else:
+                                err_c = int(f_out.get("status_code", 0) or 0)
+                                f_status = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
                         else:
-                            miss_f += 1
-                            dead_fronts[cid] = time.time()
-                            dead_fronts_dirty = True
-                            f_status = "Miss(404->Cached)"
-                    else:
-                        f_status = "NoURL"
+                            f_status = "NoURL"
 
-                    existing_b = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
-                    if existing_b:
-                        skip_b += 1
-                        b_status = existing_b
-                    elif not has_front:
-                        skip_back_only += 1
-                        b_status = "Skip(NoFrontImage)"
-                    elif not (url_rep_b or url_std_b):
-                        skip_noback += 1
-                        b_status = "Skip(NoBackOnTCDB)"
-                    elif cid in dead_backs or normalize_numeric_tcdb_cid(cid) in dead_backs:
-                        skip_noback += 1
-                        b_status = "Skip(DeadBackCached)"
-                    else:
-                        q_b = _download_single_template_side(
-                            req_session, url_rep_b, url_std_b, referer, b_path,
-                            set_key=folder_name, thumb_url=b_thumb_u, preferred_tier=b_hint_t or q_f_winner,
-                        )
-                        if q_b:
-                            dl_b += 1
-                            disk_cid_index[(cid, "B")] = b_path
-                            entry["back"] = {"quality": q_b, "file": b_fname}
-                            kb_b = b_path.stat().st_size / 1024.0 if b_path.exists() else 0.0
-                            b_status = f"{q_b}-Tier OK ({kb_b:.1f}KB)"
+                        if existing_b:
+                            skip_b += 1
+                            b_status = existing_b
+                        elif not has_front:
+                            skip_back_only += 1
+                            b_status = "Skip(NoFrontImage)"
+                        elif not (url_rep_b or url_std_b):
+                            skip_noback += 1
+                            b_status = "Skip(NoBackOnTCDB)"
+                        elif cid in dead_backs or normalize_numeric_tcdb_cid(cid) in dead_backs:
+                            skip_noback += 1
+                            b_status = "Skip(DeadBackCached)"
                         else:
-                            miss_b += 1
-                            dead_backs[cid] = time.time()
-                            dead_backs_dirty = True
-                            b_status = "Miss(404->Cached)"
+                            b_out: dict = {}
+                            q_b = _download_single_template_side(
+                                req_session, url_rep_b, url_std_b, referer, b_path,
+                                set_key=folder_name, thumb_url=b_thumb_u, preferred_tier=b_hint_t or q_f_winner,
+                                outcome_out=b_out, circuit_breaker=cb,
+                            )
+                            if q_b:
+                                dl_b += 1
+                                card_downloaded = True
+                                disk_cid_index[(cid, "B")] = b_path
+                                entry["back"] = {"quality": q_b, "file": b_fname}
+                                kb_b = b_path.stat().st_size / 1024.0 if b_path.exists() else 0.0
+                                b_status = f"{q_b}-Tier OK ({kb_b:.1f}KB)"
+                            elif b_out.get("confirmed_404"):
+                                miss_b += 1
+                                dead_backs[cid] = time.time()
+                                dead_backs_dirty = True
+                                b_status = "Miss(404->Cached)"
+                            else:
+                                err_c = int(b_out.get("status_code", 0) or 0)
+                                b_status = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
 
-                    if not f_status.startswith("Skip") or not b_status.startswith("Skip") or sub_pos == sub_tot or c_idx % 25 == 0:
-                        emit_progress(
-                            active_set_name=chk_title,
-                            active_set_key=set_stats_key,
-                            set_index=idx,
-                            total_sets=total_sets,
-                            completed_cards=completed_cards_all,
-                            total_cards=total_cards_all,
-                            completed_subsets=completed_subsets_all,
-                            total_subsets=max(1, total_subsets_all),
-                            sub_name=sub_clean,
-                            sub_current=sub_pos,
-                            sub_total=sub_tot,
-                            sub_start_epoch=sub_t0,
-                            current_item=f"[Card #{cnum}] {plr} [{sub_clean} | CID {cid}] -> F:{f_status} | B:{b_status}",
-                            mode_key="images_only",
-                            est_remaining_dl_cards=est_rem_dl_all,
+                        if will_hit_network:
+                            need_card_jitter = True
+
+                        if not f_status.startswith("Skip") or not b_status.startswith("Skip") or sub_pos == sub_tot or c_idx % 25 == 0:
+                            emit_progress(
+                                active_set_name=chk_title,
+                                active_set_key=set_stats_key,
+                                set_index=idx,
+                                total_sets=total_sets,
+                                completed_cards=completed_cards_all,
+                                total_cards=total_cards_all,
+                                completed_subsets=completed_subsets_all,
+                                total_subsets=max(1, total_subsets_all),
+                                sub_name=sub_clean,
+                                sub_current=sub_pos,
+                                sub_total=sub_tot,
+                                sub_start_epoch=sub_t0,
+                                current_item=f"[Card #{cnum}] {plr} [{sub_clean} | CID {cid}] -> F:{f_status} | B:{b_status}",
+                                mode_key="images_only",
+                                est_remaining_dl_cards=est_rem_dl_all,
+                            )
+
+                        if not f_status.startswith("Skip") or not b_status.startswith("Skip") or c_idx % 50 == 0 or c_idx == total_cards_set:
+                            log_msg(f"  [{c_idx}/{total_cards_set}] #{cnum} {plr} [{sub_clean} | CID {cid}] -> Front: {f_status} | Back: {b_status}")
+
+                        if c_idx % 50 == 0:
+                            save_catalog(folder_name, catalog)
+                            if dead_backs_dirty:
+                                save_dead_backs_cache(dead_backs)
+                                dead_backs_dirty = False
+                            if dead_fronts_dirty:
+                                save_dead_fronts_cache(dead_fronts)
+                                dead_fronts_dirty = False
+
+                        if card_downloaded:
+                            downloaded_cards_this_run += 1
+                            if max_cards_per_run is not None and max_cards_per_run > 0 and downloaded_cards_this_run >= max_cards_per_run:
+                                cap_msg = f"⏸️ Reached max_cards_per_run cap ({downloaded_cards_this_run:,} downloaded cards) — stopping run cleanly."
+                                log_msg(cap_msg)
+                                emit_progress(current_item=cap_msg)
+                                stop_run = True
+                                break
+                            if breather_every_cards > 0 and downloaded_cards_this_run % breather_every_cards == 0:
+                                breather_s = random.uniform(float(breather_duration_range[0]), float(breather_duration_range[1]))
+                                b_msg = f"☕ Human-like breather: {breather_s / 60.0:.1f}m after {downloaded_cards_this_run:,} downloaded cards..."
+                                log_msg(b_msg)
+                                emit_progress(current_item=b_msg)
+                                need_card_jitter = False
+                                if not cb.interruptible_sleep(breather_s, reason="pacing breather"):
+                                    stop_run = True
+                                    break
+
+                    if not stop_run:
+                        completed_subsets_all += 1
+                        learner.record_subset_duration(
+                            "images_only",
+                            time.time() - sub_t0,
+                            card_count=sub_tot,
+                            downloaded_cards=max(0, dl_f - sub_dl_start),
+                            skipped_cards=max(0, skip_f - sub_skip_start),
                         )
-
-                    if not f_status.startswith("Skip") or not b_status.startswith("Skip") or c_idx % 50 == 0 or c_idx == total_cards_set:
-                        log_msg(f"  [{c_idx}/{total_cards_set}] #{cnum} {plr} [{sub_clean} | CID {cid}] -> Front: {f_status} | Back: {b_status}")
-
-                    if c_idx % 50 == 0:
-                        save_catalog(folder_name, catalog)
-                        if dead_backs_dirty:
-                            save_dead_backs_cache(dead_backs)
-                            dead_backs_dirty = False
-
-                completed_subsets_all += 1
-                learner.record_subset_duration(
-                    "images_only",
-                    time.time() - sub_t0,
-                    card_count=sub_tot,
-                    downloaded_cards=max(0, dl_f - sub_dl_start),
-                    skipped_cards=max(0, skip_f - sub_skip_start),
-                )
+            except CloudflareEdgeBlockPaused:
+                save_catalog(folder_name, catalog)
+                if dead_backs_dirty:
+                    save_dead_backs_cache(dead_backs)
+                if dead_fronts_dirty:
+                    save_dead_fronts_cache(dead_fronts)
+                raise
 
             save_catalog(folder_name, catalog)
             if dead_backs_dirty:
@@ -5106,6 +5458,7 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
         return
 
     req_session = connect_session(target_domain=BASE_URL)
+    cb = CloudflareImageCircuitBreaker(stop_check=is_stop_requested)
     try:
         for idx, (set_url, folder_name) in enumerate(queue.items(), 1):
             log_msg(f"[{idx}/{len(queue)}] Auditing Missing Back Images for '{folder_name}'...")
@@ -5116,45 +5469,55 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
             cached_dead_skips = 0
             new_dead_recorded = 0
 
-            for sub_name, cards in catalog.items():
-                if not isinstance(cards, dict):
-                    continue
-                for cid, entry in cards.items():
-                    if str(cid).startswith("_") or not isinstance(entry, dict):
+            try:
+                for sub_name, cards in catalog.items():
+                    if not isinstance(cards, dict):
                         continue
-                    cid_n = normalize_numeric_tcdb_cid(cid)
-                    f_file = str(entry.get("front_file") or "")
-                    b_file = str(entry.get("back_file") or "")
-                    has_front = (cid_n, "F") in disk_cid_index or (f_file and (set_dir / f_file).exists())
-                    has_back = (cid_n, "B") in disk_cid_index or (b_file and (set_dir / b_file).exists())
-                    if not (has_front and not has_back and b_file):
-                        continue
-                    if cid_n in dead_backs:
-                        cached_dead_skips += 1
-                        continue
+                    for cid, entry in cards.items():
+                        if str(cid).startswith("_") or not isinstance(entry, dict):
+                            continue
+                        cid_n = normalize_numeric_tcdb_cid(cid)
+                        f_file = str(entry.get("front_file") or "")
+                        b_file = str(entry.get("back_file") or "")
+                        has_front = (cid_n, "F") in disk_cid_index or (f_file and (set_dir / f_file).exists())
+                        has_back = (cid_n, "B") in disk_cid_index or (b_file and (set_dir / b_file).exists())
+                        if not (has_front and not has_back and b_file):
+                            continue
+                        if cid_n in dead_backs:
+                            cached_dead_skips += 1
+                            continue
 
-                    url_rep_b = str(entry.get("url_rep_back") or "")
-                    url_std_b = str(entry.get("url_std_back") or "")
-                    if url_rep_b or url_std_b:
-                        pref_t = str(entry.get("front", {}).get("quality") or "") if isinstance(entry.get("front"), dict) else ""
-                        q_b = _download_single_template_side(
-                            req_session,
-                            url_rep_b,
-                            url_std_b,
-                            entry.get("referer", set_url),
-                            set_dir / b_file,
-                            set_key=folder_name,
-                            thumb_url=str(entry.get("back_thumb") or ""),
-                            preferred_tier=str(entry.get("back_tier_hint") or pref_t),
-                        )
-                        if q_b:
-                            entry["back"] = {"quality": q_b, "file": b_file}
-                            fetched_backs += 1
-                            log_msg(f"  + [BACK OK] #{entry.get('card_number','')} {entry.get('player','')} [{sub_name} | CID {cid_n}] ({q_b}-Tier)")
-                        else:
-                            dead_backs[cid_n] = time.time()
-                            dead_backs_dirty = True
-                            new_dead_recorded += 1
+                        url_rep_b = str(entry.get("url_rep_back") or "")
+                        url_std_b = str(entry.get("url_std_back") or "")
+                        if url_rep_b or url_std_b:
+                            pref_t = str(entry.get("front", {}).get("quality") or "") if isinstance(entry.get("front"), dict) else ""
+                            b_out: dict = {}
+                            q_b = _download_single_template_side(
+                                req_session,
+                                url_rep_b,
+                                url_std_b,
+                                entry.get("referer", set_url),
+                                set_dir / b_file,
+                                set_key=folder_name,
+                                thumb_url=str(entry.get("back_thumb") or ""),
+                                preferred_tier=str(entry.get("back_tier_hint") or pref_t),
+                                outcome_out=b_out,
+                                circuit_breaker=cb,
+                            )
+                            if q_b:
+                                entry["back"] = {"quality": q_b, "file": b_file}
+                                fetched_backs += 1
+                                log_msg(f"  + [BACK OK] #{entry.get('card_number','')} {entry.get('player','')} [{sub_name} | CID {cid_n}] ({q_b}-Tier)")
+                            elif b_out.get("confirmed_404"):
+                                dead_backs[cid_n] = time.time()
+                                dead_backs_dirty = True
+                                new_dead_recorded += 1
+            except CloudflareEdgeBlockPaused:
+                save_catalog(folder_name, catalog)
+                if dead_backs_dirty:
+                    save_dead_backs_cache(dead_backs)
+                    dead_backs_dirty = False
+                raise
 
             save_catalog(folder_name, catalog)
             if dead_backs_dirty:
