@@ -415,6 +415,31 @@ def test_parallel_pinstripes_suppressed_isolated_scratch_kept():
     assert len(scratches) >= 1, f"Isolated scratch should still be caught, got: {res_mix['confirmed_defects']}"
 
 
+def test_biotext_punctuation_not_flagged_as_ink_spot():
+    # Clean card back with horizontal & 90-deg-rotated vertical dark glyph rows + periods/commas/hyphens
+    f_im, f_box = _make_clean_card_in_sleeve(border_rgb=(238, 238, 236), interior_rgb=(232, 232, 230))
+    arr = np.array(f_im)
+    # Horizontal bio-text row: dark glyphs (8x12) + 8x8 period/comma/hyphen blobs along y=340
+    for gx in range(200, 290, 38):
+        cv2.rectangle(arr, (gx, 330), (gx + 8, 342), (12, 12, 14), -1)
+    cv2.circle(arr, (330, 340), 4, (10, 10, 12), -1)  # period (~50 px^2)
+
+    # 90-deg-rotated vertical bio-text row along x=520
+    for gy in range(440, 530, 38):
+        cv2.rectangle(arr, (512, gy), (524, gy + 8), (12, 12, 14), -1)
+    cv2.rectangle(arr, (516, 565), (524, 573), (10, 10, 12), -1)  # rotated hyphen/period
+
+    res_clean = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    inks_clean = [d for d in res_clean["confirmed_defects"] if d["type"] == "ink_spot"]
+    assert len(inks_clean) == 0, f"Bio-text punctuation falsely flagged as ink_spot: {inks_clean}"
+
+    # Isolated r=9 dark ink blob in blank area must still be caught
+    cv2.circle(arr, (240, 760), 9, (6, 6, 8), -1)
+    res_ink = inspect_card_surface_through_sleeve(Image.fromarray(arr), f_im, front_box=f_box, back_box=f_box, enable_onnx_anomaly=False)
+    inks_hit = [d for d in res_ink["confirmed_defects"] if d["type"] == "ink_spot"]
+    assert len(inks_hit) >= 1, f"Isolated ink spot missed: {res_ink['confirmed_defects']}"
+
+
 if __name__ == "__main__":
     test_clean_card()
     print("[PASS] test_clean_card")

@@ -420,60 +420,123 @@ def expand_flatbed_pdfs_in_batch_folder(
 # ==============================================================================
 # 2. PHYSICAL CARD BOUNDARY DETECTOR & 8-CORNER INSPECTION SHEET BUILDER
 # ==============================================================================
+def _build_edge_detection_channels(bgr: np.ndarray) -> dict[str, np.ndarray]:
+    """
+    Fast in-memory desaturated + chroma-contrast pre-pass for physical card edge detection.
+    Never writes to disk and never mutates the caller's original full-color image.
+    Returns Lab, corner-sampled bg_lab, CLAHE+unsharp luminance (L_enh), paper-vs-sleeve
+    chroma map (C_warm), and 1D Sobel magnitude channels for both.
+    """
+    sh, sw = bgr.shape[:2]
+    lab_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lab_f = lab_u8.astype(np.float32)
+
+    cs_x = max(8, int(sw * 0.04))
+    cs_y = max(8, int(sh * 0.04))
+    bg_lab_samples = np.concatenate([
+        lab_f[:cs_y, :cs_x, :].reshape(-1, 3),
+        lab_f[:cs_y, -cs_x:, :].reshape(-1, 3),
+        lab_f[-cs_y:, :cs_x, :].reshape(-1, 3),
+        lab_f[-cs_y:, -cs_x:, :].reshape(-1, 3),
+    ], axis=0)
+    bg_lab = np.median(bg_lab_samples, axis=0)
+
+    # Enhanced desaturated luminance: CLAHE + Unsharp Mask
+    l_u8 = lab_u8[:, :, 0]
+    l_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l_u8)
+    blur = cv2.GaussianBlur(l_clahe, (0, 0), sigmaX=1.5)
+    l_enh_u8 = cv2.addWeighted(l_clahe, 1.8, blur, -0.8, 0)
+    l_enh = l_enh_u8.astype(np.float32)
+    gx_enh = np.abs(cv2.Sobel(l_enh, cv2.CV_32F, 1, 0, ksize=3))
+    gy_enh = np.abs(cv2.Sobel(l_enh, cv2.CV_32F, 0, 1, ksize=3))
+
+    # Paper-vs-sleeve chroma map: Lab b* delta + subtle a* delta
+    b_delta = lab_f[:, :, 2] - float(bg_lab[2])
+    a_delta = np.abs(lab_f[:, :, 1] - float(bg_lab[1]))
+    c_warm = (b_delta + 0.35 * a_delta).astype(np.float32)
+    cgx = np.abs(cv2.Sobel(c_warm, cv2.CV_32F, 1, 0, ksize=3))
+    cgy = np.abs(cv2.Sobel(c_warm, cv2.CV_32F, 0, 1, ksize=3))
+
+    return {
+        "lab": lab_f,
+        "bg_lab": bg_lab,
+        "L_enh": l_enh,
+        "C_warm": c_warm,
+        "gx_enh": gx_enh,
+        "gy_enh": gy_enh,
+        "cgx": cgx,
+        "cgy": cgy,
+    }
+
+
 def _detect_light_bed_shadow_edges(
     lab: np.ndarray,
     gx: np.ndarray,
     gy: np.ndarray,
     best_comp: tuple[int, int, int, int],
     bg_lab: np.ndarray,
-) -> Optional[tuple[int, int, int, int]]:
+    l_enh: Optional[np.ndarray] = None,
+    c_warm: Optional[np.ndarray] = None,
+    cgx: Optional[np.ndarray] = None,
+    cgy: Optional[np.ndarray] = None,
+    return_hits: bool = False,
+) -> Optional[tuple[int, int, int, int]] | tuple[Optional[tuple[int, int, int, int]], dict[str, bool]]:
     """
     On light/white scanner beds (bg_lab[0] >= 150), scans inward from the outer
-    margin along 5 strips per side to detect the thin dark-gray drop-shadow bevel
-    at the physical card-stock boundary so white-bordered cards never collapse onto
-    their inner printed frame.
+    margin along 7 strips per side to detect the thin dark-gray drop-shadow bevel
+    (or paper-vs-sleeve chroma step on C_warm) at the physical card-stock boundary
+    so white-bordered cards never collapse onto their inner printed frame.
     """
+    empty_hits = {"left": False, "right": False, "top": False, "bottom": False}
     if float(bg_lab[0]) < 150.0:
-        return None
+        return (None, empty_hits) if return_hits else None
     sh, sw = lab.shape[:2]
     bx1, by1, bx2, by2 = best_comp
     bw_c = max(40, bx2 - bx1)
     bh_c = max(40, by2 - by1)
-    l_ch = lab[:, :, 0]
+    l_raw = lab[:, :, 0]
+    l_ch = l_enh if l_enh is not None else l_raw
 
-    def _find_side_shadow(side: str) -> Optional[int]:
+    def _find_side_shadow(side: str) -> tuple[Optional[int], bool]:
         n_strips = 7
         if side in ("left", "right"):
             span_lo = max(4, int(by1 + bh_c * 0.22))
             span_hi = min(sh - 4, int(by2 - bh_c * 0.22))
             if span_hi - span_lo < 25:
-                return None
+                return None, False
             step = (span_hi - span_lo) / float(n_strips)
             limit_in = min(int(sw * 0.24), bx1 + 1) if side == "left" else max(int(sw * 0.76), bx2 - 1)
         else:
             span_lo = max(4, int(bx1 + bw_c * 0.22))
             span_hi = min(sw - 4, int(bx2 - bw_c * 0.22))
             if span_hi - span_lo < 25:
-                return None
+                return None, False
             step = (span_hi - span_lo) / float(n_strips)
             limit_in = min(int(sh * 0.24), by1 + 1) if side == "top" else max(int(sh * 0.76), by2 - 1)
 
-        hits: list[tuple[int, int]] = []
+        hits: list[tuple[int, int, bool]] = []
         for s_i in range(n_strips):
             s_mid = int(round(span_lo + (s_i + 0.5) * step))
             s0 = max(0, s_mid - 2)
             s1 = min((sh if side in ("left", "right") else sw), s_mid + 3)
             if side in ("left", "right"):
                 prof = np.median(l_ch[s0:s1, :], axis=0)
+                prof_raw = np.median(l_raw[s0:s1, :], axis=0)
                 g_prof = np.mean(gx[s0:s1, :], axis=0)
+                c_prof = np.median(c_warm[s0:s1, :], axis=0) if c_warm is not None else None
+                cg_prof = np.mean(cgx[s0:s1, :], axis=0) if cgx is not None else None
                 dim = sw
             else:
                 prof = np.median(l_ch[:, s0:s1], axis=1)
+                prof_raw = np.median(l_raw[:, s0:s1], axis=1)
                 g_prof = np.mean(gy[:, s0:s1], axis=1)
+                c_prof = np.median(c_warm[:, s0:s1], axis=1) if c_warm is not None else None
+                cg_prof = np.mean(cgy[:, s0:s1], axis=1) if cgy is not None else None
                 dim = sh
 
             best_pos = None
             best_score = 0.0
+            best_is_bevel = False
             if side in ("left", "top"):
                 lo = 2
                 hi = min(dim - 16, limit_in)
@@ -481,30 +544,53 @@ def _detect_light_bed_shadow_edges(
                     continue
                 for idx in range(lo + 2, hi):
                     val = float(prof[idx])
-                    # Local minimum check
-                    if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
+                    is_l_min = (val <= float(prof[idx - 1]) and val <= float(prof[idx + 1]))
+                    has_c_step = False
+                    c_step_val = 0.0
+                    if c_prof is not None and cg_prof is not None and float(cg_prof[idx]) >= 4.0:
+                        c_out = float(np.median(c_prof[max(0, idx - 16):max(1, idx - 2)]))
+                        c_in = float(np.median(c_prof[min(dim - 1, idx + 2):min(dim, idx + 14)]))
+                        c_step_val = c_in - c_out
+                        has_c_step = c_step_val >= 6.5
+                    if not is_l_min and not has_c_step:
                         continue
                     out_seg = prof[max(0, idx - 22):max(1, idx - 2)]
                     in_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 14)]
+                    out_raw_seg = prof_raw[max(0, idx - 22):max(1, idx - 2)]
+                    in_raw_seg = prof_raw[min(dim - 1, idx + 2):min(dim, idx + 14)]
                     if out_seg.size < 2 or in_seg.size < 2:
                         continue
                     l_out = float(np.percentile(out_seg, 85))
                     l_in = float(np.median(in_seg))
-                    if l_out < 175.0:
+                    l_out_raw = float(np.percentile(out_raw_seg, 85))
+                    l_in_raw = float(np.median(in_raw_seg))
+                    if l_out_raw < 170.0:
                         continue
                     dip_out = l_out - val
                     dip_in = l_in - val
-                    is_shadow_valley = (l_in >= 175.0 and dip_out >= 7.0 and dip_in >= 7.0)
-                    is_dark_edge = (l_in < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
-                    if not (is_shadow_valley or is_dark_edge):
+                    val_raw = float(prof_raw[idx])
+                    dip_out_raw = l_out_raw - val_raw
+                    dip_in_raw = l_in_raw - val_raw
+                    is_shadow_valley = (
+                        is_l_min
+                        and l_in_raw >= 170.0
+                        and dip_out >= 9.5
+                        and dip_in >= 9.5
+                        and dip_out_raw >= 5.5
+                        and dip_in_raw >= 5.5
+                    )
+                    is_dark_edge = is_l_min and (l_in_raw < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
+                    if not (is_shadow_valley or is_dark_edge or has_c_step):
                         continue
-                    depth = min(dip_out, dip_in) if is_shadow_valley else dip_out * 0.75
+                    depth = min(dip_out, dip_in) if is_shadow_valley else (dip_out * 0.75 if is_dark_edge else c_step_val * 1.1)
                     # Prefer physical card-edge shadow over faint sleeve rim near extreme edge
-                    score = depth + (4.0 if l_in >= 200.0 else 0.0) - (6.0 if idx < int(dim * 0.022) and depth < 12.0 else 0.0)
+                    score = depth + (4.0 if l_in_raw >= 198.0 else 0.0) - (6.0 if idx < int(dim * 0.022) and depth < 12.0 else 0.0)
                     if score > best_score:
                         best_score = score
                         best_pos = idx
-                    if is_shadow_valley and ((idx >= int(dim * 0.022) and depth >= 12.0) or depth >= 18.0):
+                        best_is_bevel = bool(is_shadow_valley or has_c_step)
+                    depth_raw = min(dip_out_raw, dip_in_raw) if is_shadow_valley else 0.0
+                    if is_shadow_valley and ((idx >= int(dim * 0.022) and depth_raw >= 12.0) or depth_raw >= 18.0):
                         break
             else:
                 lo = max(16, limit_in)
@@ -513,54 +599,89 @@ def _detect_light_bed_shadow_edges(
                     continue
                 for idx in range(hi - 3, lo, -1):
                     val = float(prof[idx])
-                    if val > float(prof[idx - 1]) or val > float(prof[idx + 1]):
+                    is_l_min = (val <= float(prof[idx - 1]) and val <= float(prof[idx + 1]))
+                    has_c_step = False
+                    c_step_val = 0.0
+                    if c_prof is not None and cg_prof is not None and float(cg_prof[idx]) >= 4.0:
+                        c_out = float(np.median(c_prof[min(dim - 1, idx + 2):min(dim, idx + 16)]))
+                        c_in = float(np.median(c_prof[max(0, idx - 14):max(1, idx - 2)]))
+                        c_step_val = c_in - c_out
+                        has_c_step = c_step_val >= 6.5
+                    if not is_l_min and not has_c_step:
                         continue
                     out_seg = prof[min(dim - 1, idx + 2):min(dim, idx + 22)]
                     in_seg = prof[max(0, idx - 14):max(1, idx - 2)]
+                    out_raw_seg = prof_raw[min(dim - 1, idx + 2):min(dim, idx + 22)]
+                    in_raw_seg = prof_raw[max(0, idx - 14):max(1, idx - 2)]
                     if out_seg.size < 2 or in_seg.size < 2:
                         continue
                     l_out = float(np.percentile(out_seg, 85))
                     l_in = float(np.median(in_seg))
-                    if l_out < 175.0:
+                    l_out_raw = float(np.percentile(out_raw_seg, 85))
+                    l_in_raw = float(np.median(in_raw_seg))
+                    if l_out_raw < 170.0:
                         continue
                     dip_out = l_out - val
                     dip_in = l_in - val
-                    is_shadow_valley = (l_in >= 175.0 and dip_out >= 7.0 and dip_in >= 7.0)
-                    is_dark_edge = (l_in < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
-                    if not (is_shadow_valley or is_dark_edge):
+                    val_raw = float(prof_raw[idx])
+                    dip_out_raw = l_out_raw - val_raw
+                    dip_in_raw = l_in_raw - val_raw
+                    is_shadow_valley = (
+                        is_l_min
+                        and l_in_raw >= 170.0
+                        and dip_out >= 9.5
+                        and dip_in >= 9.5
+                        and dip_out_raw >= 5.5
+                        and dip_in_raw >= 5.5
+                    )
+                    is_dark_edge = is_l_min and (l_in_raw < 170.0 and dip_out >= 14.0 and float(g_prof[idx]) >= 10.0)
+                    if not (is_shadow_valley or is_dark_edge or has_c_step):
                         continue
-                    depth = min(dip_out, dip_in) if is_shadow_valley else dip_out * 0.75
-                    score = depth + (4.0 if l_in >= 200.0 else 0.0) - (6.0 if (dim - idx) < int(dim * 0.022) and depth < 12.0 else 0.0)
+                    depth = min(dip_out, dip_in) if is_shadow_valley else (dip_out * 0.75 if is_dark_edge else c_step_val * 1.1)
+                    score = depth + (4.0 if l_in_raw >= 198.0 else 0.0) - (6.0 if (dim - idx) < int(dim * 0.022) and depth < 12.0 else 0.0)
                     if score > best_score:
                         best_score = score
                         best_pos = idx
-                    if is_shadow_valley and (((dim - idx) >= int(dim * 0.022) and depth >= 12.0) or depth >= 18.0):
+                        best_is_bevel = bool(is_shadow_valley or has_c_step)
+                    depth_raw = min(dip_out_raw, dip_in_raw) if is_shadow_valley else 0.0
+                    if is_shadow_valley and (((dim - idx) >= int(dim * 0.022) and depth_raw >= 12.0) or depth_raw >= 18.0):
                         break
 
             if best_pos is not None and best_score >= 7.0:
-                hits.append((s_i, best_pos))
+                hits.append((s_i, best_pos, best_is_bevel))
 
         if len(hits) < 3:
-            return None
+            return None, False
         xs_h = np.array([h[0] for h in hits], dtype=np.float32)
         ys_h = np.array([h[1] for h in hits], dtype=np.float32)
-        if len(hits) >= 3:
-            slope, intercept = np.polyfit(xs_h, ys_h, 1)
-            residuals = np.abs(ys_h - (slope * xs_h + intercept))
-            inliers = ys_h[residuals < 4.5]
-            if inliers.size < 3:
-                return None
-            return int(round(float(np.median(inliers))))
-        return int(round(float(np.median(ys_h))))
+        slope, intercept = np.polyfit(xs_h, ys_h, 1)
+        residuals = np.abs(ys_h - (slope * xs_h + intercept))
+        inlier_mask = residuals < 4.5
+        inliers = ys_h[inlier_mask]
+        if inliers.size < 3:
+            return None, False
+        bevel_cnt = sum(1 for k, h in enumerate(hits) if inlier_mask[k] and h[2])
+        return int(round(float(np.median(inliers)))), (bevel_cnt >= 3)
 
-    nx1 = _find_side_shadow("left")
-    nx2 = _find_side_shadow("right")
-    ny1 = _find_side_shadow("top")
-    ny2 = _find_side_shadow("bottom")
+    nx1, bx1_bevel = _find_side_shadow("left")
+    nx2, bx2_bevel = _find_side_shadow("right")
+    ny1, by1_bevel = _find_side_shadow("top")
+    ny2, by2_bevel = _find_side_shadow("bottom")
 
-    # Never collapse inward onto the printed frame: only expand or refine within 2px of best_comp
-    rx1 = nx1 if (nx1 is not None and nx1 <= bx1 + 2) else bx1
-    rx2 = nx2 if (nx2 is not None and nx2 >= bx2 - 2) else bx2
+    shadow_hits = {
+        "left": bool(nx1 is not None and (bx1_bevel or nx1 < bx1 - 3)),
+        "right": bool(nx2 is not None and (bx2_bevel or nx2 > bx2 + 3)),
+        "top": bool(ny1 is not None and (by1_bevel or ny1 < by1 - 3)),
+        "bottom": bool(ny2 is not None and (by2_bevel or ny2 > by2 + 3)),
+    }
+
+    # Never collapse inward onto the printed frame: only expand or refine within 2px of best_comp.
+    # If best_comp is already a Mini (ar <= 0.63), cap horizontal expansion to 3% of sw so we never
+    # snap outward across empty sleeve onto the standard-sized penny-sleeve pocket rim.
+    comp_ar = bw_c / float(max(1, bh_c))
+    max_mini_pad = max(12, int(sw * 0.03)) if (0.50 <= comp_ar <= 0.63) else sw
+    rx1 = nx1 if (nx1 is not None and nx1 <= bx1 + 2 and (bx1 - nx1) <= max_mini_pad) else bx1
+    rx2 = nx2 if (nx2 is not None and nx2 >= bx2 - 2 and (nx2 - bx2) <= max_mini_pad) else bx2
     ry1 = ny1 if (ny1 is not None and ny1 <= by1 + 2) else by1
     ry2 = ny2 if (ny2 is not None and ny2 >= by2 - 2) else by2
 
@@ -574,10 +695,11 @@ def _detect_light_bed_shadow_edges(
         or (1.58 <= ar <= 1.92)
     )
     if not valid_ar:
-        return None
+        return (None, shadow_hits) if return_hits else None
     if (rx1, ry1, rx2, ry2) == (bx1, by1, bx2, by2):
-        return None
-    return (rx1, ry1, rx2, ry2)
+        return (None, shadow_hits) if return_hits else None
+    res_box = (rx1, ry1, rx2, ry2)
+    return (res_box, shadow_hits) if return_hits else res_box
 
 
 def estimate_card_skew_deg(img: Image.Image, card_box: tuple[int, int, int, int]) -> float:
@@ -777,57 +899,235 @@ def _map_bbox_norm_inverse(bbox_norm: list[float], iw: int, ih: int, M_inv: np.n
     ]
 
 
-def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
+def _score_edge_confidence(
+    side: str,
+    pos: int,
+    box: tuple[int, int, int, int],
+    l_enh: np.ndarray,
+    c_warm: np.ndarray,
+    gx_enh: np.ndarray,
+    gy_enh: np.ndarray,
+) -> float:
+    """
+    Scores a candidate card boundary edge ('left', 'right', 'top', 'bottom') in [0.0, 1.0]
+    by combining L_enh shadow valley depth / gradient strength, along-edge strip
+    continuity, and C_warm paper-vs-sleeve chroma step strength.
+    """
+    sh, sw = l_enh.shape[:2]
+    bx1, by1, bx2, by2 = box
+    bw_c = max(40, bx2 - bx1)
+    bh_c = max(40, by2 - by1)
+    n_strips = 9
+    if side in ("left", "right"):
+        span_lo = max(4, int(by1 + bh_c * 0.20))
+        span_hi = min(sh - 4, int(by2 - bh_c * 0.20))
+        dim = sw
+    else:
+        span_lo = max(4, int(bx1 + bw_c * 0.20))
+        span_hi = min(sw - 4, int(bx2 - bw_c * 0.20))
+        dim = sh
+    if span_hi - span_lo < 20:
+        return 0.0
+
+    step = (span_hi - span_lo) / float(n_strips)
+    lum_sigs: list[float] = []
+    c_scores: list[float] = []
+    supported = 0
+
+    for s_i in range(n_strips):
+        s_mid = int(round(span_lo + (s_i + 0.5) * step))
+        s0 = max(0, s_mid - 2)
+        s1 = min((sh if side in ("left", "right") else sw), s_mid + 3)
+        if side in ("left", "right"):
+            l_prof = np.median(l_enh[s0:s1, :], axis=0)
+            g_prof = np.mean(gx_enh[s0:s1, :], axis=0)
+            c_prof = np.median(c_warm[s0:s1, :], axis=0)
+        else:
+            l_prof = np.median(l_enh[:, s0:s1], axis=1)
+            g_prof = np.mean(gy_enh[:, s0:s1], axis=1)
+            c_prof = np.median(c_warm[:, s0:s1], axis=1)
+
+        p = int(np.clip(pos, 1, dim - 2))
+        e_lo = max(0, p - 2)
+        e_hi = min(dim, p + 3)
+        max_g = float(np.max(g_prof[e_lo:e_hi]))
+        g_score = min(1.0, max_g / 35.0)
+
+        if side in ("left", "top"):
+            out_seg = l_prof[max(0, p - 16):max(1, p - 3)]
+            in_seg = l_prof[min(dim - 1, p + 3):min(dim, p + 14)]
+            c_out_seg = c_prof[max(0, p - 16):max(1, p - 3)]
+            c_in_seg = c_prof[min(dim - 1, p + 3):min(dim, p + 14)]
+        else:
+            out_seg = l_prof[min(dim - 1, p + 3):min(dim, p + 16)]
+            in_seg = l_prof[max(0, p - 14):max(1, p - 3)]
+            c_out_seg = c_prof[min(dim - 1, p + 3):min(dim, p + 16)]
+            c_in_seg = c_prof[max(0, p - 14):max(1, p - 3)]
+
+        if out_seg.size >= 2 and in_seg.size >= 2:
+            l_out = float(np.median(out_seg))
+            l_in = float(np.median(in_seg))
+            l_min = float(np.min(l_prof[e_lo:e_hi]))
+            valley_dip = max(0.0, min(l_out - l_min, l_in - l_min))
+            step_diff = abs(l_out - l_in)
+            v_score = min(1.0, max(valley_dip, 0.75 * step_diff) / 22.0)
+
+            c_out = float(np.median(c_out_seg))
+            c_in = float(np.median(c_in_seg))
+            c_diff = abs(c_in - c_out)
+            if c_in > c_out:
+                c_diff *= 1.15
+            c_score = min(1.0, c_diff / 10.0)
+        else:
+            v_score = 0.0
+            c_score = 0.0
+
+        lum_sig = max(g_score, v_score)
+        lum_sigs.append(lum_sig)
+        c_scores.append(c_score)
+        if lum_sig >= 0.30 or c_score >= 0.45:
+            supported += 1
+
+    med_lum = float(np.median(lum_sigs)) if lum_sigs else 0.0
+    med_c = float(np.median(c_scores)) if c_scores else 0.0
+    continuity = supported / float(n_strips)
+    raw_str = max(med_lum, 0.85 * med_c, 0.65 * med_lum + 0.45 * med_c)
+    return round(float(np.clip(0.55 * raw_str + 0.45 * continuity, 0.0, 1.0)), 4)
+
+
+def _search_micro_band_edge(
+    side: str,
+    expected_pos: int,
+    band_px: int,
+    box: tuple[int, int, int, int],
+    l_enh: np.ndarray,
+    c_warm: np.ndarray,
+    gx_enh: np.ndarray,
+    gy_enh: np.ndarray,
+    cgx: np.ndarray,
+    cgy: np.ndarray,
+) -> Optional[int]:
+    """
+    Searches a tight +/- band_px micro-band around an aspect-projected edge coordinate
+    on L_enh and C_warm. Returns a coherent snapped coordinate if >= 4 inlier strips
+    agree, or None to lock directly to expected_pos.
+    """
+    sh, sw = l_enh.shape[:2]
+    bx1, by1, bx2, by2 = box
+    bw_c = max(40, bx2 - bx1)
+    bh_c = max(40, by2 - by1)
+    n_strips = 9
+    if side in ("left", "right"):
+        span_lo = max(4, int(by1 + bh_c * 0.20))
+        span_hi = min(sh - 4, int(by2 - bh_c * 0.20))
+        dim = sw
+    else:
+        span_lo = max(4, int(bx1 + bw_c * 0.20))
+        span_hi = min(sw - 4, int(bx2 - bw_c * 0.20))
+        dim = sh
+    if span_hi - span_lo < 20:
+        return None
+
+    lo = max(1, expected_pos - band_px)
+    hi = min(dim - 2, expected_pos + band_px)
+    if hi <= lo + 1:
+        return None
+
+    step = (span_hi - span_lo) / float(n_strips)
+    hits: list[tuple[int, int]] = []
+    for s_i in range(n_strips):
+        s_mid = int(round(span_lo + (s_i + 0.5) * step))
+        s0 = max(0, s_mid - 2)
+        s1 = min((sh if side in ("left", "right") else sw), s_mid + 3)
+        if side in ("left", "right"):
+            l_prof = np.median(l_enh[s0:s1, :], axis=0)
+            g_prof = np.mean(gx_enh[s0:s1, :], axis=0)
+            cg_prof = np.mean(cgx[s0:s1, :], axis=0)
+        else:
+            l_prof = np.median(l_enh[:, s0:s1], axis=1)
+            g_prof = np.mean(gy_enh[:, s0:s1], axis=1)
+            cg_prof = np.mean(cgy[:, s0:s1], axis=1)
+
+        seg_g = g_prof[lo:hi + 1]
+        seg_cg = cg_prof[lo:hi + 1]
+        seg_l = l_prof[lo:hi + 1]
+        # Local valley bonus where L_enh dips relative to flanking window
+        l_ref = float(np.percentile(l_prof[max(0, lo - 12):min(dim, hi + 13)], 80))
+        valley = np.maximum(0.0, l_ref - seg_l) * 0.6
+        resp = seg_g + 2.0 * seg_cg + valley
+        best_rel = int(np.argmax(resp))
+        if float(resp[best_rel]) >= 12.0:
+            hits.append((s_i, lo + best_rel))
+
+    if len(hits) < 4:
+        return None
+    xs_h = np.array([h[0] for h in hits], dtype=np.float32)
+    ys_h = np.array([h[1] for h in hits], dtype=np.float32)
+    slope, intercept = np.polyfit(xs_h, ys_h, 1)
+    residuals = np.abs(ys_h - (slope * xs_h + intercept))
+    inliers = ys_h[residuals <= 2.5]
+    if inliers.size < 4:
+        return None
+    return int(round(float(np.median(inliers))))
+
+
+def detect_physical_card_box(
+    img: Image.Image,
+    return_meta: bool = False,
+) -> tuple[int, int, int, int] | tuple[tuple[int, int, int, int], dict]:
     """
     Two-stage multi-format physical card-stock boundary detector (Standard 2.5"x3.5",
     Tobacco / A&G Mini 1.5"x2.625", and Non-Standard formats):
-      1. Separates solid opaque card paper from empty scanner/sleeve margin via Lab/warmth/chroma
-         + morphological closing/opening (erasing thin 1-4px penny-sleeve rims & reflections).
-      2. Refines each of the 4 physical edges within a tight +/-3.5% band around the opaque
-         component using 1D Sobel gradients so outer edges never collapse onto the inner frame.
-      3. Applies a gentle multi-format aspect guard (never clipping an A&G Mini ~0.571 to 0.714).
+      1. Builds in-memory desaturated CLAHE+Unsharp luminance (L_enh) and paper-vs-sleeve
+         chroma (C_warm) channels without altering the original full-color scan.
+      2. Separates solid opaque card paper from empty scanner/sleeve margin via Lab/C_warm
+         + morphological closing/opening + light-bed drop-shadow bevel detection.
+      3. Scores each of the 4 edges with explicit confidence and applies the
+         3-Solid-Edges -> 4th-Edge Solver (+/-2.0% micro-band search or aspect-projected
+         lock) whenever 3 edges are strong and 1 is weak, or raw AR deviates > 2.5%.
     """
     w, h = img.size
+    default_meta = {
+        "edge_confidence": {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0},
+        "edge_inferred_side": None,
+        "edge_solver_used": False,
+        "edge_solver_snapped": False,
+    }
     if w < 60 or h < 60:
-        return (0, 0, w, h)
+        box = (0, 0, w, h)
+        return (box, default_meta) if return_meta else box
 
     arr = np.array(img.convert("RGB"))
     scale = 800.0 / max(w, h)
     sw, sh = max(80, int(round(w * scale))), max(80, int(round(h * scale)))
     small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
 
-    lab = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ch = _build_edge_detection_channels(small[:, :, ::-1].copy())
+    lab = ch["lab"]
+    bg_lab = ch["bg_lab"]
+    l_enh = ch["L_enh"]
+    c_warm = ch["C_warm"]
+    gx = ch["gx_enh"]
+    gy = ch["gy_enh"]
+    cgx = ch["cgx"]
+    cgy = ch["cgy"]
+
     hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    # Outer scanner/sleeve background reference from 4 corner patches (4% x 4%)
-    cs_x = max(8, int(sw * 0.04))
-    cs_y = max(8, int(sh * 0.04))
-    bg_lab_samples = np.concatenate([
-        lab[:cs_y, :cs_x, :].reshape(-1, 3),
-        lab[:cs_y, -cs_x:, :].reshape(-1, 3),
-        lab[-cs_y:, :cs_x, :].reshape(-1, 3),
-        lab[-cs_y:, -cs_x:, :].reshape(-1, 3),
-    ], axis=0)
-    bg_lab = np.median(bg_lab_samples, axis=0)
-
     l_abs_diff = np.abs(lab[:, :, 0] - bg_lab[0])
-    b_warm_diff = lab[:, :, 2] - bg_lab[2]
-
-    gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-    gy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
 
     # Bed-polarity-aware card-stock mask:
     # - Light scanner beds (bg_lab[0] >= 150): ignore bright neutral sleeve glare (L > bg_lab[0])
-    #   and capture warm paper (b_warm_diff > 7.5), darker printed ink/borders, or rich chroma.
+    #   and capture warm paper (c_warm > 7.5), darker printed ink/borders, or rich chroma.
     # - Dark scanner beds (bg_lab[0] < 150): capture dark stadium/full-bleed photo bottoms
     #   ((L - bg_lab[0]) > 12.0), warm paper, or chroma while ignoring cool blue-gray empty sleeve.
     if float(bg_lab[0]) >= 150.0:
         l_dark_diff = bg_lab[0] - lab[:, :, 0]
-        opaque = ((b_warm_diff > 7.5) | (l_dark_diff > 18.0) | ((hsv[:, :, 1] > 38) & (hsv[:, :, 2] > 45))).astype(np.uint8) * 255
+        opaque = ((c_warm > 7.5) | (l_dark_diff > 18.0) | ((hsv[:, :, 1] > 38) & (hsv[:, :, 2] > 45))).astype(np.uint8) * 255
     else:
         l_bright_diff = lab[:, :, 0] - bg_lab[0]
-        opaque = ((b_warm_diff > 7.5) | (l_bright_diff > 12.0) | (l_abs_diff > 22.0) | ((hsv[:, :, 1] > 36) & (hsv[:, :, 2] > 40))).astype(np.uint8) * 255
+        opaque = ((c_warm > 7.5) | (l_bright_diff > 12.0) | (l_abs_diff > 22.0) | ((hsv[:, :, 1] > 36) & (hsv[:, :, 2] > 40))).astype(np.uint8) * 255
 
     # Erase thin 1-4px sleeve rims/glare first, then bridge printed interior details
     k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
@@ -856,7 +1156,7 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
         bh_c = max(40, by2 - by1)
 
         # Row/column projection trim: if a mini card sits inside a large sleeve where a sliver of
-        # sleeve shadow bridged across the empty half, trim columns/rows with <15% foreground occupancy
+        # sleeve shadow bridged across the empty half, trim columns/rows with <18% foreground occupancy
         sub_mask = (cleaned[by1:by2, bx1:bx2] > 0)
         col_fill = sub_mask.mean(axis=0)
         row_fill = sub_mask.mean(axis=1)
@@ -869,7 +1169,37 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
             by1, by2 = by1 + int(valid_rows[0]), by1 + int(valid_rows[-1]) + 1
             bh_c = max(40, by2 - by1)
 
-        shadow_box = _detect_light_bed_shadow_edges(lab, gx, gy, (bx1, by1, bx2, by2), bg_lab)
+        # Dark-bed extent recovery: MORPH_OPEN(11x11) can erase thin white bio-text/graphics
+        # sitting on dark photo bottoms (e.g. Stadium Club backs), truncating by2.
+        # Only run when dark photo bottom truncated height (bw_c / bh_c > 0.74).
+        is_dark_bed = float(bg_lab[0]) < 150.0
+        if is_dark_bed and (bw_c / float(max(1, bh_c))) > 0.74:
+            k_soft_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            opaque_soft = cv2.morphologyEx(
+                cv2.morphologyEx(opaque, cv2.MORPH_OPEN, k_soft_open, iterations=1),
+                cv2.MORPH_CLOSE, k_close, iterations=1,
+            )
+            span_x1 = max(0, bx1 + int(bw_c * 0.10))
+            span_x2 = min(sw, bx2 - int(bw_c * 0.10))
+            max_y2 = min(sh, by1 + int(round(bw_c / (2.5 / 3.5))) + 12)
+            if span_x2 - span_x1 >= 24:
+                last_hit = by2 - 1
+                gap = 0
+                for yy in range(by2, max_y2):
+                    if (opaque_soft[yy, span_x1:span_x2] > 0).mean() >= 0.25:
+                        last_hit = yy
+                        gap = 0
+                    else:
+                        gap += 1
+                        if gap > 14:
+                            break
+                by2 = max(by2, last_hit + 1)
+                bh_c = max(40, by2 - by1)
+
+        shadow_box, shadow_found = _detect_light_bed_shadow_edges(
+            lab, gx, gy, (bx1, by1, bx2, by2), bg_lab,
+            l_enh=l_enh, c_warm=c_warm, cgx=cgx, cgy=cgy, return_hits=True,
+        )
         if shadow_box is not None:
             bx1, by1, bx2, by2 = shadow_box
             bw_c = max(40, bx2 - bx1)
@@ -877,8 +1207,8 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
 
         mid_y1, mid_y2 = int(by1 + bh_c * 0.2), int(by2 - bh_c * 0.2)
         mid_x1, mid_x2 = int(bx1 + bw_c * 0.2), int(bx2 - bw_c * 0.2)
-        prof_x = np.mean(gx[max(0, mid_y1):max(1, mid_y2), :], axis=0)
-        prof_y = np.mean(gy[:, max(0, mid_x1):max(1, mid_x2)], axis=1)
+        prof_x = np.mean(gx[max(0, mid_y1):max(1, mid_y2), :] + 1.5 * cgx[max(0, mid_y1):max(1, mid_y2), :], axis=0)
+        prof_y = np.mean(gy[:, max(0, mid_x1):max(1, mid_x2)] + 1.5 * cgy[:, max(0, mid_x1):max(1, mid_x2)], axis=1)
 
         pad_x = 3 if shadow_box is not None else max(4, int(sw * 0.02))
         pad_y = 3 if shadow_box is not None else max(4, int(sh * 0.02))
@@ -902,10 +1232,7 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
         ch_c = max(40, y2 - y1)
         cand_ar = cw_c / float(ch_c)
 
-        # Multi-format prior: Standard (0.714 / 1.400) vs. Tobacco/A&G Mini (0.571 / 1.750)
-        # Check whether significant card-stock or edge evidence exists outside a narrow (<0.62) box:
-        # if a standard white-bordered card had its white left/right borders missed by `opaque`,
-        # expanding toward standard width (2.5/3.5) rather than locking to mini (0.571) recovers the true card edge.
+        # Multi-format prior: Standard (0.7143 / 1.400) vs. Tobacco/A&G Mini (0.5714 / 1.750)
         target_ar = None
         if 0.62 <= cand_ar <= 0.84:
             target_ar = 2.5 / 3.5
@@ -913,30 +1240,35 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
             target_ar = 1.400
         elif 0.45 <= cand_ar < 0.62:
             # Distinguish a genuine Mini (narrow card surrounded by empty sleeve/scanner bed)
-            # from a Standard white-bordered card whose neutral white side borders were trimmed:
-            # check if strong vertical card-edge gradients sit outside [x1..x2] near standard width.
+            # from a Standard white-bordered card whose neutral white side borders were trimmed
+            # or whose dark inner printed frame locked L_enh.
             std_w = int(round(ch_c * (2.5 / 3.5)))
+            is_std_aspect_scan = (0.65 <= (sw / float(max(1, sh))) <= 0.79)
+            full_height_std_scan = is_std_aspect_scan and (ch_c / float(max(1, sh)) >= 0.84)
+            left_m = x1 / float(max(1, sw))
+            right_m = (sw - x2) / float(max(1, sw))
+            no_dual_empty_margin = (left_m < 0.12 and right_m < 0.14) or ((left_m + right_m) < 0.21)
+
             has_outer_std_edges = False
             if std_w <= int(sw * 0.96) and (x1 > int(sw * 0.10) or (sw - x2) > int(sw * 0.10)):
                 left_outer_band = prof_x[max(2, int(sw * 0.02)):max(3, x1 - int(sw * 0.03))]
                 right_outer_band = prof_x[min(sw - 3, x2 + int(sw * 0.03)):min(sw - 2, int(sw * 0.98))]
                 l_pk = float(np.max(left_outer_band)) if left_outer_band.size > 0 else 0.0
                 r_pk = float(np.max(right_outer_band)) if right_outer_band.size > 0 else 0.0
-                # Also check if the outer band has bright warm/neutral paper luminance (L > 205) vs darker inner frame
                 outer_l_patch = lab[max(0, mid_y1):max(1, mid_y2), max(2, int(sw * 0.03)):max(3, x1 - 4), 0]
                 outer_is_white_paper = outer_l_patch.size > 0 and float(np.median(outer_l_patch)) >= 210.0 and float(bg_lab[0]) >= 180.0
-                if (l_pk >= 7.5 and r_pk >= 7.5 and outer_is_white_paper):
+                if l_pk >= 7.5 and r_pk >= 7.5 and outer_is_white_paper:
                     has_outer_std_edges = True
-            if has_outer_std_edges:
+
+            if (full_height_std_scan and no_dual_empty_margin) or has_outer_std_edges:
                 target_ar = 2.5 / 3.5
-                # Snap x1 / x2 outward to the physical paper edges in the outer bands
-                lo_l = max(2, int(sw * 0.02))
-                hi_l = max(lo_l + 1, x1 - int(sw * 0.02))
-                lo_r = min(sw - 3, x2 + int(sw * 0.02))
-                hi_r = min(sw - 2, int(sw * 0.98))
-                if hi_l > lo_l:
+                lo_l = max(2, int(sw * 0.015))
+                hi_l = max(lo_l + 1, x1 - int(sw * 0.015))
+                lo_r = min(sw - 3, x2 + int(sw * 0.015))
+                hi_r = min(sw - 2, int(sw * 0.985))
+                if hi_l > lo_l and float(np.max(prof_x[lo_l:hi_l])) >= 7.5:
                     x1 = lo_l + int(np.argmax(prof_x[lo_l:hi_l]))
-                if hi_r > lo_r:
+                if hi_r > lo_r and float(np.max(prof_x[lo_r:hi_r])) >= 7.5:
                     x2 = lo_r + int(np.argmax(prof_x[lo_r:hi_r]))
                 cw_c = max(40, x2 - x1)
                 cand_ar = cw_c / float(ch_c)
@@ -944,54 +1276,228 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
                 target_ar = 1.5 / 2.625
         elif 1.58 <= cand_ar <= 1.92:
             target_ar = 2.625 / 1.5
+        elif sh > sw and 0.84 < cand_ar <= 0.96:
+            # Portrait scan whose top or bottom dark-bed edge collapsed inward
+            exp_h_std = int(round(cw_c / (2.5 / 3.5)))
+            if exp_h_std <= int(sh * 0.99):
+                target_ar = 2.5 / 3.5
 
-        if target_ar is not None and abs(cand_ar - target_ar) / target_ar > 0.032:
-            if cand_ar < target_ar:
-                exp_h = int(round(cw_c / target_ar))
-                if exp_h < ch_c:
-                    excess = ch_c - exp_h
-                    # Trim the edge with weaker gradient (e.g. top/bottom empty sleeve overhang on a mini)
-                    top_g = float(prof_y[min(len(prof_y) - 1, max(0, y1))])
-                    bot_g = float(prof_y[min(len(prof_y) - 1, max(0, y2))])
-                    # Also check row foreground density in top vs bottom excess band
-                    top_fill = float((cleaned[y1:min(y2, y1 + max(4, excess)), x1:x2] > 0).mean()) if excess > 0 else 1.0
-                    bot_fill = float((cleaned[max(y1, y2 - max(4, excess)):y2, x1:x2] > 0).mean()) if excess > 0 else 1.0
-                    if top_fill < bot_fill * 0.65 or top_g < bot_g * 0.75:
-                        y1 = min(y2 - 40, y2 - exp_h)
-                    elif bot_fill < top_fill * 0.65 or bot_g < top_g * 0.75:
-                        y2 = max(y1 + 40, y1 + exp_h)
+        edge_conf = {
+            side: _score_edge_confidence(
+                side,
+                {"left": x1, "right": x2, "top": y1, "bottom": y2}[side],
+                (x1, y1, x2, y2),
+                l_enh, c_warm, gx, gy,
+            )
+            for side in ("left", "right", "top", "bottom")
+        }
+
+        edge_inferred_side: Optional[str] = None
+        edge_solver_used = False
+        edge_solver_snapped = False
+
+        if target_ar is not None:
+            ar_dev = abs(cand_ar - target_ar) / target_ar
+            sorted_edges = sorted(edge_conf.items(), key=lambda kv: kv[1])
+            w_side, w_conf = sorted_edges[0]
+            _, s2_conf = sorted_edges[1]
+            three_solid_one_weak = (s2_conf >= 0.58 and (w_conf < 0.55 or w_conf < s2_conf - 0.18))
+            solver_trigger = (three_solid_one_weak or ar_dev > 0.06) if is_dark_bed else (three_solid_one_weak or ar_dev > 0.025)
+
+            if solver_trigger:
+                def _project_coord(side: str) -> int:
+                    if side == "left":
+                        return int(round(x2 - ch_c * target_ar))
+                    if side == "right":
+                        return int(round(x1 + ch_c * target_ar))
+                    if side == "top":
+                        return int(round(y2 - cw_c / target_ar))
+                    return int(round(y1 + cw_c / target_ar))
+
+                def _is_valid_proj(side: str, p_val: int) -> bool:
+                    if side == "left":
+                        return 0 <= p_val <= x2 - 40
+                    if side == "right":
+                        return x1 + 40 <= p_val <= sw
+                    if side == "top":
+                        return 0 <= p_val <= y2 - 40
+                    return y1 + 40 <= p_val <= sh
+
+                def _strip_fg_frac(side: str, a_pos: int, b_pos: int) -> float:
+                    lo_p, hi_p = min(a_pos, b_pos), max(a_pos, b_pos)
+                    if hi_p <= lo_p + 1:
+                        return 0.0
+                    if side in ("left", "right"):
+                        ty1 = max(0, y1 + int(ch_c * 0.15))
+                        ty2 = min(sh, y2 - int(ch_c * 0.15))
+                        if ty2 <= ty1 + 4:
+                            return 0.0
+                        op_s = opaque[ty1:ty2, lo_p:hi_p] > 0
+                        lab_s = lab[ty1:ty2, lo_p:hi_p, 0]
+                        cw_s = c_warm[ty1:ty2, lo_p:hi_p]
+                        gx_s = gx[ty1:ty2, lo_p:hi_p]
+                        gy_s = gy[ty1:ty2, lo_p:hi_p]
                     else:
-                        y1 += excess // 2
-                        y2 = min(sh, y1 + exp_h)
-            else:
-                # cand_ar > target_ar: either height was under-detected (dark bottom with weak edge) or width overshot
-                exp_h = int(round(cw_c / target_ar))
-                exp_w = int(round(ch_c * target_ar))
-                top_g = float(prof_y[min(len(prof_y) - 1, max(0, y1))])
-                bot_g = float(prof_y[min(len(prof_y) - 1, max(0, y2))])
-                if exp_h <= int(sh * 0.985) and (sh - y2) >= (exp_h - ch_c) and float(bg_lab[0]) < 150.0 and bot_g < max(8.0, top_g * 0.45):
-                    # Dark-bed full-bleed bottom was under-detected (weak bottom edge vs top): extend y2
-                    deficit_h = exp_h - ch_c
-                    y2 = min(sh, y2 + deficit_h)
-                else:
-                    excess = cw_c - exp_w
-                    if excess > 2:
-                        left_g = float(prof_x[min(len(prof_x) - 1, max(0, x1))])
-                        right_g = float(prof_x[min(len(prof_x) - 1, max(0, x2))])
-                        if right_g < left_g * 0.75:
-                            x2 = max(x1 + 40, x1 + exp_w)
-                        elif left_g < right_g * 0.75:
-                            x1 = min(x2 - 40, x2 - exp_w)
-                        else:
-                            x1 += excess // 2
-                            x2 = min(sw, x1 + exp_w)
+                        tx1 = max(0, x1 + int(cw_c * 0.15))
+                        tx2 = min(sw, x2 - int(cw_c * 0.15))
+                        if tx2 <= tx1 + 4:
+                            return 0.0
+                        op_s = opaque[lo_p:hi_p, tx1:tx2] > 0
+                        lab_s = lab[lo_p:hi_p, tx1:tx2, 0]
+                        cw_s = c_warm[lo_p:hi_p, tx1:tx2]
+                        gx_s = gx[lo_p:hi_p, tx1:tx2]
+                        gy_s = gy[lo_p:hi_p, tx1:tx2]
+                    if is_dark_bed:
+                        fg_m = op_s | ((lab_s - float(bg_lab[0])) > 18.0)
+                    else:
+                        fg_m = op_s | ((float(bg_lab[0]) - lab_s) > 16.0) | (cw_s > 6.5) | (gx_s > 18.0) | (gy_s > 18.0)
+                    return float(np.mean(fg_m))
 
-        return (
+                def _inward_strip_has_foreground(side: str, new_coord: int) -> bool:
+                    if side == "left" and new_coord > x1 + 3:
+                        return _strip_fg_frac("left", x1, new_coord) >= 0.35
+                    if side == "right" and new_coord < x2 - 3:
+                        return _strip_fg_frac("right", new_coord, x2) >= 0.35
+                    if side == "top" and new_coord > y1 + 3:
+                        return _strip_fg_frac("top", y1, new_coord) >= 0.35
+                    if side == "bottom" and new_coord < y2 - 3:
+                        return _strip_fg_frac("bottom", new_coord, y2) >= 0.35
+                    return False
+
+                chosen_side: Optional[str] = None
+                if float(bg_lab[0]) >= 150.0 and ar_dev > 0.025:
+                    # On light beds, if 3 outer drop-shadows were found and 1 side missed its shadow,
+                    # that shadowless side likely collapsed onto inner artwork (high inner-edge gradient)
+                    missing_shadows = [s for s, found in shadow_found.items() if not found]
+                    if len(missing_shadows) == 1:
+                        ms = missing_shadows[0]
+                        p_ms = _project_coord(ms)
+                        if _is_valid_proj(ms, p_ms) and (
+                            (cand_ar < target_ar and ms in ("left", "right"))
+                            or (cand_ar > target_ar and ms in ("top", "bottom"))
+                        ):
+                            chosen_side = ms
+
+                if chosen_side is None and three_solid_one_weak:
+                    p_cand = _project_coord(w_side)
+                    if _is_valid_proj(w_side, p_cand):
+                        chosen_side = w_side
+
+                if chosen_side is None and ar_dev > 0.025:
+                    if cand_ar < target_ar:
+                        # Too narrow or too tall: check if expanding a shadowless left/right outward fits, else trim top/bottom
+                        lr_cands = [s for s in ("left", "right") if not shadow_found.get(s, False)]
+                        if lr_cands:
+                            lr_weak = min(lr_cands, key=lambda s: edge_conf[s])
+                        else:
+                            lr_weak = "left" if edge_conf["left"] <= edge_conf["right"] else "right"
+                        p_lr = _project_coord(lr_weak)
+                        exp_w = int(round(ch_c * target_ar))
+                        other_lr = "right" if lr_weak == "left" else "left"
+                        if (
+                            exp_w > cw_c
+                            and _is_valid_proj(lr_weak, p_lr)
+                            and not shadow_found.get(lr_weak, False)
+                            and (
+                                (shadow_found.get(other_lr, False) and (shadow_found.get("top", False) or shadow_found.get("bottom", False)))
+                                or edge_conf[lr_weak] < min(edge_conf["top"], edge_conf["bottom"])
+                            )
+                        ):
+                            chosen_side = lr_weak
+                        else:
+                            excess = max(1, ch_c - int(round(cw_c / target_ar)))
+                            top_fill = float((cleaned[y1:min(y2, y1 + max(4, excess)), x1:x2] > 0).mean())
+                            bot_fill = float((cleaned[max(y1, y2 - max(4, excess)):y2, x1:x2] > 0).mean())
+                            if top_fill < bot_fill * 0.65:
+                                chosen_side = "top"
+                            elif bot_fill < top_fill * 0.65:
+                                chosen_side = "bottom"
+                            else:
+                                chosen_side = "top" if edge_conf["top"] <= edge_conf["bottom"] else "bottom"
+                    else:
+                        # Too wide or too short: extend weak top/bottom if it fits and is weaker than L/R, else trim L/R
+                        tb_weak = "top" if edge_conf["top"] <= edge_conf["bottom"] else "bottom"
+                        p_tb = _project_coord(tb_weak)
+                        if _is_valid_proj(tb_weak, p_tb) and edge_conf[tb_weak] < min(edge_conf["left"], edge_conf["right"]):
+                            chosen_side = tb_weak
+                        else:
+                            chosen_side = "left" if edge_conf["left"] <= edge_conf["right"] else "right"
+
+                if chosen_side is not None:
+                    raw_exp = _project_coord(chosen_side)
+                    dim = sw if chosen_side in ("left", "right") else sh
+                    exp_coord = int(np.clip(raw_exp, 0, dim))
+                    if _is_valid_proj(chosen_side, exp_coord):
+                        band_px = max(4, int(round(dim * 0.02)))
+                        snapped = _search_micro_band_edge(
+                            chosen_side, exp_coord, band_px, (x1, y1, x2, y2),
+                            l_enh, c_warm, gx, gy, cgx, cgy,
+                        )
+                        final_coord = snapped if (snapped is not None and _is_valid_proj(chosen_side, snapped)) else exp_coord
+                        if _inward_strip_has_foreground(chosen_side, final_coord):
+                            # Reject inward shrink across opaque cardstock; try expanding weaker orthogonal edge outward instead
+                            alt_side = (
+                                ("left" if edge_conf["left"] <= edge_conf["right"] else "right")
+                                if chosen_side in ("top", "bottom")
+                                else ("top" if edge_conf["top"] <= edge_conf["bottom"] else "bottom")
+                            )
+                            alt_dim = sw if alt_side in ("left", "right") else sh
+                            alt_exp = int(np.clip(_project_coord(alt_side), 0, alt_dim))
+                            moves_outward = (
+                                (alt_side == "left" and alt_exp < x1)
+                                or (alt_side == "right" and alt_exp > x2)
+                                or (alt_side == "top" and alt_exp < y1)
+                                or (alt_side == "bottom" and alt_exp > y2)
+                            )
+                            alt_fg_ok = True
+                            if is_dark_bed and moves_outward:
+                                a0, a1 = (
+                                    (alt_exp, x1) if alt_side == "left" else
+                                    (x2, alt_exp) if alt_side == "right" else
+                                    (alt_exp, y1) if alt_side == "top" else
+                                    (y2, alt_exp)
+                                )
+                                alt_fg_ok = _strip_fg_frac(alt_side, a0, a1) >= 0.20
+                            if moves_outward and _is_valid_proj(alt_side, alt_exp) and alt_fg_ok:
+                                chosen_side = alt_side
+                                snapped = _search_micro_band_edge(
+                                    chosen_side, alt_exp, max(4, int(round(alt_dim * 0.02))), (x1, y1, x2, y2),
+                                    l_enh, c_warm, gx, gy, cgx, cgy,
+                                )
+                                final_coord = snapped if (snapped is not None and _is_valid_proj(chosen_side, snapped)) else alt_exp
+                            else:
+                                chosen_side = None
+
+                        if chosen_side is not None:
+                            if chosen_side == "left":
+                                x1 = final_coord
+                            elif chosen_side == "right":
+                                x2 = final_coord
+                            elif chosen_side == "top":
+                                y1 = final_coord
+                            else:
+                                y2 = final_coord
+                            edge_inferred_side = chosen_side
+                            edge_solver_used = True
+                            edge_solver_snapped = bool(snapped is not None and final_coord == snapped)
+                            edge_conf[chosen_side] = _score_edge_confidence(
+                                chosen_side, final_coord, (x1, y1, x2, y2),
+                                l_enh, c_warm, gx, gy,
+                            )
+
+        box = (
             max(0, int(round(x1 / scale))),
             max(0, int(round(y1 / scale))),
             min(w, int(round(x2 / scale))),
             min(h, int(round(y2 / scale))),
         )
+        meta = {
+            "edge_confidence": edge_conf,
+            "edge_inferred_side": edge_inferred_side,
+            "edge_solver_used": edge_solver_used,
+            "edge_solver_snapped": edge_solver_snapped,
+        }
+        return (box, meta) if return_meta else box
 
     # Fallback contour detector
     blur = cv2.GaussianBlur(gray.astype(np.uint8), (5, 5), 0)
@@ -1003,17 +1509,17 @@ def detect_physical_card_box(img: Image.Image) -> tuple[int, int, int, int]:
     best_area = 0.0
     total_s_area = float(sw * sh)
     for c in cnts:
-        x, y, cw, ch = cv2.boundingRect(c)
-        a = float(cw * ch)
+        x, y, cw, ch_b = cv2.boundingRect(c)
+        a = float(cw * ch_b)
         if 0.25 * total_s_area <= a <= 0.98 * total_s_area and a > best_area:
             best_area = a
             best_box = (
                 max(0, int(x / scale)),
                 max(0, int(y / scale)),
                 min(w, int((x + cw) / scale)),
-                min(h, int((y + ch) / scale)),
+                min(h, int((y + ch_b) / scale)),
             )
-    return best_box
+    return (best_box, default_meta) if return_meta else best_box
 
 
 def build_corners_inspection_sheet(
@@ -4961,6 +5467,7 @@ def _measure_side_centering(
     skew_deg: float = 0.0,
     manual_card_format: Optional[str] = None,
     inv_matrix: Optional[np.ndarray] = None,
+    edge_meta: Optional[dict] = None,
 ) -> dict:
     """
     Measures outer card boundary & inner design frame centering on a single side,
@@ -5223,6 +5730,7 @@ def _measure_side_centering(
     else:
         card_fmt = "non_standard"
 
+    em = edge_meta if isinstance(edge_meta, dict) else {}
     return {
         "outer_card_rect": outer_rect,
         "inner_frame_rect": inner_rect,
@@ -5239,6 +5747,8 @@ def _measure_side_centering(
         "borderless_detected": borderless_det,
         "sleeve_detected": sleeve_det,
         "sub_centering": sub_centering,
+        "edge_confidence": em.get("edge_confidence"),
+        "edge_inferred_side": em.get("edge_inferred_side"),
     }
 
 
@@ -5509,10 +6019,20 @@ def estimate_card_pregrade(
         y2 = max(y1 + 40, min(ih, int(round((oy + oh) * ih))))
         return (x1, y1, x2, y2)
 
+    front_edge_meta: Optional[dict] = None
+    back_edge_meta: Optional[dict] = None
     if front_box is None:
-        front_box = _box_from_norm(fg.get("outer_card_rect"), front_img) or detect_physical_card_box(front_img)
+        man_f_box = _box_from_norm(fg.get("outer_card_rect"), front_img)
+        if man_f_box is not None:
+            front_box = man_f_box
+        else:
+            front_box, front_edge_meta = detect_physical_card_box(front_img, return_meta=True)
     if back_box is None:
-        back_box = _box_from_norm(bg.get("outer_card_rect"), back_img) or detect_physical_card_box(back_img)
+        man_b_box = _box_from_norm(bg.get("outer_card_rect"), back_img)
+        if man_b_box is not None:
+            back_box = man_b_box
+        else:
+            back_box, back_edge_meta = detect_physical_card_box(back_img, return_meta=True)
 
     if fg.get("skew_deg") is not None:
         front_skew = round(float(np.clip(float(fg.get("skew_deg")), -6.0, 6.0)), 2)
@@ -5541,6 +6061,8 @@ def estimate_card_pregrade(
                 enable_onnx_anomaly=True,
                 claim_slot=True,
                 overrides=ov,
+                front_inferred_edge=(front_edge_meta or {}).get("edge_inferred_side"),
+                back_inferred_edge=(back_edge_meta or {}).get("edge_inferred_side"),
             )
     except Exception:
         win4_res = None
@@ -5559,6 +6081,7 @@ def estimate_card_pregrade(
         skew_deg=front_skew,
         manual_card_format=fg.get("card_format"),
         inv_matrix=front_M_inv,
+        edge_meta=front_edge_meta,
     )
     b_cent = _measure_side_centering(
         back_work_img,
@@ -5571,6 +6094,7 @@ def estimate_card_pregrade(
         skew_deg=back_skew,
         manual_card_format=bg.get("card_format"),
         inv_matrix=back_M_inv,
+        edge_meta=back_edge_meta,
     )
 
     used_fallback = False

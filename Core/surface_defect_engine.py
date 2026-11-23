@@ -718,6 +718,7 @@ def _detect_edge_silhouette_dings(
     glare_mask: np.ndarray,
     streak_mask: np.ndarray,
     side_label: str,
+    inferred_edge: Optional[str] = None,
 ) -> list[tuple[dict, tuple[int, int, int, int]]]:
     """
     Detects physical edge dings / notches along all 4 card edges (both white and colored
@@ -774,11 +775,65 @@ def _detect_edge_silhouette_dings(
             strip_excl = strip_excl[::-1, :]
             local_edge = (sh_s - 1) - local_edge
 
+        # 2. Localized dark shadow wedge/notch touching outer physical edge (light/white borders)
+        edge_notches: list[tuple[dict, tuple[int, int, int, int]]] = []
+        in_start = max(0, local_edge)
+        in_end = min(sh_s, local_edge + 22)
+        if in_end - in_start >= 10:
+            inner_band = strip_l[min(sh_s - 4, local_edge + 8):min(sh_s, local_edge + 20), :]
+            if inner_band.size > 0:
+                col_med = np.median(inner_band, axis=0)
+                k_roll = min(101, max(15, (sw_s // 8) | 1))
+                # Fast sliding median approximation via blur
+                ref_l = cv2.GaussianBlur(col_med.reshape(1, -1).astype(np.float32), (k_roll, 1), 0).ravel()
+                edge_sub = strip_l[in_start:in_end, :]
+                excl_sub = strip_excl[in_start:in_end, :]
+                notch_m = ((ref_l[None, :] >= 165.0) & (edge_sub <= ref_l[None, :] - 50.0) & (~excl_sub)).astype(np.uint8)
+                n_nc, _, st_nc, _ = cv2.connectedComponentsWithStats(notch_m, connectivity=8)
+                if n_nc < 8:
+                    for i_n in range(1, n_nc):
+                        a_n = int(st_nc[i_n, cv2.CC_STAT_AREA])
+                        if a_n < 48:
+                            continue
+                        bx_n = int(st_nc[i_n, cv2.CC_STAT_LEFT])
+                        by_n = int(st_nc[i_n, cv2.CC_STAT_TOP])
+                        bw_n = int(st_nc[i_n, cv2.CC_STAT_WIDTH])
+                        bh_n = int(st_nc[i_n, cv2.CC_STAT_HEIGHT])
+                        if by_n > 2 or not (6 <= bw_n <= 120) or not (5 <= bh_n <= 30):
+                            continue
+                        l_flank = float(ref_l[max(0, bx_n - 10)])
+                        r_flank = float(ref_l[min(sw_s - 1, bx_n + bw_n + 10)])
+                        if abs(l_flank - r_flank) >= 25.0 or min(l_flank, r_flank) < 165.0:
+                            continue
+                        if axis == "h":
+                            ry = edge_v if inward_dir > 0 else max(0, edge_v - bh_n - 2)
+                            bbox_roi = (int(u_lo + bx_n), int(ry), max(6, bw_n), max(6, bh_n + 2))
+                        else:
+                            rx = edge_v if inward_dir > 0 else max(0, edge_v - bh_n - 2)
+                            bbox_roi = (int(rx), int(u_lo + bx_n), max(6, bh_n + 2), max(6, bw_n))
+                        sev = 1.0 if (a_n >= 120 or bh_n >= 10) else 0.5
+                        edge_notches.append(({
+                            "type": "edge_dent",
+                            "is_true_defect": True,
+                            "confidence": 0.80,
+                            "side": side_label,
+                            "zone": e_name,
+                            "severity": sev,
+                            "target": "edges",
+                        }, bbox_roi))
+                if len(edge_notches) <= 3:
+                    results.extend(edge_notches)
+
         # 1. Silhouette indentation (when margin is available outside edge)
+        has_dark_wedge = 0 < len(edge_notches) <= 3
+        is_inferred_side = bool(inferred_edge and e_name.lower().startswith(str(inferred_edge).strip().lower()))
+        dip_thr = 5.5 if (is_inferred_side and not has_dark_wedge) else 3.5
         if has_m and local_edge >= 5 and (sh_s - local_edge) >= 12:
             bg_l = float(np.median(strip_l[:max(2, local_edge - 3), :]))
             in_band = strip_l[min(sh_s - 4, local_edge + 8):min(sh_s, local_edge + 20), :]
-            border_l = float(np.median(in_band)) if in_band.size else bg_l
+            if in_band.size == 0 or float(np.std(in_band)) >= 22.0:
+                continue
+            border_l = float(np.median(in_band))
             edge_pos = np.full(sw_s, np.nan, dtype=np.float32)
 
             if abs(bg_l - border_l) >= 18.0:
@@ -819,7 +874,7 @@ def _detect_edge_silhouette_dings(
                         if sw_s >= 5:
                             indent_s = np.pad(indent, 1, mode="edge")
                             indent = np.median(np.stack([indent_s[:-2], indent_s[1:-1], indent_s[2:]]), axis=0)
-                        dip_mask = (indent >= 3.5) & (np.mean(strip_excl, axis=0) < 0.35)
+                        dip_mask = (indent >= dip_thr) & (np.mean(strip_excl, axis=0) < 0.35)
                         # Find contiguous runs allowing 1-px gap
                         edge_runs: list[tuple[dict, tuple[int, int, int, int]]] = []
                         u_i = 0
@@ -832,7 +887,8 @@ def _detect_edge_silhouette_dings(
                                 u_end += 1
                             span = u_end - u_i + 1
                             peak_dip = float(np.max(indent[u_i:u_end + 1]))
-                            if 8 <= span <= 120 and peak_dip >= 3.5:
+                            min_span = 22 if (is_inferred_side and not has_dark_wedge and peak_dip < 6.5) else 20
+                            if min_span <= span <= 120 and peak_dip >= dip_thr:
                                 bx_u = u_lo + u_i
                                 depth_px = max(8, int(round(peak_dip + 8)))
                                 if axis == "h":
@@ -855,55 +911,6 @@ def _detect_edge_silhouette_dings(
                             u_i = u_end + 1
                         if len(edge_runs) <= 3:
                             results.extend(edge_runs)
-
-        # 2. Localized dark shadow wedge/notch touching outer physical edge (light/white borders)
-        in_start = max(0, local_edge)
-        in_end = min(sh_s, local_edge + 22)
-        if in_end - in_start >= 10:
-            inner_band = strip_l[min(sh_s - 4, local_edge + 8):min(sh_s, local_edge + 20), :]
-            if inner_band.size > 0:
-                col_med = np.median(inner_band, axis=0)
-                k_roll = min(101, max(15, (sw_s // 8) | 1))
-                # Fast sliding median approximation via blur
-                ref_l = cv2.GaussianBlur(col_med.reshape(1, -1).astype(np.float32), (k_roll, 1), 0).ravel()
-                edge_sub = strip_l[in_start:in_end, :]
-                excl_sub = strip_excl[in_start:in_end, :]
-                notch_m = ((ref_l[None, :] >= 165.0) & (edge_sub <= ref_l[None, :] - 40.0) & (~excl_sub)).astype(np.uint8)
-                n_nc, _, st_nc, _ = cv2.connectedComponentsWithStats(notch_m, connectivity=8)
-                edge_notches: list[tuple[dict, tuple[int, int, int, int]]] = []
-                if n_nc < 8:
-                    for i_n in range(1, n_nc):
-                        a_n = int(st_nc[i_n, cv2.CC_STAT_AREA])
-                        if a_n < 20:
-                            continue
-                        bx_n = int(st_nc[i_n, cv2.CC_STAT_LEFT])
-                        by_n = int(st_nc[i_n, cv2.CC_STAT_TOP])
-                        bw_n = int(st_nc[i_n, cv2.CC_STAT_WIDTH])
-                        bh_n = int(st_nc[i_n, cv2.CC_STAT_HEIGHT])
-                        if by_n > 3 or not (4 <= bw_n <= 120) or not (3 <= bh_n <= 30):
-                            continue
-                        l_flank = float(ref_l[max(0, bx_n - 10)])
-                        r_flank = float(ref_l[min(sw_s - 1, bx_n + bw_n + 10)])
-                        if abs(l_flank - r_flank) >= 25.0 or min(l_flank, r_flank) < 165.0:
-                            continue
-                        if axis == "h":
-                            ry = edge_v if inward_dir > 0 else max(0, edge_v - bh_n - 2)
-                            bbox_roi = (int(u_lo + bx_n), int(ry), max(6, bw_n), max(6, bh_n + 2))
-                        else:
-                            rx = edge_v if inward_dir > 0 else max(0, edge_v - bh_n - 2)
-                            bbox_roi = (int(rx), int(u_lo + bx_n), max(6, bh_n + 2), max(6, bw_n))
-                        sev = 1.0 if (a_n >= 120 or bh_n >= 10) else 0.5
-                        edge_notches.append(({
-                            "type": "edge_dent",
-                            "is_true_defect": True,
-                            "confidence": 0.80,
-                            "side": side_label,
-                            "zone": e_name,
-                            "severity": sev,
-                            "target": "edges",
-                        }, bbox_roi))
-                if len(edge_notches) <= 3:
-                    results.extend(edge_notches)
 
     return results
 
@@ -939,7 +946,7 @@ def _detect_corner_creases(
         ("Bot-Right", max(cx1, cx2 - cz_w), max(cy1, cy2 - cz_h), cx2 - 3, cy2 - 3, -1),
     ]
 
-    min_len = max(28, int(min(cz_w, cz_h) * 0.20))
+    min_len = max(28, int(min(cz_w, cz_h) * 0.25))
     for c_name, kx1, ky1, kx2, ky2, exp_sign in corners:
         if kx2 - kx1 < 36 or ky2 - ky1 < 36:
             continue
@@ -949,6 +956,9 @@ def _detect_corner_creases(
         patch_lab = lab[ky1:ky2, kx1:kx2].astype(np.float32)
         patch_lap = lap_abs[ky1:ky2, kx1:kx2]
         ph, pw = patch_lab.shape[:2]
+        corner_vx = 0.0 if "Left" in c_name else float(pw)
+        corner_vy = 0.0 if "Top" in c_name else float(ph)
+        max_corner_dist = 0.85 * float(min(cz_w, cz_h))
         l_sm = cv2.GaussianBlur(patch_lab[:, :, 0], (7, 7), 0)
         edges = cv2.Canny(np.clip(l_sm, 0, 255).astype(np.uint8), 12, 36)
         art_mask = cv2.dilate((patch_lap > 140.0).astype(np.uint8), np.ones((5, 5), dtype=np.uint8), iterations=1) > 0
@@ -981,6 +991,9 @@ def _detect_corner_creases(
             slope_sign = 1 if (dx * dy) > 0 else -1
             if slope_sign != exp_sign:
                 continue
+            mid_dist = float(np.hypot((x1 + x2) * 0.5 - corner_vx, (y1 + y2) * 0.5 - corner_vy))
+            if mid_dist > max_corner_dist:
+                continue
 
             # Perpendicular unit normal
             nx, ny = -dy / length, dx / length
@@ -1008,19 +1021,19 @@ def _detect_corner_creases(
 
             m_l1, m_l2 = float(np.mean(flank1_l)), float(np.mean(flank2_l))
             s_l1, s_l2 = float(np.std(flank1_l)), float(np.std(flank2_l))
-            if max(s_l1, s_l2) >= 12.0:
+            if max(s_l1, s_l2) >= 10.5:
                 continue
 
             ab1 = np.mean(np.array(flank1_ab, dtype=np.float32), axis=0)
             ab2 = np.mean(np.array(flank2_ab, dtype=np.float32), axis=0)
             hue_diff = float(np.hypot(ab1[0] - ab2[0], ab1[1] - ab2[1]))
-            if hue_diff >= 5.0:
+            if hue_diff >= 3.5:
                 continue
 
             step_l = abs(m_l1 - m_l2)
             ridge_dev = max(abs(float(np.mean(ridge_l)) - m_l1), abs(float(np.mean(ridge_l)) - m_l2))
             contrast = max(step_l, ridge_dev)
-            if not (7.5 <= contrast <= 50.0):
+            if not (15.0 <= contrast <= 48.0):
                 continue
 
             valid_segs.append((length * contrast, x1, y1, x2, y2))
@@ -1076,7 +1089,7 @@ def _detect_edge_foil_peel_or_tear(
     c_span = max(16, int(min(cw, ch) * 0.06))
     band_d = max(14, int(min(cw, ch) * 0.065))
     out_skip = max(2, int(min(cw, ch) * 0.003))
-    min_area = max(200, int(cw * ch * 0.00010))
+    min_area = max(250, int(cw * ch * 0.00022))
     touch_tol = max(6, int(min(cw, ch) * 0.012))
     excl = glare_mask | streak_mask
 
@@ -1186,6 +1199,7 @@ def _detect_ink_spots(
     glare_mask: np.ndarray,
     streak_mask: np.ndarray,
     side_label: str,
+    lap_abs: Optional[np.ndarray] = None,
 ) -> list[tuple[dict, tuple[int, int, int, int]]]:
     """
     Detects isolated compact dark ink blobs / Sharpie splatters (L* < 45, delta_L >= 60
@@ -1200,19 +1214,32 @@ def _detect_ink_spots(
     ix2, iy2 = max(ix1 + 16, cx2 - pad), max(iy1 + 16, cy2 - pad)
 
     sub_l = lab[iy1:iy2, ix1:ix2, 0].astype(np.float32)
+    lap_src = lap_abs if lap_abs is not None else np.abs(cv2.Laplacian(lab[:, :, 0].astype(np.float32), cv2.CV_32F, ksize=3))
     ab_chroma = np.hypot(
         lab[iy1:iy2, ix1:ix2, 1].astype(np.float32) - 128.0,
         lab[iy1:iy2, ix1:ix2, 2].astype(np.float32) - 128.0,
     )
     sub_excl = glare_mask[iy1:iy2, ix1:ix2] | streak_mask[iy1:iy2, ix1:ix2]
     dark_bin = ((sub_l < 48.0) & (ab_chroma < 22.0) & (~sub_excl)).astype(np.uint8)
+    text_bin = ((sub_l < 65.0) & (ab_chroma < 28.0) & (~sub_excl)).astype(np.uint8)
+    n_txt, _, st_txt, cen_txt = cv2.connectedComponentsWithStats(text_bin, connectivity=8)
+    glyphs: list[tuple[float, float, int, int]] = []
+    for i_g in range(1, n_txt):
+        g_area = int(st_txt[i_g, cv2.CC_STAT_AREA])
+        if 8 <= g_area <= 2500:
+            glyphs.append((
+                float(cen_txt[i_g][0]),
+                float(cen_txt[i_g][1]),
+                int(st_txt[i_g, cv2.CC_STAT_WIDTH]),
+                int(st_txt[i_g, cv2.CC_STAT_HEIGHT]),
+            ))
 
     cnts, _ = cv2.findContours(dark_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cands: list[tuple[float, float, int, int, int, int, float]] = []
     sh_i, sw_i = sub_l.shape
     for cnt in cnts:
         area = float(cv2.contourArea(cnt))
-        if not (25.0 <= area <= 1400.0):
+        if not (45.0 <= area <= 1400.0):
             continue
         bx, by, bw, bh = cv2.boundingRect(cnt)
         if bx <= 2 or by <= 2 or (bx + bw) >= (sw_i - 2) or (by + bh) >= (sh_i - 2):
@@ -1250,17 +1277,54 @@ def _detect_ink_spots(
         if (ring_l_med - blob_l_med) < 55.0 or ring_l_std > 16.0 or ring_l_iqr > 18.0:
             continue
 
+        # Filigree / ornamental dark-corner guard: suppress dark print motifs embedded in
+        # high-density scrollwork along the outer 8% corner bands or 12% border bands
+        cx_rel = (bx + bw * 0.5 + pad) / float(cw)
+        cy_rel = (by + bh * 0.5 + pad) / float(ch)
+        in_corner_8 = (cx_rel < 0.08 or cx_rel > 0.92) and (cy_rel < 0.08 or cy_rel > 0.92)
+        in_border_12 = (cx_rel < 0.12 or cx_rel > 0.88 or cy_rel < 0.12 or cy_rel > 0.88)
+        if in_corner_8 or in_border_12:
+            wx1, wy1 = max(cx1, ix1 + bx - 32), max(cy1, iy1 + by - 32)
+            wx2, wy2 = min(cx2, ix1 + bx + bw + 32), min(cy2, iy1 + by + bh + 32)
+            patch_lap = lap_src[wy1:wy2, wx1:wx2].copy()
+            if patch_lap.size > 0:
+                mx1 = max(0, ix1 + bx - 4 - wx1)
+                my1 = max(0, iy1 + by - 4 - wy1)
+                mx2 = min(patch_lap.shape[1], ix1 + bx + bw + 4 - wx1)
+                my2 = min(patch_lap.shape[0], iy1 + by + bh + 4 - wy1)
+                patch_lap[my1:my2, mx1:mx2] = 0.0
+                ed40 = float(np.mean(patch_lap > 40.0))
+                ed60 = float(np.mean(patch_lap > 60.0))
+                if (in_corner_8 and (ed40 >= 0.30 or ed60 >= 0.20)) or (in_border_12 and ed40 >= 0.38 and ed60 >= 0.25):
+                    continue
+
         cands.append((bx + bw * 0.5, by + bh * 0.5, bx, by, bw, bh, area))
 
     if len(cands) > 8:
         return results
 
     # Reject collinear text/dot rows (>= 4 blobs aligned horizontally within 12 px)
+    # and punctuation (periods/commas/hyphens) sitting along horizontal or 90-deg-rotated text baselines
     filtered: list[tuple[float, float, int, int, int, int, float]] = []
     for c in cands:
-        row_peers = sum(1 for o in cands if abs(o[1] - c[1]) < 12.0)
+        cx_b, cy_b, bx, by, bw, bh, area = c
+        row_peers = sum(1 for o in cands if abs(o[1] - cy_b) < 12.0)
         if row_peers >= 4:
             continue
+        if area < 165.0 or max(bw, bh) <= 14:
+            h_peers = 0
+            v_peers = 0
+            for gcx, gcy, gw, gh in glyphs:
+                if abs(gcx - cx_b) < max(bw, 6) and abs(gcy - cy_b) < max(bh, 6):
+                    continue
+                if abs(gcy - cy_b) <= 28.0 and 4.0 <= abs(gcx - cx_b) <= 140.0 and gh <= 55:
+                    h_peers += 1
+                if abs(gcx - cx_b) <= 28.0 and 4.0 <= abs(gcy - cy_b) <= 140.0 and gw <= 55:
+                    v_peers += 1
+                if h_peers >= 2 or v_peers >= 2:
+                    break
+            if h_peers >= 2 or v_peers >= 2:
+                continue
         filtered.append(c)
 
     for cx_b, cy_b, bx, by, bw, bh, area in filtered:
@@ -1430,6 +1494,7 @@ def _inspect_single_side(
     enable_onnx_anomaly: bool = True,
     force_cpu: bool = False,
     overrides: Optional[dict] = None,
+    inferred_edge: Optional[str] = None,
 ) -> dict:
     ov = overrides if isinstance(overrides, dict) else {}
     light_border_mode = bool(ov.get("light_border_mode", False))
@@ -1693,7 +1758,7 @@ def _inspect_single_side(
                     "severity": 0.5,
                     "target": "surface",
                 }, (int(bx + ix1), int(by + iy1), int(bw), int(bh))))
-            elif minor <= 42.0 and (minor <= 8.5 or stroke_w <= 6.0) and major >= 18.0:
+            elif (not is_axis_aligned) and minor <= 18.0 and (minor <= 9.0 or stroke_w <= 5.5) and major >= 65.0 and cand_max_resp > max(thr_surf, 48):
                 conf = min(0.95, 0.72 + min(0.18, major / 250.0) + _anom_boost(cx_c, cy_c))
                 sev = 1.0 if major >= 75.0 else 0.5
                 confirmed.append(_attach_meta({
@@ -1730,9 +1795,9 @@ def _inspect_single_side(
             perim = max(1.0, cv2.arcLength(cnt, True))
             circularity = float(4.0 * np.pi * area / (perim * perim))
 
-            # True fisheye sits on a relatively uniform surrounding ink field (outer_std <= 16.0),
+            # True fisheye sits on a relatively uniform surrounding ink field (outer_std <= 10.0),
             # whereas printed text characters ('E', 'O', '0') or filigree edges sit inside high-variance graphics.
-            if area >= 18.0 and halo_diff >= 9.5 and circularity >= 0.48 and outer_std <= 16.0:
+            if area >= 42.0 and halo_diff >= 22.0 and circularity >= 0.65 and outer_std <= 10.0:
                 conf = min(0.94, 0.68 + min(0.18, halo_diff / 60.0) + _anom_boost(cx_c, cy_c))
                 confirmed.append(_attach_meta({
                     "type": "print_spot_fisheye",
@@ -1778,8 +1843,8 @@ def _inspect_single_side(
                 # whereas printed ribbons/frames are elongated or have multi-color transitions.
                 if (
                     ab_patch.size > 0
-                    and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 7.5
-                    and (lap_patch.size == 0 or (float(np.median(lap_patch)) <= 22.0 and float(np.percentile(lap_patch, 85)) <= 45.0))
+                    and float(np.mean(np.std(ab_patch, axis=(0, 1)))) < 5.5
+                    and (lap_patch.size == 0 or (float(np.median(lap_patch)) <= 14.0 and float(np.percentile(lap_patch, 85)) <= 32.0))
                 ):
                     used_neg.add(j)
                     # Check if dent lies inside the outer 3.5% edge strip (outside corner tips) -> edge_dent
@@ -2010,13 +2075,13 @@ def _inspect_single_side(
     for cc_item, cc_bbox in _detect_corner_creases(lab, lap_abs, local_box, glare_mask, streak_mask, side_label):
         confirmed.append(_attach_meta(cc_item, cc_bbox))
 
-    for ed_item, ed_bbox in _detect_edge_silhouette_dings(lab, local_box, margin_avail, glare_mask, streak_mask, side_label):
+    for ed_item, ed_bbox in _detect_edge_silhouette_dings(lab, local_box, margin_avail, glare_mask, streak_mask, side_label, inferred_edge=inferred_edge):
         confirmed.append(_attach_meta(ed_item, ed_bbox))
 
     for et_item, et_bbox in _detect_edge_foil_peel_or_tear(lab, hsv, surf_resp, local_box, margin_avail, glare_mask, streak_mask, side_label):
         confirmed.append(_attach_meta(et_item, et_bbox))
 
-    for ink_item, ink_bbox in _detect_ink_spots(lab, hsv, local_box, glare_mask, streak_mask, side_label):
+    for ink_item, ink_bbox in _detect_ink_spots(lab, hsv, local_box, glare_mask, streak_mask, side_label, lap_abs=lap_abs):
         confirmed.append(_attach_meta(ink_item, ink_bbox))
 
     for st_item, st_bbox in _detect_margin_ink_bleed(lab, lap_abs, local_box, glare_mask, streak_mask, border_l_med, side_label):
@@ -2077,6 +2142,8 @@ def inspect_card_surface_through_sleeve(
     claim_slot: bool = True,
     force_cpu: bool = False,
     overrides: Optional[dict] = None,
+    front_inferred_edge: Optional[str] = None,
+    back_inferred_edge: Optional[str] = None,
 ) -> dict:
     """
     Inspects Front & Back card images through penny sleeves, toploaders, and Card Saver 1 holders,
@@ -2098,6 +2165,7 @@ def inspect_card_surface_through_sleeve(
         enable_onnx_anomaly=enable_onnx_anomaly,
         force_cpu=force_cpu,
         overrides=overrides,
+        inferred_edge=front_inferred_edge,
     )
 
     if back_img is not None:
@@ -2112,6 +2180,7 @@ def inspect_card_surface_through_sleeve(
             enable_onnx_anomaly=enable_onnx_anomaly,
             force_cpu=force_cpu,
             overrides=overrides,
+            inferred_edge=back_inferred_edge,
         )
     else:
         b_res = {"confirmed": [], "raw_confirmed": [], "artifacts": [], "glare_pct": 0.0, "has_holder_margin": False, "backend": f_res["backend"]}

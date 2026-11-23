@@ -373,6 +373,67 @@ class TestGradingDeepDive(unittest.TestCase):
         self.assertEqual(str(res_upd["card"]["Raw_Price"] or ""), "")
         self.assertTrue(self.vg.GRADING_FEEDBACK_LOG_FILE.exists())
 
+    def test_three_solid_edges_fourth_edge_solver_shadowless_left(self):
+        import cv2
+        import numpy as np
+
+        w, h = 800, 1120
+        true_x1, true_y1, true_x2, true_y2 = 43, 60, 757, 1060  # width=714, height=1000, AR=0.7140
+        canvas = np.full((h, w, 3), 240, dtype=np.uint8)
+        # Draw crisp drop-shadow bevels ONLY on top, bottom, and right edges; leave left edge shadowless
+        cv2.line(canvas, (true_x1, true_y1 - 1), (true_x2 + 1, true_y1 - 1), (165, 165, 168), 3)
+        cv2.line(canvas, (true_x1, true_y2 + 1), (true_x2 + 1, true_y2 + 1), (165, 165, 168), 3)
+        cv2.line(canvas, (true_x2 + 1, true_y1 - 1), (true_x2 + 1, true_y2 + 1), (165, 165, 168), 3)
+        # Inner printed artwork frame inset 48 px from the true physical border
+        cv2.rectangle(canvas, (true_x1 + 48, true_y1 + 48), (true_x2 - 48, true_y2 - 48), (42, 78, 128), -1)
+        im = Image.fromarray(canvas)
+
+        box, meta = self.vg.detect_physical_card_box(im, return_meta=True)
+        self.assertTrue(meta["edge_solver_used"], meta)
+        self.assertEqual(meta["edge_inferred_side"], "left", meta)
+        self.assertLess(meta["edge_confidence"]["left"], meta["edge_confidence"]["right"], meta)
+        self.assertLessEqual(abs(box[0] - true_x1), int(round(w * 0.01)), f"Left edge drifted: {box} vs {true_x1}")
+
+        _, diag = self.vg.estimate_card_pregrade(im, im, return_diagnostics=True)
+        front_cent = diag["centering"]["front"]
+        self.assertIsInstance(front_cent.get("edge_confidence"), dict)
+        self.assertEqual(front_cent.get("edge_inferred_side"), "left")
+
+    def test_dark_bed_white_border_not_chopped_by_solver(self):
+        import cv2
+        import numpy as np
+
+        w, h = 538, 800
+        true_x1, true_y1, true_x2, true_y2 = 12, 36, 502, 755  # ar=490/719=0.6815
+        canvas = np.full((h, w, 3), 38, dtype=np.uint8)
+        cv2.rectangle(canvas, (true_x1, true_y1), (true_x2, true_y2), (240, 240, 238), -1)
+        cv2.rectangle(canvas, (true_x1 + 36, true_y1 + 42), (true_x2 - 36, true_y2 - 42), (45, 78, 128), -1)
+        im = Image.fromarray(canvas)
+
+        box, meta = self.vg.detect_physical_card_box(im, return_meta=True)
+        self.assertLessEqual(box[0], true_x1 + 12, f"Dark-bed left edge chopped: {box} vs {true_x1}")
+        self.assertLessEqual(box[1], true_y1 + 12, f"Dark-bed top edge chopped: {box} vs {true_y1}")
+        self.assertNotIn(meta.get("edge_inferred_side"), ("top", "left"))
+
+    def test_standard_white_border_with_inner_frame_not_mini(self):
+        import cv2
+        import numpy as np
+
+        # 571x800 light-bed scan of a full-height white-bordered standard card whose dark inner frame has ~0.57 AR
+        w, h = 571, 800
+        canvas = np.full((h, w, 3), 234, dtype=np.uint8)
+        # Subtle drop-shadow bevel at outer standard border (20..551, 24..776 -> ar=0.706)
+        cv2.rectangle(canvas, (20, 24), (551, 776), (180, 180, 182), 2)
+        cv2.rectangle(canvas, (22, 26), (549, 774), (244, 244, 242), -1)
+        # Strong dark inner printed frame (~430x748 -> ar=0.575)
+        cv2.rectangle(canvas, (70, 26), (500, 774), (35, 40, 48), 4)
+        cv2.rectangle(canvas, (74, 30), (496, 770), (72, 105, 145), -1)
+        im = Image.fromarray(canvas)
+
+        box, meta = self.vg.detect_physical_card_box(im, return_meta=True)
+        cent = self.vg._measure_side_centering(im, box, edge_meta=meta)
+        self.assertEqual(cent["card_format"], "standard", f"Standard card misclassified as mini: {cent}")
+
 
 if __name__ == "__main__":
     unittest.main()
