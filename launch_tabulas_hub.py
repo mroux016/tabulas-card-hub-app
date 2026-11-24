@@ -31,6 +31,94 @@ _ACTIVE_WEBVIEW_WINDOW = None
 _RESTART_LOCK = threading.Lock()
 _RESTART_IN_PROGRESS = False
 
+WINDOWS_APP_USER_MODEL_ID = "Tabulas.CardHub.Desktop"
+SHELL32_CARDBOARD_BOX_ICON_INDEX = 174
+_WM_SETICON = 0x0080
+_ICON_SMALL = 0
+_ICON_BIG = 1
+
+
+def set_windows_app_user_model_id(app_id: str = WINDOWS_APP_USER_MODEL_ID) -> bool:
+    """Sets the Windows AppUserModelID so Tabulas has its own taskbar group instead of python.exe."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+        return True
+    except Exception:
+        return False
+
+
+def extract_shell32_icon_handles(
+    icon_index: int = SHELL32_CARDBOARD_BOX_ICON_INDEX,
+    dll_path: str | None = None,
+) -> tuple[int, int]:
+    """Extracts `(h_large, h_small)` icon handles from `SHELL32.dll` using `ExtractIconExW`."""
+    if not sys.platform.startswith("win") and dll_path is None:
+        return (0, 0)
+    try:
+        import ctypes
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        target_dll = str(dll_path or os.path.join(sys_root, "System32", "SHELL32.dll"))
+        large = (ctypes.c_void_p * 1)()
+        small = (ctypes.c_void_p * 1)()
+        count = int(ctypes.windll.shell32.ExtractIconExW(target_dll, int(icon_index), large, small, 1) or 0)
+        if count <= 0:
+            return (0, 0)
+        return (int(large[0] or 0), int(small[0] or 0))
+    except Exception:
+        return (0, 0)
+
+
+def apply_windows_window_icon(
+    hwnd: int,
+    icon_index: int = SHELL32_CARDBOARD_BOX_ICON_INDEX,
+    dll_path: str | None = None,
+) -> bool:
+    """Applies `ICON_BIG` and `ICON_SMALL` from `SHELL32.dll` to a native Win32 window `HWND`."""
+    if not hwnd or (not sys.platform.startswith("win") and dll_path is None):
+        return False
+    try:
+        import ctypes
+        h_large, h_small = extract_shell32_icon_handles(icon_index=icon_index, dll_path=dll_path)
+        if not h_large and not h_small:
+            return False
+        user32 = ctypes.windll.user32
+        if h_large:
+            user32.SendMessageW(int(hwnd), _WM_SETICON, _ICON_BIG, int(h_large))
+        if h_small or h_large:
+            user32.SendMessageW(int(hwnd), _WM_SETICON, _ICON_SMALL, int(h_small or h_large))
+        return True
+    except Exception:
+        return False
+
+
+def _apply_pywebview_windows_icon(win, icon_index: int = SHELL32_CARDBOARD_BOX_ICON_INDEX) -> bool:
+    """Resolves the `pywebview` native `HWND` and applies the Windows cardboard box icon."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        hwnd = 0
+        for _ in range(15):
+            native = getattr(win, "native", None)
+            handle = getattr(native, "Handle", None)
+            if handle is not None:
+                try:
+                    hwnd = int(handle.ToInt64()) if hasattr(handle, "ToInt64") else int(handle)
+                except Exception:
+                    hwnd = 0
+            if not hwnd:
+                title = str(getattr(win, "title", "") or "Tabulas Card Management Hub")
+                hwnd = int(ctypes.windll.user32.FindWindowW(None, title) or 0)
+            if hwnd:
+                break
+            time.sleep(0.2)
+        return apply_windows_window_icon(hwnd, icon_index=icon_index) if hwnd else False
+    except Exception:
+        return False
+
 
 def build_restart_command(
     port: int,
@@ -587,6 +675,34 @@ def _start_background_cache_prewarm():
         _log_ui_action_to_file("System", "Startup Cache Pre-Warm", summary)
 
     threading.Thread(target=_prewarm_worker, name="tabulas-cache-prewarm", daemon=True).start()
+
+
+def _start_background_proxy_bootstrap():
+    """
+    Non-blocking startup hook that validates/launches configured localhost `wireproxy`
+    instances when `scraper_proxy_pool` contains loopback proxies.
+    """
+    def _proxy_worker():
+        try:
+            from Core.proxy_manager import ensure_proxies_ready, is_localhost_proxy
+            pool = (load_scraper_settings() or {}).get("scraper_proxy_pool") or []
+            if not any(is_localhost_proxy(p) for p in pool):
+                return
+            res = ensure_proxies_ready(pool)
+            for item in res.get("results") or []:
+                hp = str(item.get("proxy") or "").replace("http://", "").replace("https://", "")
+                if item.get("ok"):
+                    print(
+                        f"  [PROXY OK] {hp} -> ip={item.get('ip')} "
+                        f"(loc={item.get('loc') or '?'}, colo={item.get('colo') or '?'})",
+                        flush=True,
+                    )
+                else:
+                    print(f"  [PROXY DOWN] {hp} -> {item.get('error') or 'unreachable'}", flush=True)
+        except Exception as e:
+            print(f"  [PROXY WARN] Startup proxy check failed: {e}", flush=True)
+
+    threading.Thread(target=_proxy_worker, name="tabulas-proxy-bootstrap", daemon=True).start()
 
 
 def _expand_sku_tokens(raw_skus: list[str]) -> list[str]:
@@ -1253,6 +1369,18 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
         if route == "/api/scraper/settings":
             self._send_json({"success": True, "settings": load_scraper_settings()})
+            return
+
+        if route == "/api/scraper/proxies/status":
+            from Core.proxy_manager import get_proxies_status
+            pool = (load_scraper_settings() or {}).get("scraper_proxy_pool") or []
+            st = get_proxies_status(pool)
+            self._send_json({
+                "success": True,
+                "configured_pool": pool,
+                "healthy_proxies": st.get("healthy_proxies", []),
+                "results": st.get("results", []),
+            })
             return
 
         if route == "/api/rate-learner":
@@ -3447,6 +3575,25 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "settings": saved_sc})
             return
 
+        if route == "/api/scraper/proxies/restart":
+            from Core.proxy_manager import ensure_proxies_ready
+            pool = (load_scraper_settings() or {}).get("scraper_proxy_pool") or []
+            res = ensure_proxies_ready(pool, force_relaunch=True)
+            healthy = res.get("healthy_proxies", [])
+            _log_ui_action_to_file(
+                "Settings",
+                "Restarted & Validated Local Proxies",
+                f"healthy={len(healthy)}/{len(pool)}",
+            )
+            self._send_json({
+                "success": True,
+                "configured_pool": pool,
+                "healthy_proxies": healthy,
+                "results": res.get("results", []),
+                "relaunched": bool(res.get("relaunched")),
+            })
+            return
+
         if route == "/api/compute/benchmark":
             from Core.compute_backend import probe_system_hardware, run_compute_benchmark
             bench_res = run_compute_benchmark()
@@ -3563,6 +3710,7 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
 
     # Pre-warm Master Checklist, Set Directory & Inventory caches asynchronously while window opens
     _start_background_cache_prewarm()
+    _start_background_proxy_bootstrap()
     try:
         from Core.maintenance_scheduler import start_maintenance_scheduler_daemon
         start_maintenance_scheduler_daemon(poll_seconds=60)
@@ -3582,6 +3730,7 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
         # Mode 1: Native Desktop App Window via pywebview (zero Chrome/browser tabs!)
         try:
             import webview
+            set_windows_app_user_model_id()
             srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
             srv_thread.start()
             print("  [Window] Opening Native Desktop Window (pywebview)...")
@@ -3595,7 +3744,7 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
             )
             _ACTIVE_WEBVIEW_WINDOW = win
             try:
-                webview.start()
+                webview.start(func=lambda: _apply_pywebview_windows_icon(win))
             finally:
                 _ACTIVE_WEBVIEW_WINDOW = None
             server.shutdown()
@@ -3640,6 +3789,7 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
 
 
 def main():
+    set_windows_app_user_model_id()
     parser = argparse.ArgumentParser(description="Launch Tabulas Card Management Hub")
     parser.add_argument("--browser", action="store_true", help="Open in default web browser instead of standalone desktop window")
     parser.add_argument(

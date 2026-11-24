@@ -32,6 +32,8 @@ BACKUP_SUBDIR = CORE_DIR / ".verified_backups"
 FONTS_DIR = CORE_DIR / "fonts"
 DOWNLOADED_FILES_DIR = CORE_DIR / "downloaded_files"
 UPDATES_DIR = BASE_DIR / "Updates"
+HUB_DIR = str(BASE_DIR)
+PROXY_DIR = os.path.join(HUB_DIR, "Proxy")
 
 # Canonical registry of all 9 application modules and their expected pre-release versions
 EXPECTED_MODULE_REGISTRY = [

@@ -95,6 +95,7 @@ from Core.config import (
     sanitize_filename_part,
     strip_accents,
 )
+from Core.proxy_manager import ensure_proxies_ready, is_localhost_proxy
 from Core.rate_learner import get_rate_learner
 
 SCRAPER_ENGINE_VERSION = f"v{__version__}"
@@ -833,6 +834,60 @@ def preflight_probe_tcdb_images(
         }
 
 
+class _CloudflareHardBlockError(RuntimeError):
+    """Raised when SeleniumBase lands on a Cloudflare WAF hard IP block page."""
+
+
+class _LocalProxyUnreachableError(RuntimeError):
+    """Raised when the browser or preflight probe fails to reach a local proxy."""
+
+
+def _is_cloudflare_hard_block(page_title: str, page_source: str) -> bool:
+    """Returns True when the page title or HTML indicates a Cloudflare WAF hard block."""
+    combined = f"{page_title or ''}\n{page_source or ''}".lower()
+    markers = (
+        "sorry, you have been blocked",
+        "attention required! | cloudflare",
+        "you have been blocked",
+        "error 1020",
+        "cf-error-details",
+    )
+    return any(m in combined for m in markers)
+
+
+def _is_browser_proxy_error(page_title: str, page_source: str) -> bool:
+    """Returns True when Chrome reports a local proxy connection failure or offline page."""
+    combined = f"{page_title or ''}\n{page_source or ''}".lower()
+    markers = (
+        "err_proxy_connection_failed",
+        "err_tunnel_connection_failed",
+        "no internet",
+        "there is no internet connection",
+        "unable to connect to the proxy server",
+    )
+    return any(m in combined for m in markers)
+
+
+def _is_local_proxy_connection_refused(err_text: str, active_proxy: str = "") -> bool:
+    """Returns True when an error string reflects a connection refusal to a local proxy."""
+    low = str(err_text or "").lower()
+    if not low:
+        return False
+    conn_markers = (
+        "curl: (7)",
+        "failed to connect",
+        "connection refused",
+        "err_proxy_connection_failed",
+        "local proxy unreachable",
+        "tcp port unreachable",
+    )
+    if not any(m in low for m in conn_markers):
+        return False
+    return is_localhost_proxy(active_proxy) or any(
+        tok in low for tok in ("127.0.0.1", "localhost", "proxy")
+    )
+
+
 def connect_session(
     existing_session=None,
     max_attempts: int = 5,
@@ -860,8 +915,23 @@ def connect_session(
     effective_pool = normalize_proxy_pool(
         proxy_pool if proxy_pool is not None else load_scraper_settings().get("scraper_proxy_pool", [])
     )
+    if any(is_localhost_proxy(p) for p in effective_pool):
+        pm_res = ensure_proxies_ready(effective_pool)
+        for res in pm_res.get("results") or []:
+            hp = format_proxy_host_port(res.get("proxy", ""))
+            if res.get("ok"):
+                loc_s = res.get("loc") or "?"
+                colo_s = res.get("colo") or "?"
+                log_msg(f"  ✅ [PROXY READY] {hp} -> ip={res.get('ip')} (loc={loc_s}, colo={colo_s})")
+            else:
+                log_msg(f"  ⚠️ [PROXY SKIPPED] {hp} -> {res.get('error') or 'unhealthy'}")
+        healthy_pool = list(pm_res.get("healthy_proxies") or [])
+        if healthy_pool:
+            effective_pool = healthy_pool
+
     cur_proxy_idx = (_ACTIVE_PROXY_INDEX % len(effective_pool)) if effective_pool else 0
     proxies_tried = 0
+    local_proxy_self_healed = False
 
     if SB is None:
         log_msg("  [!] SeleniumBase (SB) not installed — using curl_cffi TLS session.")
@@ -941,8 +1011,14 @@ def connect_session(
                                 sb.driver.switch_to.window(sb.driver.window_handles[-1])
                             cur_cookies = {c["name"]: c["value"] for c in (sb.driver.get_cookies() or [])}
                             title_s = str(getattr(sb.driver, "title", "") or "")
-                            src_head = str(getattr(sb.driver, "page_source", "") or "")[:1200]
+                            src_head = str(getattr(sb.driver, "page_source", "") or "")[:4000]
                             ready_state = str(sb.driver.execute_script("return document.readyState;") or "")
+                            if _is_cloudflare_hard_block(title_s, src_head):
+                                log_msg("  🛡️ [CF HARD BLOCK] Cloudflare WAF hard-blocked this IP/proxy — skipping /Images/Large/ probe.")
+                                raise _CloudflareHardBlockError(f"Cloudflare WAF hard block ({title_s or 'HTTP 403'})")
+                            if _is_browser_proxy_error(title_s, src_head):
+                                log_msg(f"  🔌 [PROXY ERROR] Browser reported local proxy error ({title_s or 'ERR_PROXY_CONNECTION_FAILED'}).")
+                                raise _LocalProxyUnreachableError(f"Local proxy unreachable ({title_s or 'ERR_PROXY_CONNECTION_FAILED'})")
                             is_cf_page = (
                                 "just a moment" in title_s.lower()
                                 or "cf-browser-verification" in src_head.lower()
@@ -954,7 +1030,7 @@ def connect_session(
                                 elapsed_c = time.time() - wait_t0
                                 log_msg(f"  ✅ TCDB page ready in {elapsed_c:.1f}s (cf_clearance={has_clearance}).")
                                 break
-                        except CloudflareEdgeBlockPaused:
+                        except (_CloudflareHardBlockError, _LocalProxyUnreachableError, CloudflareEdgeBlockPaused):
                             raise
                         except Exception:
                             pass
@@ -1003,6 +1079,8 @@ def connect_session(
                 )
                 if probe.get("classification") == "403_cf_block":
                     raise RuntimeError(probe.get("message") or "Pre-flight /Images/Large/ returned HTTP 403")
+                if probe.get("classification") == "network_error" and _is_local_proxy_connection_refused(probe.get("message", ""), active_proxy):
+                    raise _LocalProxyUnreachableError(probe.get("message") or "Local proxy unreachable")
             elif run_preflight and not effective_require_image_probe:
                 log_msg("  ℹ️ Skipping /Images/Large/ pre-flight gate (checklist/HTML-only mode; require_image_probe=False).")
 
@@ -1018,6 +1096,74 @@ def connect_session(
             consecutive_clearance_failures += 1
             err_line = str(e).splitlines()[0] if str(e) else "Unknown Error"
             cleanup_orphaned_drivers()
+
+            is_proxy_drop = isinstance(e, _LocalProxyUnreachableError) or _is_local_proxy_connection_refused(str(e), active_proxy)
+            if is_proxy_drop:
+                if not local_proxy_self_healed and any(is_localhost_proxy(p) for p in effective_pool):
+                    local_proxy_self_healed = True
+                    log_msg("  🔧 [PROXY SELF-HEAL] Local proxy unreachable — relaunching wireproxy configs...")
+                    heal = ensure_proxies_ready(effective_pool, force_relaunch=True)
+                    healed_pool = list(heal.get("healthy_proxies") or [])
+                    if healed_pool:
+                        effective_pool = healed_pool
+                        cur_proxy_idx = 0
+                        _ACTIVE_PROXY_INDEX = 0
+                        rotate_profile = True
+                        effective_max_attempts = max(effective_max_attempts, attempt + len(effective_pool))
+                        continue
+                if effective_pool and (proxies_tried + 1) < len(effective_pool):
+                    proxies_tried += 1
+                    cur_proxy_idx = (cur_proxy_idx + 1) % len(effective_pool)
+                    _ACTIVE_PROXY_INDEX = cur_proxy_idx
+                    rotate_profile = True
+                    log_msg(
+                        f"  🔄 [PROXY ROTATE] Switching to proxy {cur_proxy_idx + 1}/{len(effective_pool)} "
+                        f"({format_proxy_host_port(effective_pool[cur_proxy_idx])})"
+                    )
+                    time.sleep(min(4, 2 * attempt))
+                    continue
+                pause_msg = (
+                    f"Auto-paused: Local proxy unreachable ({err_line}) — "
+                    f"verify wireproxy configs or network, then click Resume"
+                )
+                request_auto_pause(pause_msg)
+                if _PAUSE_CHECK_CALLBACK is not None and is_pause_requested():
+                    resumed = wait_if_paused(reason=pause_msg)
+                    if resumed:
+                        consecutive_clearance_failures = 0
+                        proxies_tried = 0
+                        local_proxy_self_healed = False
+                        rotate_profile = True
+                        attempt = 0
+                        continue
+                raise CloudflareEdgeBlockPaused(pause_msg)
+
+            if isinstance(e, _CloudflareHardBlockError):
+                if effective_pool and (proxies_tried + 1) < len(effective_pool):
+                    proxies_tried += 1
+                    cur_proxy_idx = (cur_proxy_idx + 1) % len(effective_pool)
+                    _ACTIVE_PROXY_INDEX = cur_proxy_idx
+                    rotate_profile = True
+                    log_msg(
+                        f"  🔄 [PROXY ROTATE] Switching to proxy {cur_proxy_idx + 1}/{len(effective_pool)} "
+                        f"({format_proxy_host_port(effective_pool[cur_proxy_idx])})"
+                    )
+                    time.sleep(min(4, 2 * attempt))
+                    continue
+                pause_msg = "Auto-paused: IP hard-blocked by Cloudflare WAF — switch VPN node or update proxy, then click Resume"
+                request_auto_pause(pause_msg)
+                if _PAUSE_CHECK_CALLBACK is not None and is_pause_requested():
+                    resumed = wait_if_paused(reason=pause_msg)
+                    if resumed:
+                        consecutive_clearance_failures = 0
+                        proxies_tried = 0
+                        if effective_pool:
+                            cur_proxy_idx = (cur_proxy_idx + 1) % len(effective_pool)
+                            _ACTIVE_PROXY_INDEX = cur_proxy_idx
+                        rotate_profile = True
+                        attempt = 0
+                        continue
+                raise CloudflareEdgeBlockPaused(pause_msg)
 
             if effective_pool:
                 proxies_tried += 1

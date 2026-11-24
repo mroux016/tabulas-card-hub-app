@@ -120,6 +120,7 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
         self.catalogs_dir = self.root / "Cache" / "Library" / "Catalogs"
         self.ref_dir = self.root / "SetLibrary" / "Reference_Library"
         self.logs_dir = self.root / "Logs"
+        self.proxy_dir = self.root / "Proxy"
         self.scraper_settings_file = self.logs_dir / "scraper_settings.json"
         self.learner_file = self.logs_dir / "adaptive_rate_learner.json"
 
@@ -129,6 +130,7 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
             self.catalogs_dir,
             self.ref_dir,
             self.logs_dir,
+            self.proxy_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +159,7 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
             mock.patch.object(cfg, "CACHE_CHECKPOINTS_DIR", self.checkpoints_dir),
             mock.patch.object(cfg, "REFERENCE_TEMPLATES_DIR", self.ref_dir),
             mock.patch.object(cfg, "LOGS_DIR", self.logs_dir),
+            mock.patch.object(cfg, "PROXY_DIR", str(self.proxy_dir)),
             mock.patch.object(cfg, "SCRAPER_SETTINGS_FILE", self.scraper_settings_file),
             mock.patch.object(rl, "RATE_LEARNER_STATE_FILE", self.learner_file),
             mock.patch.object(rl, "_SINGLETON_LEARNER", rl.AdaptiveRateLearner(state_file=self.learner_file)),
@@ -364,7 +367,15 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
         logs: list[str] = []
         self.se.set_log_callback(logs.append)
         sess = _ProxySession()
-        with mock.patch.object(self.se, "SB", _ProxySB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+        fake_pm_ok = {
+            "healthy_proxies": ["http://127.0.0.1:8881", "http://127.0.0.1:8882"],
+            "results": [
+                {"proxy": "http://127.0.0.1:8881", "ok": True, "ip": "198.51.100.1", "loc": "CA", "colo": "YYZ", "latency_ms": 10, "error": ""},
+                {"proxy": "http://127.0.0.1:8882", "ok": True, "ip": "198.51.100.2", "loc": "US", "colo": "SJC", "latency_ms": 12, "error": ""},
+            ],
+            "relaunched": False,
+        }
+        with mock.patch.object(self.se, "SB", _ProxySB), mock.patch.object(self.se, "ensure_proxies_ready", return_value=fake_pm_ok), mock.patch.object(self.se.time, "sleep", lambda _s: None):
             out = self.se.connect_session(existing_session=sess, max_attempts=1, require_image_probe=True)
 
         self.assertIs(out, sess)
@@ -380,7 +391,7 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
         always_403 = _CapturingMockSession({self.se.DEFAULT_PREFLIGHT_IMAGE_URL: _MockResponse(403, text="Forbidden")})
         pause_calls: list[tuple[bool, str]] = []
         self.se.set_pause_state_callback(lambda paused, reason="": pause_calls.append((paused, reason)))
-        with mock.patch.object(self.se, "SB", _ProxySB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+        with mock.patch.object(self.se, "SB", _ProxySB), mock.patch.object(self.se, "ensure_proxies_ready", return_value=fake_pm_ok), mock.patch.object(self.se.time, "sleep", lambda _s: None):
             with self.assertRaises(self.se.CloudflareEdgeBlockPaused) as ctx:
                 self.se.connect_session(existing_session=always_403, max_attempts=1, require_image_probe=True)
         self.assertIn("exhausting all 2 configured proxies", str(ctx.exception))
@@ -444,6 +455,300 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
         self.assertEqual(len(df2), 202)
         self.assertTrue(all("Checklist.cfm" not in c["url"] for c in sess_run2.calls))
         self.assertTrue(any("[SKIP] Metallic Snowflake (local=200, tcdb_reported=201)" in ln for ln in logs2))
+
+    # ------------------------------------------------------------------
+    # 6. Dynamic discovery of wp*.conf files & BindAddress parsing in %TEMP%
+    # ------------------------------------------------------------------
+    def test_discover_wireproxy_configs_dynamic_parsing(self):
+        import Core.proxy_manager as pm
+
+        exe = self.proxy_dir / "wireproxy.exe"
+        exe.write_bytes(b"MZ")
+        (self.proxy_dir / "wp_alpha.conf").write_text(
+            "WGConfig = wg_ca.conf\n\n[http]\nBindAddress = 127.0.0.1:9101\n",
+            encoding="utf-8",
+        )
+        (self.proxy_dir / "wp_beta.conf").write_text(
+            "WGConfig = wg_us.conf\n\n[Socks5]\nBindAddress = 127.0.0.1:9102\n",
+            encoding="utf-8",
+        )
+        (self.proxy_dir / "other.conf").write_text(
+            "[http]\nBindAddress = 127.0.0.1:9999\n",
+            encoding="utf-8",
+        )
+
+        disc = pm.discover_wireproxy_configs(self.proxy_dir)
+        self.assertEqual(disc["exe_path"], str(exe))
+        self.assertEqual(
+            disc["proxies"],
+            {
+                "http://127.0.0.1:9101": str(self.proxy_dir / "wp_alpha.conf"),
+                "socks5://127.0.0.1:9102": str(self.proxy_dir / "wp_beta.conf"),
+            },
+        )
+        self.assertEqual(disc["configs"]["http://127.0.0.1:9101"]["wg_config"], "wg_ca.conf")
+        self.assertEqual(disc["configs"]["socks5://127.0.0.1:9102"]["wg_config"], "wg_us.conf")
+
+    # ------------------------------------------------------------------
+    # 7. ensure_proxies_ready relaunches stopped proxies & filters timed-out port
+    # ------------------------------------------------------------------
+    def test_ensure_proxies_ready_relaunches_and_filters_unhealthy_port(self):
+        import Core.proxy_manager as pm
+
+        (self.proxy_dir / "wireproxy.exe").write_bytes(b"MZ")
+        (self.proxy_dir / "wp_a.conf").write_text("WGConfig = wg1.conf\n[http]\nBindAddress = 127.0.0.1:8881\n", encoding="utf-8")
+        (self.proxy_dir / "wp_b.conf").write_text("WGConfig = wg2.conf\n[http]\nBindAddress = 127.0.0.1:8882\n", encoding="utf-8")
+
+        state = {"launched": False}
+        run_calls: list[list[str]] = []
+        popen_calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_popen(cmd, **kwargs):
+            popen_calls.append(list(cmd))
+            state["launched"] = True
+            return mock.Mock(pid=42420 + len(popen_calls))
+
+        def fake_tcp(host, port, timeout=1.0):
+            return bool(state["launched"] and port == 8882)
+
+        def fake_get(url, proxies=None, timeout=6.0):
+            p_url = (proxies or {}).get("https", "")
+            if "8882" in p_url:
+                return _MockResponse(200, text="ip=203.0.113.88\nloc=CA\ncolo=YYZ\n")
+            raise TimeoutError("timed out")
+
+        with mock.patch.object(pm.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(pm.subprocess, "Popen", side_effect=fake_popen), \
+             mock.patch.object(pm, "_tcp_port_open", side_effect=fake_tcp), \
+             mock.patch.object(pm.requests, "get", side_effect=fake_get), \
+             mock.patch.object(pm.time, "sleep", lambda _s: None):
+            res = pm.ensure_proxies_ready(["http://127.0.0.1:8881", "http://127.0.0.1:8882"], proxy_dir=self.proxy_dir, startup_wait_s=0.1)
+
+        self.assertTrue(res["relaunched"])
+        self.assertEqual(res["healthy_proxies"], ["http://127.0.0.1:8882"])
+        self.assertEqual(len(popen_calls), 2)
+        self.assertTrue(any("-n" in c for c in run_calls))
+
+    # ------------------------------------------------------------------
+    # 8. connect_session detects Cloudflare WAF hard block without /Images/Large/
+    # ------------------------------------------------------------------
+    def test_connect_session_detects_cf_hard_block_skips_probe_and_rotates_or_pauses(self):
+        self.cfg.save_scraper_settings({"scraper_proxy_pool": ["http://127.0.0.1:8881", "http://127.0.0.1:8882"]})
+        fake_pm_ok = {
+            "healthy_proxies": ["http://127.0.0.1:8881", "http://127.0.0.1:8882"],
+            "results": [
+                {"proxy": "http://127.0.0.1:8881", "ok": True, "ip": "198.51.100.1", "loc": "US", "colo": "LAX", "latency_ms": 10, "error": ""},
+                {"proxy": "http://127.0.0.1:8882", "ok": True, "ip": "198.51.100.2", "loc": "CA", "colo": "YYZ", "latency_ms": 12, "error": ""},
+            ],
+            "relaunched": False,
+        }
+
+        class _HardBlockedDriver:
+            window_handles = ["h1"]
+            title = "Attention Required! | Cloudflare"
+            page_source = '<html><body><div id="cf-error-details"><h1>Sorry, you have been blocked</h1></div></body></html>'
+
+            class _SW:
+                def window(self, _h):
+                    pass
+
+            switch_to = _SW()
+
+            def get_cookies(self):
+                return []
+
+            def execute_script(self, script: str):
+                return "complete" if "readyState" in script else "Mozilla/5.0 TestUA"
+
+        class _HealthyDriver:
+            window_handles = ["h1"]
+            title = "TCDB"
+            page_source = "<html><body>" + ("ok" * 100) + "</body></html>"
+
+            class _SW:
+                def window(self, _h):
+                    pass
+
+            switch_to = _SW()
+
+            def get_cookies(self):
+                return [{"name": "cf_clearance", "value": "cf_ok_2"}]
+
+            def execute_script(self, script: str):
+                return "complete" if "readyState" in script else "Mozilla/5.0 TestUA"
+
+        sb_calls = {"n": 0}
+
+        class _RotSB:
+            def __init__(self, **kwargs):
+                sb_calls["n"] += 1
+                self.driver = _HardBlockedDriver() if sb_calls["n"] == 1 else _HealthyDriver()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def uc_open_with_reconnect(self, _url, _t):
+                pass
+
+            def sleep(self, _s):
+                pass
+
+        probe_calls = []
+
+        class _NoProbeSess:
+            def __init__(self):
+                self.cookies = {}
+                self.headers = {}
+                self.proxies = {}
+
+            def get(self, url, **kwargs):
+                probe_calls.append(url)
+                return _MockResponse(200, content=b"\xff\xd8\xff\xe0" + b"0" * 600)
+
+        logs: list[str] = []
+        self.se.set_log_callback(logs.append)
+        with mock.patch.object(self.se, "SB", _RotSB), \
+             mock.patch.object(self.se, "ensure_proxies_ready", return_value=fake_pm_ok), \
+             mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            out = self.se.connect_session(existing_session=_NoProbeSess(), max_attempts=1, require_image_probe=True)
+
+        self.assertEqual(len(probe_calls), 1)
+        self.assertTrue(any("[CF HARD BLOCK]" in ln for ln in logs))
+        self.assertTrue(any("[PROXY ROTATE]" in ln for ln in logs))
+        self.assertEqual(sum("TCDB page ready" in ln for ln in logs), 1)
+        self.assertFalse(any("cf_clearance=False" in ln for ln in logs))
+        self.assertEqual(out.proxies.get("https"), "http://127.0.0.1:8882")
+
+        # When all connections are hard-blocked (e.g. direct connection), immediately auto-pause with WAF message
+        self.se.reset_proxy_pool_state()
+        sb_calls["n"] = 0
+        logs.clear()
+
+        class _AlwaysBlockedSB(_RotSB):
+            def __init__(self, **kwargs):
+                self.driver = _HardBlockedDriver()
+
+        probe_calls.clear()
+        with mock.patch.object(self.se, "SB", _AlwaysBlockedSB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            with self.assertRaises(self.se.CloudflareEdgeBlockPaused) as ctx:
+                self.se.connect_session(existing_session=_NoProbeSess(), proxy_pool=[], max_attempts=2, require_image_probe=True)
+        self.assertEqual(probe_calls, [])
+        self.assertFalse(any("TCDB page ready" in ln for ln in logs))
+        self.assertIn("IP hard-blocked by Cloudflare WAF", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # 9. connect_session detects ERR_PROXY_CONNECTION_FAILED and self-heals
+    # ------------------------------------------------------------------
+    def test_connect_session_detects_browser_proxy_error_and_triggers_relaunch(self):
+        self.cfg.save_scraper_settings({"scraper_proxy_pool": ["http://127.0.0.1:8881"]})
+        initial_ok = {
+            "healthy_proxies": ["http://127.0.0.1:8881"],
+            "results": [{"proxy": "http://127.0.0.1:8881", "ok": True, "ip": "198.51.100.1", "loc": "CA", "colo": "YYZ", "latency_ms": 10, "error": ""}],
+            "relaunched": False,
+        }
+        relaunch_ok = {
+            "healthy_proxies": ["http://127.0.0.1:8881"],
+            "results": [{"proxy": "http://127.0.0.1:8881", "ok": True, "ip": "198.51.100.1", "loc": "CA", "colo": "YYZ", "latency_ms": 10, "error": ""}],
+            "relaunched": True,
+        }
+
+        class _ProxyErrDriver:
+            window_handles = ["h1"]
+            title = "www.tcdb.com"
+            page_source = "<html><body><h1>No internet</h1><div>ERR_PROXY_CONNECTION_FAILED</div></body></html>"
+
+            class _SW:
+                def window(self, _h):
+                    pass
+
+            switch_to = _SW()
+
+            def get_cookies(self):
+                return []
+
+            def execute_script(self, script: str):
+                return "complete" if "readyState" in script else "Mozilla/5.0 TestUA"
+
+        class _GoodDriver:
+            window_handles = ["h1"]
+            title = "TCDB"
+            page_source = "<html><body>" + ("ok" * 100) + "</body></html>"
+
+            class _SW:
+                def window(self, _h):
+                    pass
+
+            switch_to = _SW()
+
+            def get_cookies(self):
+                return [{"name": "cf_clearance", "value": "cf_healed"}]
+
+            def execute_script(self, script: str):
+                return "complete" if "readyState" in script else "Mozilla/5.0 TestUA"
+
+        sb_calls = {"n": 0}
+
+        class _HealSB:
+            def __init__(self, **kwargs):
+                sb_calls["n"] += 1
+                self.driver = _ProxyErrDriver() if sb_calls["n"] == 1 else _GoodDriver()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def uc_open_with_reconnect(self, _url, _t):
+                pass
+
+            def sleep(self, _s):
+                pass
+
+        sess = _CapturingMockSession({self.se.DEFAULT_PREFLIGHT_IMAGE_URL: _MockResponse(200, content=b"\xff\xd8\xff\xe0" + b"0" * 600)})
+        logs: list[str] = []
+        self.se.set_log_callback(logs.append)
+        with mock.patch.object(self.se, "SB", _HealSB), \
+             mock.patch.object(self.se, "ensure_proxies_ready", side_effect=[initial_ok, relaunch_ok]) as pm_mock, \
+             mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            out = self.se.connect_session(existing_session=sess, max_attempts=1, require_image_probe=True)
+
+        self.assertIs(out, sess)
+        self.assertEqual(pm_mock.call_count, 2)
+        self.assertTrue(pm_mock.call_args_list[1].kwargs.get("force_relaunch"))
+        self.assertTrue(any("[PROXY SELF-HEAL]" in ln for ln in logs))
+
+    # ------------------------------------------------------------------
+    # 10. Windows SHELL32.dll icon helpers degrade gracefully when mocked/unavailable
+    # ------------------------------------------------------------------
+    def test_windows_shell32_icon_helpers_graceful_degradation(self):
+        import launch_tabulas_hub as hub
+
+        fake_shell32 = mock.Mock()
+        fake_shell32.SetCurrentProcessExplicitAppUserModelID.return_value = 0
+        fake_shell32.ExtractIconExW.side_effect = lambda _dll, _idx, large, small, _n: (
+            large.__setitem__(0, 111) or small.__setitem__(0, 222) or 1
+        )
+        fake_user32 = mock.Mock()
+        fake_windll = mock.Mock(shell32=fake_shell32, user32=fake_user32)
+
+        with mock.patch("ctypes.windll", fake_windll, create=True), mock.patch.object(hub.sys, "platform", "win32"):
+            self.assertTrue(hub.set_windows_app_user_model_id())
+            self.assertTrue(hub.apply_windows_window_icon(98765, dll_path=r"C:\Windows\System32\SHELL32.dll"))
+            self.assertEqual(fake_user32.SendMessageW.call_count, 2)
+
+        # Non-Windows / failing Win32 calls must return False without raising
+        with mock.patch.object(hub.sys, "platform", "linux"):
+            self.assertFalse(hub.set_windows_app_user_model_id())
+            self.assertEqual(hub.extract_shell32_icon_handles(), (0, 0))
+            self.assertFalse(hub.apply_windows_window_icon(98765))
 
 
 if __name__ == "__main__":

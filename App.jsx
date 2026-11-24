@@ -4297,6 +4297,16 @@ export default function App() {
   const [scraperSettings, setScraperSettings] = useState({ scraper_proxy_pool: [] });
   const [proxyPoolText, setProxyPoolText] = useState('');
   const [savingScraperSettings, setSavingScraperSettings] = useState(false);
+  const [proxyStatuses, setProxyStatuses] = useState([]);
+  const [restartingProxies, setRestartingProxies] = useState(false);
+  const refreshProxyStatus = () => {
+    fetch(`${NODE_API_BASE}/scraper/proxies/status`)
+      .then((r) => r.json())
+      .then((st) => {
+        if (st && Array.isArray(st.results)) setProxyStatuses(st.results);
+      })
+      .catch(() => {});
+  };
   const toggleSettingsMod = (modKey, prop) => {
     setSettingsLayout((prev) => ({
       ...prev,
@@ -4623,7 +4633,10 @@ export default function App() {
       .then((d) => {
         if (d && d.settings) {
           setScraperSettings(d.settings);
-          setProxyPoolText(Array.isArray(d.settings.scraper_proxy_pool) ? d.settings.scraper_proxy_pool.join('\n') : '');
+          const pool = Array.isArray(d.settings.scraper_proxy_pool) ? d.settings.scraper_proxy_pool : [];
+          setProxyPoolText(pool.join('\n'));
+          if (pool.length > 0) refreshProxyStatus();
+          else setProxyStatuses([]);
         }
       })
       .catch(() => {});
@@ -12249,11 +12262,14 @@ export default function App() {
                                   .then((res) => {
                                     if (res && res.success && res.settings) {
                                       setScraperSettings(res.settings);
-                                      setProxyPoolText((res.settings.scraper_proxy_pool || []).join('\n'));
+                                      const pool = res.settings.scraper_proxy_pool || [];
+                                      setProxyPoolText(pool.join('\n'));
+                                      if (pool.length > 0) refreshProxyStatus();
+                                      else setProxyStatuses([]);
                                       pushNotification(
                                         'Scraper Settings Saved',
-                                        (res.settings.scraper_proxy_pool || []).length > 0
-                                          ? `Configured ${res.settings.scraper_proxy_pool.length} proxy URL(s).`
+                                        pool.length > 0
+                                          ? `Configured ${pool.length} proxy URL(s).`
                                           : 'Reset to direct connection (0 proxies).',
                                         'Settings',
                                         'success'
@@ -12284,6 +12300,7 @@ export default function App() {
                                   .then((res) => {
                                     if (res && res.success && res.settings) {
                                       setScraperSettings(res.settings);
+                                      setProxyStatuses([]);
                                       pushNotification('Proxy Pool Cleared', 'Scraper switched back to direct connection.', 'Settings', 'info');
                                     }
                                   })
@@ -12294,7 +12311,55 @@ export default function App() {
                             >
                               Clear (Direct)
                             </button>
+                            <button
+                              type="button"
+                              disabled={restartingProxies || (scraperSettings?.scraper_proxy_pool || []).length === 0}
+                              onClick={() => {
+                                setRestartingProxies(true);
+                                fetch(`${NODE_API_BASE}/scraper/proxies/restart`, { method: 'POST' })
+                                  .then((r) => r.json())
+                                  .then((res) => {
+                                    if (res && res.success) {
+                                      setProxyStatuses(Array.isArray(res.results) ? res.results : []);
+                                      const okCount = (res.healthy_proxies || []).length;
+                                      const totalCount = (res.configured_pool || []).length;
+                                      pushNotification(
+                                        'Proxies Restarted & Validated',
+                                        `${okCount}/${totalCount} configured proxy/proxies healthy.`,
+                                        'Settings',
+                                        okCount > 0 ? 'success' : 'warning'
+                                      );
+                                    } else {
+                                      pushNotification('Proxy Restart Failed', res?.error || 'Could not restart proxies.', 'Settings', 'error');
+                                    }
+                                  })
+                                  .catch((e) => pushNotification('Proxy Restart Error', e.message, 'Settings', 'error'))
+                                  .finally(() => setRestartingProxies(false));
+                              }}
+                              className="px-3 py-1.5 rounded-xl bg-sky-900/60 hover:bg-sky-800/70 border border-sky-700/70 text-xs font-semibold text-sky-200 disabled:opacity-50"
+                            >
+                              {restartingProxies ? '⏳ Restarting...' : '🔄 Restart & Validate Proxies'}
+                            </button>
                           </div>
+                          {(scraperSettings?.scraper_proxy_pool || []).length > 0 && (
+                            <div className="space-y-1 pt-1">
+                              {(scraperSettings?.scraper_proxy_pool || []).map((pUrl) => {
+                                const st = (proxyStatuses || []).find((r) => r && r.proxy === pUrl);
+                                const isOk = !!(st && st.ok);
+                                return (
+                                  <div key={pUrl} className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800 font-mono text-[11px]">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${st ? (isOk ? 'bg-emerald-400' : 'bg-rose-400') : 'bg-slate-500'}`} />
+                                      <span className="text-slate-200 truncate">{pUrl}</span>
+                                    </div>
+                                    <span className={`truncate ${st ? (isOk ? 'text-emerald-300' : 'text-rose-300') : 'text-slate-500'}`}>
+                                      {st ? (isOk ? `${st.loc || '?'} • ${st.ip}${st.colo ? ` (${st.colo})` : ''}` : (st.error || 'Unreachable')) : 'Pending check...'}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
