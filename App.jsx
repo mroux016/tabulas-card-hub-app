@@ -752,6 +752,77 @@ function SideBySideCardComparison({
   );
 }
 
+function formatRotateDegreesLabel(deg) {
+  const n = Number(deg);
+  if (n === 90) return '+90° CW';
+  if (n === 180) return '180°';
+  if (n === -90 || n === 270) return '-90° CCW';
+  return `${deg}°`;
+}
+
+function RotateDropdownButton({ label, onRotate, disabled = false, title = '', className = '' }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const handleMouseDown = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
+        setOpen(false);
+      }
+    };
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', handleMouseDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleMouseDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
+
+  const handleSelect = (angle) => {
+    setOpen(false);
+    setBusy(true);
+    Promise.resolve(onRotate(angle)).finally(() => setBusy(false));
+  };
+
+  return (
+    <div ref={wrapRef} className="relative inline-flex">
+      <button
+        type="button"
+        disabled={disabled || busy}
+        onClick={() => setOpen((v) => !v)}
+        title={title || `Rotate ${label} image (+90°, 180°, -90°)`}
+        className={`px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10.5px] font-semibold disabled:opacity-50 inline-flex items-center gap-1 ${className}`}
+      >
+        {busy ? '⏳ Rotating...' : `↻ ${label} ▾`}
+      </button>
+      {open && !busy && (
+        <div className="absolute right-0 top-full mt-1 z-50 min-w-[116px] rounded-xl bg-slate-900 border border-slate-700 shadow-2xl py-1 text-[11px]">
+          {[
+            { angle: 90, text: '+90°', hint: 'CW' },
+            { angle: 180, text: '180°', hint: 'Flip' },
+            { angle: -90, text: '-90°', hint: 'CCW' },
+          ].map((opt) => (
+            <button
+              key={opt.angle}
+              type="button"
+              onClick={() => handleSelect(opt.angle)}
+              className="w-full px-2.5 py-1 text-left hover:bg-slate-800 text-slate-200 flex items-center justify-between gap-2 font-semibold"
+            >
+              <span>{opt.text}</span>
+              <span className="text-[10px] text-slate-400 font-mono">{opt.hint}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GuidedReviewCardItem({
   card,
   draft,
@@ -786,8 +857,8 @@ function GuidedReviewCardItem({
   const curCnum = String(draft.Card_Number || '').replace(/^#/, '');
   const tier = parseCardIdTier(card);
   const bEnc = encodeURIComponent(effectiveBatchName);
-  const combinedBust = imgBust + (externalImgBust || 0);
-  const bustQ = combinedBust ? `?v=${combinedBust}` : '';
+  const bustVal = imgBust && externalImgBust ? `${imgBust}_${externalImgBust}` : (imgBust || externalImgBust);
+  const bustQ = bustVal ? `?t=${bustVal}` : '';
   const isReprocBusy = reprocessingOne || isReprocessingExternal;
 
   const hasFieldChanges = (
@@ -896,24 +967,18 @@ function GuidedReviewCardItem({
             </button>
           )}
           {card.Front_File && (
-            <button
-              type="button"
-              onClick={() => Promise.resolve(onRotateSide(card.Front_File)).then(() => setImgBust((v) => v + 1))}
-              title="Rotate Scan Front 90° clockwise on disk"
-              className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10.5px] font-semibold"
-            >
-              ↻ Front
-            </button>
+            <RotateDropdownButton
+              label="Front"
+              onRotate={(deg) => Promise.resolve(onRotateSide(card.Front_File, deg)).then((ok) => { if (ok !== false) setImgBust(Date.now()); })}
+              title="Rotate Scan Front on disk (+90°, 180°, -90°)"
+            />
           )}
           {card.Back_File && (
-            <button
-              type="button"
-              onClick={() => Promise.resolve(onRotateSide(card.Back_File)).then(() => setImgBust((v) => v + 1))}
-              title="Rotate Scan Back 90° clockwise on disk"
-              className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10.5px] font-semibold"
-            >
-              ↻ Back
-            </button>
+            <RotateDropdownButton
+              label="Back"
+              onRotate={(deg) => Promise.resolve(onRotateSide(card.Back_File, deg)).then((ok) => { if (ok !== false) setImgBust(Date.now()); })}
+              title="Rotate Scan Back on disk (+90°, 180°, -90°)"
+            />
           )}
           {onReplaceImages && (
             <button
@@ -1226,8 +1291,8 @@ function InventoryGuidedCardItem({
   const curCnum = String(draft['Card Number'] || '').replace(/^#/, '');
   const tier = parseCardIdTier(card);
   const sFold = encodeURIComponent(sanitizeFolderName(card.Set || curSet));
-  const combinedBust = imgBust + (externalImgBust || 0);
-  const bustQ = combinedBust ? `?v=${combinedBust}` : '';
+  const bustVal = imgBust && externalImgBust ? `${imgBust}_${externalImgBust}` : (imgBust || externalImgBust);
+  const bustQ = bustVal ? `?t=${bustVal}` : '';
   const isReprocBusy = reprocessingOne || isReprocessingExternal;
 
   const hasFieldChanges = [
@@ -1331,24 +1396,18 @@ function InventoryGuidedCardItem({
             </button>
           )}
           {card.Front_File && onRotateSide && (
-            <button
-              type="button"
-              onClick={() => Promise.resolve(onRotateSide(card.Set, card.Front_File)).then(() => setImgBust((v) => v + 1))}
-              title="Rotate Scan Front 90° clockwise on disk"
-              className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10.5px] font-semibold"
-            >
-              ↻ Front
-            </button>
+            <RotateDropdownButton
+              label="Front"
+              onRotate={(deg) => Promise.resolve(onRotateSide(card.Set, card.Front_File, deg)).then((ok) => { if (ok !== false) setImgBust(Date.now()); })}
+              title="Rotate Scan Front on disk (+90°, 180°, -90°)"
+            />
           )}
           {card.Back_File && onRotateSide && (
-            <button
-              type="button"
-              onClick={() => Promise.resolve(onRotateSide(card.Set, card.Back_File)).then(() => setImgBust((v) => v + 1))}
-              title="Rotate Scan Back 90° clockwise on disk"
-              className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[10.5px] font-semibold"
-            >
-              ↻ Back
-            </button>
+            <RotateDropdownButton
+              label="Back"
+              onRotate={(deg) => Promise.resolve(onRotateSide(card.Set, card.Back_File, deg)).then((ok) => { if (ok !== false) setImgBust(Date.now()); })}
+              title="Rotate Scan Back on disk (+90°, 180°, -90°)"
+            />
           )}
           {onReplaceImages && (
             <button
@@ -2220,6 +2279,8 @@ function GradingDeepDiveStudio({
   cardOptions,
   onSelectCardIndex,
   onCardUpdated,
+  onRotateSide,
+  onReprocess,
   skin,
   pushNotification,
 }) {
@@ -2259,6 +2320,8 @@ function GradingDeepDiveStudio({
   const [gaugeFormatOverride, setGaugeFormatOverride] = useState('auto'); // 'auto' | 'standard' | 'mini'
   const [gaugeColorMode, setGaugeColorMode] = useState('contrast'); // 'contrast' | 'classic_black' | 'cyan'
   const [showLegendsChart, setShowLegendsChart] = useState(false);
+  const [frontRotateBust, setFrontRotateBust] = useState(0);
+  const [backRotateBust, setBackRotateBust] = useState(0);
 
   const sku = String(card?.SKU || '').trim();
   const effectiveBatch = batchName || card?._BatchName || '';
@@ -2325,6 +2388,8 @@ function GradingDeepDiveStudio({
     setFlagPresetId('');
     setShowFlagModal(false);
     setLoupeZoom(2.0);
+    setFrontRotateBust(0);
+    setBackRotateBust(0);
     setDiagError('');
     setDiagnostics(null);
     fetchDiagnostics(false);
@@ -2343,6 +2408,8 @@ function GradingDeepDiveStudio({
     setFlagPresetId('');
     setShowFlagModal(false);
     setLoupeZoom(2.0);
+    setFrontRotateBust(0);
+    setBackRotateBust(0);
     setDiagError('');
     const sKey = activeSide === 'Back' ? 'back' : 'front';
     const sc = diagnostics?.centering?.[sKey];
@@ -2403,9 +2470,33 @@ function GradingDeepDiveStudio({
         ? `${API_ORIGIN}/static/batches/${encodeURIComponent(effectiveBatch)}/${encodeURIComponent(card.Back_File)}`
         : `${API_ORIGIN}/static/cards/${sFold}/${encodeURIComponent(card.Back_File)}`)
     : '';
-  const frontUrl = frontBaseUrl ? (frontCacheVer ? `${frontBaseUrl}?v=${encodeURIComponent(String(frontCacheVer))}` : frontBaseUrl) : '';
-  const backUrl = backBaseUrl ? (backCacheVer ? `${backBaseUrl}?v=${encodeURIComponent(String(backCacheVer))}` : backBaseUrl) : '';
+  const buildSideImgUrl = (baseUrl, cacheVer, rotBust) => {
+    if (!baseUrl) return '';
+    const qs = new URLSearchParams();
+    if (cacheVer) qs.set('v', String(cacheVer));
+    if (rotBust) qs.set('t', String(rotBust));
+    const qStr = qs.toString();
+    return qStr ? `${baseUrl}?${qStr}` : baseUrl;
+  };
+  const frontUrl = buildSideImgUrl(frontBaseUrl, frontCacheVer, frontRotateBust);
+  const backUrl = buildSideImgUrl(backBaseUrl, backCacheVer, backRotateBust);
   const activeImgUrl = activeSide === 'Back' ? (backUrl || frontUrl) : (frontUrl || backUrl);
+
+  const handleStudioRotate = (sideLbl, fileName, degrees) => {
+    if (!onRotateSide || !fileName) return Promise.resolve(false);
+    return Promise.resolve(onRotateSide(fileName, degrees)).then((res) => {
+      if (res !== false && (!res || res.success !== false)) {
+        const nowBust = Date.now();
+        if (sideLbl === 'Front') setFrontRotateBust(nowBust);
+        else setBackRotateBust(nowBust);
+        if (res && Number(res.width) > 0 && Number(res.height) > 0 && activeSide === sideLbl) {
+          setNaturalSize({ w: Number(res.width), h: Number(res.height) });
+        }
+        return res || true;
+      }
+      return false;
+    });
+  };
 
   const toggleLayer = (cat) => setActiveLayers((prev) => ({ ...prev, [cat]: !prev[cat] }));
 
@@ -2473,6 +2564,7 @@ function GradingDeepDiveStudio({
     if (!sku || !Array.isArray(bbox)) return '';
     const sideStr = String(sideLbl || 'Front').toLowerCase();
     const sideVer = sideStr === 'back' ? backCacheVer : frontCacheVer;
+    const rotBust = sideStr === 'back' ? backRotateBust : frontRotateBust;
     const qs = new URLSearchParams({
       targetType,
       sku,
@@ -2486,6 +2578,7 @@ function GradingDeepDiveStudio({
       size: String(size),
     });
     if (sideVer) qs.set('v', String(sideVer));
+    if (rotBust) qs.set('t', String(rotBust));
     return `${NODE_API_BASE}/grading/crop?${qs.toString()}`;
   };
 
@@ -2990,6 +3083,16 @@ function GradingDeepDiveStudio({
           >
             {loadingDiag ? '⏳ Scanning...' : '🔄 Re-Scan'}
           </button>
+          {onReprocess && (
+            <button
+              type="button"
+              onClick={() => onReprocess()}
+              title="Re-run OCR, visual confirmation & pre-grading using the current Front/Back scans"
+              className="px-2.5 py-1 rounded-lg bg-emerald-950/90 hover:bg-emerald-800 border border-emerald-600/70 text-emerald-200 font-bold text-xs"
+            >
+              🔄 Reprocess
+            </button>
+          )}
           <div className="flex items-center gap-1 text-xs">
             <button type="button" onClick={onPrev} disabled={cardIndex <= 0} className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-35 font-bold">◀ Prev</button>
             {Array.isArray(cardOptions) && cardOptions.length > 1 && onSelectCardIndex ? (
@@ -3033,6 +3136,20 @@ function GradingDeepDiveStudio({
                   Back
                 </button>
               </div>
+              {onRotateSide && card?.Front_File && (
+                <RotateDropdownButton
+                  label="Front"
+                  onRotate={(deg) => handleStudioRotate('Front', card.Front_File, deg)}
+                  title="Rotate Front scan image on disk (+90°, 180°, -90°)"
+                />
+              )}
+              {onRotateSide && card?.Back_File && (
+                <RotateDropdownButton
+                  label="Back"
+                  onRotate={(deg) => handleStudioRotate('Back', card.Back_File, deg)}
+                  title="Rotate Back scan image on disk (+90°, 180°, -90°)"
+                />
+              )}
               {sideCent?.sleeve_detected && (
                 <span className="px-2 py-0.5 rounded-lg bg-cyan-950/80 border border-cyan-700/70 text-cyan-200 text-[10px] font-semibold">
                   🛡️ Sleeve
@@ -5457,6 +5574,8 @@ export default function App() {
 
   const [availabilityExpanded, setAvailabilityExpanded] = useState(false);
   const [gradeRecSetFilter, setGradeRecSetFilter] = useState('All Sets');
+  const [gradeRecSortBy, setGradeRecSortBy] = useState('Max_Net_Gain');
+  const [gradeRecSortDir, setGradeRecSortDir] = useState('desc');
   const [inspectorIdx, setInspectorIdx] = useState(0);
   const [inspectorMode, setInspectorMode] = useState('deep_dive');
   const [recalculatingStrategy, setRecalculatingStrategy] = useState(false);
@@ -6213,11 +6332,56 @@ export default function App() {
     return true;
   }), [inventory, invSetFilter, invHoldFilter, invStatusFilter, invSearch]);
 
-  const gradingCandidates = useMemo(() => inventory.filter((c) => {
-    if (gradeRecSetFilter !== 'All Sets' && c.Set !== gradeRecSetFilter) return false;
-    const act = String(c.Recommended_Action || '').toUpperCase();
-    return act.startsWith('GRADE') || act.startsWith('PC SLAB');
-  }), [inventory, gradeRecSetFilter]);
+  const gradingCandidates = useMemo(() => {
+    const filtered = inventory.filter((c) => {
+      if (gradeRecSetFilter !== 'All Sets' && c.Set !== gradeRecSetFilter) return false;
+      const act = String(c.Recommended_Action || '').toUpperCase();
+      return act.startsWith('GRADE') || act.startsWith('PC SLAB');
+    });
+    const parseOptNum = (v) => {
+      if (v === null || v === undefined || v === '') return NaN;
+      if (typeof v === 'number') return Number.isFinite(v) ? v : NaN;
+      const cleaned = String(v).replace(/[$,%\s,]/g, '');
+      if (!cleaned) return NaN;
+      const n = Number(cleaned);
+      return Number.isFinite(n) ? n : NaN;
+    };
+    const cmpOptNum = (aVal, bVal, dir) => {
+      const aNum = parseOptNum(aVal);
+      const bNum = parseOptNum(bVal);
+      const aMiss = Number.isNaN(aNum);
+      const bMiss = Number.isNaN(bNum);
+      if (aMiss && bMiss) return 0;
+      if (aMiss) return 1;
+      if (bMiss) return -1;
+      return (aNum - bNum) * dir;
+    };
+    const cmpOptStr = (aVal, bVal, dir) => {
+      const aStr = String(aVal ?? '').trim();
+      const bStr = String(bVal ?? '').trim();
+      if (!aStr && !bStr) return 0;
+      if (!aStr) return 1;
+      if (!bStr) return -1;
+      return aStr.localeCompare(bStr, undefined, { numeric: true, sensitivity: 'base' }) * dir;
+    };
+    const getEstSlabVal = (c) => (c.Best_Grader === 'BGS' ? (c.Est_Graded_BGS || c.BGS_9_5_Price) : (c.Est_Graded_PSA || c.PSA_10_Price));
+    const dir = gradeRecSortDir === 'asc' ? 1 : -1;
+    return filtered.slice().sort((a, b) => {
+      let cmp = 0;
+      if (gradeRecSortBy === 'SKU') cmp = cmpOptStr(a.SKU, b.SKU, dir);
+      else if (gradeRecSortBy === 'Set') cmp = cmpOptStr(a.Set, b.Set, dir);
+      else if (gradeRecSortBy === 'Card Number') cmp = cmpOptStr(String(a['Card Number'] ?? '').replace(/^#/, ''), String(b['Card Number'] ?? '').replace(/^#/, ''), dir);
+      else if (gradeRecSortBy === 'Player') cmp = cmpOptStr(a.Player, b.Player, dir);
+      else if (gradeRecSortBy === 'Subset') cmp = cmpOptStr(a.Subset, b.Subset, dir);
+      else if (gradeRecSortBy === 'Est_Grade') cmp = cmpOptNum(a.Est_PSA, b.Est_PSA, dir) || cmpOptNum(a.Est_BGS, b.Est_BGS, dir);
+      else if (gradeRecSortBy === 'Raw_Price') cmp = cmpOptNum(a.Raw_Price, b.Raw_Price, dir);
+      else if (gradeRecSortBy === 'Est_Slab') cmp = cmpOptNum(getEstSlabVal(a), getEstSlabVal(b), dir);
+      else if (gradeRecSortBy === 'Recommended_Action') cmp = cmpOptStr(a.Recommended_Action, b.Recommended_Action, dir);
+      else cmp = cmpOptNum(a.Max_Net_Gain, b.Max_Net_Gain, dir);
+      if (cmp !== 0) return cmp;
+      return cmpOptNum(a.Max_Net_Gain, b.Max_Net_Gain, -1) || cmpOptStr(a.SKU, b.SKU, 1);
+    });
+  }, [inventory, gradeRecSetFilter, gradeRecSortBy, gradeRecSortDir]);
 
   const targetScraperQueueMap = useMemo(() => {
     const m = {};
@@ -6373,21 +6537,25 @@ export default function App() {
     openHiddenPage('inventory_editor');
   };
 
-  const rotateInventoryCardImage = (setName, fileName) =>
+  const rotateInventoryCardImage = (setName, fileName, degrees = 90) =>
     fetch(`${NODE_API_BASE}/inventory/rotate-image`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ setName: setName || '', fileName, degrees: 90 }),
+      body: JSON.stringify({ setName: setName || '', fileName, degrees }),
     })
       .then((r) => r.json())
       .then((res) => {
         if (res?.success) {
-          pushNotification('Image Rotated', `Rotated ${fileName} 90° clockwise.`, 'Inventory', 'info');
-        } else {
-          pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Inventory', 'error');
+          pushNotification('Image Rotated', `Rotated ${fileName} ${formatRotateDegreesLabel(degrees)}.`, 'Inventory', 'info');
+          return res;
         }
+        pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Inventory', 'error');
+        return false;
       })
-      .catch((err) => pushNotification('Rotate Error', err.message, 'Inventory', 'error'));
+      .catch((err) => {
+        pushNotification('Rotate Error', err.message, 'Inventory', 'error');
+        return false;
+      });
 
   const triggerInventoryReprocess = (skuList, lockedSetVal = '') => {
     const cleanList = Array.from(new Set((skuList || []).map((s) => String(s).trim()).filter(Boolean)));
@@ -9311,14 +9479,21 @@ export default function App() {
               const ddCard = ddSearched[safeDdIdx];
               const ddCardBatch = ddCard?._BatchName || currentBatchObj.batchName;
 
-              const handleDdRotate = (fileName) =>
+              const handleDdRotate = (fileName, degrees = 90) =>
                 fetch(`${NODE_API_BASE}/batches/rotate-image`, {
                   method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ batchName: ddCardBatch, fileName, degrees: 90 }),
+                  body: JSON.stringify({ batchName: ddCardBatch, fileName, degrees }),
                 }).then((r) => r.json()).then((res) => {
-                  if (res?.success) pushNotification('Image Rotated', `Rotated ${fileName} 90° clockwise.`, 'Batch', 'info');
-                  else pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Batch', 'error');
-                }).catch((err) => pushNotification('Rotate Error', err.message, 'Batch', 'error'));
+                  if (res?.success) {
+                    pushNotification('Image Rotated', `Rotated ${fileName} ${formatRotateDegreesLabel(degrees)}.`, 'Batch', 'info');
+                    return res;
+                  }
+                  pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Batch', 'error');
+                  return false;
+                }).catch((err) => {
+                  pushNotification('Rotate Error', err.message, 'Batch', 'error');
+                  return false;
+                });
 
               const handleDdReprocess = (skuVal, lockedSetVal) =>
                 triggerBatchCardsReprocess(ddCardBatch, [skuVal], lockedSetVal || '');
@@ -9409,6 +9584,8 @@ export default function App() {
                         label: `${si + 1}/${ddSearched.length} • SKU ${sc.SKU} — #${String(sc.Card_Number || '').replace(/^#/, '')} ${sc.Player}`,
                       }))}
                       onSelectCardIndex={(idx) => setDeepDiveIdx(idx)}
+                      onRotateSide={handleDdRotate}
+                      onReprocess={() => handleDdReprocess(ddCard.SKU, ddCard.Set)}
                       onCardUpdated={(res) => {
                         if (Array.isArray(res?.cards)) {
                           setBatches((prev) => prev.map((b) => (b.batchName === ddCardBatch ? { ...b, cards: res.cards.map((x) => ({ ...x, _BatchName: ddCardBatch })) } : b)));
@@ -9617,17 +9794,21 @@ export default function App() {
                           setDeepDiveIdx(foundI >= 0 ? foundI : 0);
                           openHiddenPage('batch_deep_dive');
                         }}
-                        onRotateSide={(fileName) =>
+                        onRotateSide={(fileName, degrees = 90) =>
                           fetch(`${NODE_API_BASE}/batches/rotate-image`, {
                             method: 'POST', headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ batchName: cBatch, fileName, degrees: 90 }),
+                            body: JSON.stringify({ batchName: cBatch, fileName, degrees }),
                           }).then((r) => r.json()).then((res) => {
                             if (res?.success) {
-                              pushNotification('Image Rotated', `Rotated ${fileName} 90° clockwise.`, 'Batch', 'info');
-                            } else {
-                              pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Batch', 'error');
+                              pushNotification('Image Rotated', `Rotated ${fileName} ${formatRotateDegreesLabel(degrees)}.`, 'Batch', 'info');
+                              return true;
                             }
-                          }).catch((err) => pushNotification('Rotate Error', err.message, 'Batch', 'error'))
+                            pushNotification('Rotate Failed', res?.error || 'Unable to rotate image.', 'Batch', 'error');
+                            return false;
+                          }).catch((err) => {
+                            pushNotification('Rotate Error', err.message, 'Batch', 'error');
+                            return false;
+                          })
                         }
                         onSaveOne={(singleUpdate, opts = {}) => {
                           const isConfirmOnly = Boolean(opts?.confirmOnly);
@@ -10086,7 +10267,7 @@ export default function App() {
                           isReprocessingExternal={Boolean(reprocessingInvSkus[card.SKU])}
                           onDraftChange={(nextCard) => setInvEditorDrafts((p) => ({ ...p, [card.SKU]: nextCard }))}
                           onSaveOne={(upd) => saveSingleInvCard(upd, false)}
-                          onRotateSide={(sName, fName) => rotateInventoryCardImage(sName, fName)}
+                          onRotateSide={(sName, fName, deg) => rotateInventoryCardImage(sName, fName, deg)}
                           onReprocessOne={(skuVal, sName) => triggerInventoryReprocess([skuVal], sName)}
                           onReplaceImages={(cObj) => setReplaceImgTarget({
                             type: 'inventory',
@@ -10145,6 +10326,7 @@ export default function App() {
                           label: `${ei + 1}/${searchedEdCards.length} • SKU ${ec.SKU} — #${ec['Card Number']} ${ec.Player}`,
                         }))}
                         onSelectCardIndex={(idx) => setInvEditorIdx(idx)}
+                        onRotateSide={(fileName, deg) => rotateInventoryCardImage(ddEdCard.Set, fileName, deg)}
                         onCardUpdated={(res) => {
                           if (Array.isArray(res?.rows)) {
                             setInventory(res.rows);
@@ -11982,28 +12164,64 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex-1 min-h-0 overflow-auto border border-slate-800 rounded-xl">
-                    <table className="w-full text-left text-xs whitespace-nowrap">
-                      <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10">
-                        <tr><th className="p-2">Inspect</th><th className="p-2">SKU</th><th className="p-2">Set</th><th className="p-2">Card #</th><th className="p-2">Player</th><th className="p-2">Subset</th><th className="p-2">Est PSA/BGS</th><th className="p-2">Raw</th><th className="p-2">Est Slab</th><th className="p-2">Net Gain</th><th className="p-2">Recommendation</th></tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800">
-                        {gradingCandidates.map((c, idx) => (
-                          <tr key={c.SKU} className="hover:bg-slate-800/40">
-                            <td className="p-2"><button onClick={() => { setInspectorIdx(idx); openHiddenPage('grading_inspector'); }} className="px-2 py-0.5 rounded-lg bg-sky-900/70 hover:bg-sky-700 text-sky-200 text-[10px] font-bold">🔬 Inspect</button></td>
-                            <td className="p-2 font-mono text-sky-400">{c.SKU}</td>
-                            <td className="p-2">{c.Set}</td>
-                            <td className="p-2 font-mono">#{c['Card Number']}</td>
-                            <td className="p-2 font-bold text-white">{c.Player}</td>
-                            <td className="p-2">{c.Subset}</td>
-                            <td className="p-2 font-mono">PSA {c.Est_PSA} / BGS {c.Est_BGS}</td>
-                            <td className="p-2 font-mono">{fmtCurrency(c.Raw_Price)}</td>
-                            <td className="p-2 font-mono text-sky-300">{fmtCurrency(c.Best_Grader === 'BGS' ? (c.Est_Graded_BGS || c.BGS_9_5_Price) : (c.Est_Graded_PSA || c.PSA_10_Price))}</td>
-                            <td className="p-2 font-mono text-emerald-400 font-bold">{fmtCurrency(c.Max_Net_Gain, true)}</td>
-                            <td className="p-2 text-amber-300 font-semibold">{c.Recommended_Action}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                    {(() => {
+                      const toggleGradeRecSort = (colKey) => {
+                        if (gradeRecSortBy === colKey) {
+                          setGradeRecSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                        } else {
+                          setGradeRecSortBy(colKey);
+                          setGradeRecSortDir(['Max_Net_Gain', 'Est_Slab', 'Raw_Price', 'Est_Grade'].includes(colKey) ? 'desc' : 'asc');
+                        }
+                      };
+                      const gradeRecSortInd = (colKey) => (gradeRecSortBy === colKey ? (gradeRecSortDir === 'asc' ? ' ▲' : ' ▼') : '');
+                      const sortCols = [
+                        { key: 'SKU', label: 'SKU' },
+                        { key: 'Set', label: 'Set' },
+                        { key: 'Card Number', label: 'Card #' },
+                        { key: 'Player', label: 'Player' },
+                        { key: 'Subset', label: 'Subset' },
+                        { key: 'Est_Grade', label: 'Est PSA/BGS' },
+                        { key: 'Raw_Price', label: 'Raw' },
+                        { key: 'Est_Slab', label: 'Est Slab' },
+                        { key: 'Max_Net_Gain', label: 'Net Gain' },
+                        { key: 'Recommended_Action', label: 'Recommendation' },
+                      ];
+                      return (
+                        <table className="w-full text-left text-xs whitespace-nowrap">
+                          <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10">
+                            <tr>
+                              <th className="p-2">Inspect</th>
+                              {sortCols.map((col) => (
+                                <th
+                                  key={col.key}
+                                  onClick={() => toggleGradeRecSort(col.key)}
+                                  className="p-2 cursor-pointer select-none hover:text-white transition"
+                                >
+                                  {col.label}{gradeRecSortInd(col.key)}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800">
+                            {gradingCandidates.map((c, idx) => (
+                              <tr key={c.SKU} className="hover:bg-slate-800/40">
+                                <td className="p-2"><button onClick={() => { setInspectorIdx(idx); openHiddenPage('grading_inspector'); }} className="px-2 py-0.5 rounded-lg bg-sky-900/70 hover:bg-sky-700 text-sky-200 text-[10px] font-bold">🔬 Inspect</button></td>
+                                <td className="p-2 font-mono text-sky-400">{c.SKU}</td>
+                                <td className="p-2">{c.Set}</td>
+                                <td className="p-2 font-mono">#{c['Card Number']}</td>
+                                <td className="p-2 font-bold text-white">{c.Player}</td>
+                                <td className="p-2">{c.Subset}</td>
+                                <td className="p-2 font-mono">PSA {c.Est_PSA} / BGS {c.Est_BGS}</td>
+                                <td className="p-2 font-mono">{fmtCurrency(c.Raw_Price)}</td>
+                                <td className="p-2 font-mono text-sky-300">{fmtCurrency(c.Best_Grader === 'BGS' ? (c.Est_Graded_BGS || c.BGS_9_5_Price) : (c.Est_Graded_PSA || c.PSA_10_Price))}</td>
+                                <td className="p-2 font-mono text-emerald-400 font-bold">{fmtCurrency(c.Max_Net_Gain, true)}</td>
+                                <td className="p-2 text-amber-300 font-semibold">{c.Recommended_Action}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      );
+                    })()}
                   </div>
                 </div>
               </div>
@@ -12036,6 +12254,7 @@ export default function App() {
                           label: `${gi + 1}/${gradingCandidates.length} • SKU ${gc.SKU} — #${gc['Card Number']} ${gc.Player}`,
                         }))}
                         onSelectCardIndex={(idx) => setInspectorIdx(idx)}
+                        onRotateSide={(fileName, deg) => rotateInventoryCardImage(card.Set, fileName, deg)}
                         onCardUpdated={(res) => {
                           if (Array.isArray(res?.rows)) {
                             setInventory(res.rows);
