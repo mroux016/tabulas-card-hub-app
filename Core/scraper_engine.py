@@ -200,12 +200,15 @@ TCDB_IMAGE_FETCH_HEADERS: dict[str, str] = {
 }
 
 _ACTIVE_PROXY_INDEX: int = 0
+_LAST_PROXY_SELF_HEAL_TS: float = 0.0
+_PROXY_SELF_HEAL_MIN_INTERVAL_S: float = 30.0
 
 
 def reset_proxy_pool_state():
-    """Resets the pinned proxy-pool index back to 0."""
-    global _ACTIVE_PROXY_INDEX
+    """Resets the pinned proxy-pool index and mid-run self-heal rate-limit state."""
+    global _ACTIVE_PROXY_INDEX, _LAST_PROXY_SELF_HEAL_TS
     _ACTIVE_PROXY_INDEX = 0
+    _LAST_PROXY_SELF_HEAL_TS = 0.0
 
 
 def _apply_proxy_to_session(sess, proxy_url: str = ""):
@@ -1405,9 +1408,11 @@ def safe_get(
             status_out["status_code"] = int(code)
             status_out["error"] = err
 
+    global _ACTIVE_PROXY_INDEX, _LAST_PROXY_SELF_HEAL_TS
     net_attempt = 0
     rl_attempt = 0
     cf_403_attempt = 0
+    proxy_heal_attempts = 0
     max_rl_retries = 5
 
     while net_attempt < retries:
@@ -1512,6 +1517,51 @@ def safe_get(
         except (StealthBrowserError, CloudflareEdgeBlockPaused):
             raise
         except Exception as e:
+            active_proxy = str(getattr(req_session, "_active_proxy", "") or "").strip()
+            if not active_proxy:
+                sess_proxies = getattr(req_session, "proxies", None) or {}
+                if isinstance(sess_proxies, dict):
+                    active_proxy = str(sess_proxies.get("https") or sess_proxies.get("http") or "").strip()
+
+            if _is_local_proxy_connection_refused(str(e), active_proxy):
+                now = time.time()
+                can_relaunch = (proxy_heal_attempts == 0) and (
+                    (now - _LAST_PROXY_SELF_HEAL_TS) >= _PROXY_SELF_HEAL_MIN_INTERVAL_S
+                )
+                healthy_proxies: list[str] = []
+                if can_relaunch:
+                    proxy_heal_attempts += 1
+                    _LAST_PROXY_SELF_HEAL_TS = now
+                    log_msg("  🔧 [PROXY SELF-HEAL] Local proxy dropped mid-download — relaunching & validating wireproxy...")
+                    configured_pool = normalize_proxy_pool(load_scraper_settings().get("scraper_proxy_pool", []))
+                    if active_proxy and is_localhost_proxy(active_proxy) and active_proxy not in configured_pool:
+                        configured_pool.append(active_proxy)
+                    if configured_pool:
+                        heal = ensure_proxies_ready(configured_pool, force_relaunch=True)
+                        healthy_proxies = list((heal or {}).get("healthy_proxies") or [])
+
+                if healthy_proxies:
+                    chosen_proxy = active_proxy if (active_proxy and active_proxy in healthy_proxies) else healthy_proxies[0]
+                    try:
+                        _ACTIVE_PROXY_INDEX = healthy_proxies.index(chosen_proxy)
+                    except ValueError:
+                        _ACTIVE_PROXY_INDEX = 0
+                    _apply_proxy_to_session(req_session, chosen_proxy)
+                    log_msg(
+                        f"  ✅ [PROXY SELF-HEAL] Active proxy restored to {format_proxy_host_port(chosen_proxy)} — retrying request..."
+                    )
+                    continue
+
+                pause_msg = "Auto-paused: Local proxy unreachable mid-run — restart/validate proxies, then click Resume"
+                request_auto_pause(pause_msg)
+                if _PAUSE_CHECK_CALLBACK is not None and is_pause_requested():
+                    resumed = wait_if_paused(reason=pause_msg)
+                    if resumed:
+                        proxy_heal_attempts = 0
+                        _LAST_PROXY_SELF_HEAL_TS = 0.0
+                        continue
+                raise CloudflareEdgeBlockPaused(pause_msg)
+
             err_line = str(e).splitlines()[0] if str(e) else type(e).__name__
             _record_status(0, err_line)
             net_attempt += 1

@@ -382,16 +382,31 @@ def ensure_proxies_ready(
         if all(r.get("ok") for r in results):
             return {"healthy_proxies": list(pool), "results": results, "relaunched": False}
 
+    healthy_local = {r["proxy"] for r in results if r.get("ok")}
+    unhealthy_local = [p for p in local_proxies if p not in healthy_local]
+    should_kill = bool(force_relaunch or not healthy_local)
+
     disc = discover_wireproxy_configs(proxy_dir=proxy_dir)
     exe_path = disc.get("exe_path", "")
-    matched = _match_configs_for_proxies(local_proxies, disc.get("proxies", {}))
+    all_matched = _match_configs_for_proxies(local_proxies, disc.get("proxies", {}))
 
-    if exe_path and matched:
-        kill_wireproxy_processes()
-        time.sleep(0.25)
+    if should_kill:
+        to_launch = all_matched
+    else:
+        healthy_confs = {all_matched[p] for p in healthy_local if p in all_matched}
+        to_launch = {
+            p: c
+            for p, c in all_matched.items()
+            if p in unhealthy_local and c not in healthy_confs
+        }
+
+    if exe_path and to_launch:
+        if should_kill:
+            kill_wireproxy_processes()
+            time.sleep(0.25)
         launched_urls: list[str] = []
         seen_confs: set[str] = set()
-        for p_url, conf_path in matched.items():
+        for p_url, conf_path in to_launch.items():
             if conf_path in seen_confs:
                 launched_urls.append(p_url)
                 continue
@@ -402,7 +417,8 @@ def ensure_proxies_ready(
         relaunched = True
 
         deadline = time.time() + max(0.0, float(startup_wait_s or 5.0))
-        targets = [_parse_proxy_host_port(u)[:2] for u in (launched_urls or local_proxies)]
+        wait_urls = launched_urls or (local_proxies if should_kill else [])
+        targets = [_parse_proxy_host_port(u)[:2] for u in wait_urls]
         while targets and time.time() < deadline:
             if all(_tcp_port_open(h, port, timeout=0.4) for h, port in targets if h and port > 0):
                 break

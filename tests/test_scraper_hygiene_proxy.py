@@ -886,6 +886,167 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
         self.assertIn(par_url, urls_forced)
         self.assertFalse(any("[SKIP-STABLE-MISMATCH]" in ln for ln in logs_forced))
 
+    # ------------------------------------------------------------------
+    # 13. Mid-run local proxy curl(7) self-heals & retries without breather
+    # ------------------------------------------------------------------
+    def test_mid_run_local_proxy_drop_self_heals_and_retries_without_breather(self):
+        self.cfg.save_scraper_settings({
+            "scraper_proxy_pool": ["http://127.0.0.1:8881", "http://127.0.0.1:8882"]
+        })
+        set_name = "2026 Proxy Heal Test"
+        folder = "2026_Proxy_Heal_Test"
+        rows = [
+            {"cid": "701", "cnum": "1", "player": "Card One", "front_thumb": "/Images/Thumbs/701Fr.jpg"},
+            {"cid": "702", "cnum": "2", "player": "Card Two", "front_thumb": "/Images/Thumbs/702Fr.jpg"},
+            {"cid": "703", "cnum": "3", "player": "Card Three", "front_thumb": "/Images/Thumbs/703Fr.jpg"},
+        ]
+        base_html = _make_checklist_html(rows)
+        jpg_bytes = b"\xff\xd8\xff\xe0" + b"2" * 600
+        img1_state = {"calls": 0}
+
+        def _img1_route(_url: str):
+            img1_state["calls"] += 1
+            if img1_state["calls"] == 1:
+                raise RuntimeError("curl: (7) Failed to connect to 127.0.0.1 port 8881 over proxy 127.0.0.1:8881")
+            return _MockResponse(200, content=jpg_bytes)
+
+        sess = _CapturingMockSession({
+            "https://www.tcdb.com/Checklist.cfm/sid/700/2026-Proxy-Heal-Test": _MockResponse(200, base_html),
+            "https://www.tcdb.com/Errors.cfm/sid/700/2026-Proxy-Heal-Test": _MockResponse(404, ""),
+            "https://www.tcdb.com/Images/Large/701Fr.jpg": _img1_route,
+            "https://www.tcdb.com/Images/Large/702Fr.jpg": _MockResponse(200, content=jpg_bytes),
+            "https://www.tcdb.com/Images/Large/703Fr.jpg": _MockResponse(200, content=jpg_bytes),
+        })
+        self.se._apply_proxy_to_session(sess, "http://127.0.0.1:8881")
+
+        heal_res = {
+            "healthy_proxies": ["http://127.0.0.1:8882"],
+            "results": [{"proxy": "http://127.0.0.1:8882", "ok": True, "ip": "198.51.100.2", "loc": "US", "colo": "SJC", "latency_ms": 10, "error": ""}],
+            "relaunched": True,
+        }
+        logs: list[str] = []
+        sleep_calls: list[float] = []
+        self.se.set_log_callback(logs.append)
+
+        with mock.patch.object(self.se, "ensure_proxies_ready", return_value=heal_res) as pm_mock, \
+             mock.patch.object(self.se.time, "sleep", side_effect=sleep_calls.append):
+            self.se.scrape_tcdb_checklist_set(
+                sess,
+                "https://www.tcdb.com/ViewSet.cfm/sid/700/2026-Proxy-Heal-Test",
+                set_name,
+                folder_name=folder,
+                include_inserts=False,
+                download_images_card_by_card=True,
+                card_delay_range=(0.0, 0.0),
+                pacer_sleep_fn=sleep_calls.append,
+            )
+
+        pm_mock.assert_called_once()
+        self.assertTrue(pm_mock.call_args.kwargs.get("force_relaunch"))
+        self.assertEqual(sess.proxies.get("https"), "http://127.0.0.1:8882")
+        self.assertTrue(any("[PROXY SELF-HEAL] Local proxy dropped mid-download" in ln for ln in logs))
+        self.assertFalse(any("[Origin Overload Breather]" in ln for ln in logs))
+        self.assertFalse(any("Err(Net-Uncached)" in ln for ln in logs))
+        self.assertFalse(any(s >= 15.0 for s in sleep_calls))
+
+        f1, _ = self.se.build_template_image_filenames(set_name, "Base", "1", "Card One", "701")
+        self.assertTrue((self.ref_dir / folder / f1).is_file())
+        img1_calls = [c for c in sess.calls if c["url"].endswith("701Fr.jpg")]
+        self.assertEqual(len(img1_calls), 2)
+        self.assertEqual(img1_calls[1]["proxies"].get("https"), "http://127.0.0.1:8882")
+
+    # ------------------------------------------------------------------
+    # 14. Mid-run local proxy curl(7) with empty healthy pool triggers Auto-Pause
+    # ------------------------------------------------------------------
+    def test_mid_run_local_proxy_drop_unhealthy_relaunch_triggers_autopause(self):
+        self.cfg.save_scraper_settings({"scraper_proxy_pool": ["http://127.0.0.1:8881"]})
+        set_name = "2026 Proxy Pause Test"
+        folder = "2026_Proxy_Pause_Test"
+        rows = [
+            {"cid": "801", "cnum": "1", "player": "Card One", "front_thumb": "/Images/Thumbs/801Fr.jpg"},
+            {"cid": "802", "cnum": "2", "player": "Card Two", "front_thumb": "/Images/Thumbs/802Fr.jpg"},
+            {"cid": "803", "cnum": "3", "player": "Card Three", "front_thumb": "/Images/Thumbs/803Fr.jpg"},
+        ]
+        base_html = _make_checklist_html(rows)
+        sess = _CapturingMockSession({
+            "https://www.tcdb.com/Checklist.cfm/sid/800/2026-Proxy-Pause-Test": _MockResponse(200, base_html),
+            "https://www.tcdb.com/Errors.cfm/sid/800/2026-Proxy-Pause-Test": _MockResponse(404, ""),
+            "https://www.tcdb.com/Images/Large/801Fr.jpg": RuntimeError(
+                "curl: (7) Failed to connect to 127.0.0.1 port 8881 over proxy 127.0.0.1:8881"
+            ),
+            "https://www.tcdb.com/Images/Large/802Fr.jpg": _MockResponse(200, content=b"\xff\xd8\xff\xe0" + b"2" * 600),
+            "https://www.tcdb.com/Images/Large/803Fr.jpg": _MockResponse(200, content=b"\xff\xd8\xff\xe0" + b"2" * 600),
+        })
+        self.se._apply_proxy_to_session(sess, "http://127.0.0.1:8881")
+
+        pause_calls: list[tuple[bool, str]] = []
+        self.se.set_pause_state_callback(lambda paused, reason="": pause_calls.append((paused, reason)))
+
+        empty_heal = {"healthy_proxies": [], "results": [], "relaunched": True}
+        with mock.patch.object(self.se, "ensure_proxies_ready", return_value=empty_heal), \
+             mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            with self.assertRaises(self.se.CloudflareEdgeBlockPaused) as ctx:
+                self.se.scrape_tcdb_checklist_set(
+                    sess,
+                    "https://www.tcdb.com/ViewSet.cfm/sid/800/2026-Proxy-Pause-Test",
+                    set_name,
+                    folder_name=folder,
+                    include_inserts=False,
+                    download_images_card_by_card=True,
+                    card_delay_range=(0.0, 0.0),
+                    pacer_sleep_fn=lambda _s: None,
+                )
+
+        expected_msg = "Auto-paused: Local proxy unreachable mid-run — restart/validate proxies, then click Resume"
+        self.assertEqual(str(ctx.exception), expected_msg)
+        self.assertTrue(any(p == (True, expected_msg) for p in pause_calls))
+        img_calls = [c for c in sess.calls if "/Images/Large/" in c["url"]]
+        self.assertEqual(len(img_calls), 1)
+
+    # ------------------------------------------------------------------
+    # 15. ensure_proxies_ready(force_relaunch=False) does not kill healthy sibling
+    # ------------------------------------------------------------------
+    def test_ensure_proxies_ready_no_kill_when_healthy_sibling_exists(self):
+        import Core.proxy_manager as pm
+
+        (self.proxy_dir / "wireproxy.exe").write_bytes(b"MZ")
+        conf_a = self.proxy_dir / "wp_a.conf"
+        conf_b = self.proxy_dir / "wp_b.conf"
+        conf_a.write_text("WGConfig = wg1.conf\n[http]\nBindAddress = 127.0.0.1:8881\n", encoding="utf-8")
+        conf_b.write_text("WGConfig = wg2.conf\n[http]\nBindAddress = 127.0.0.1:8882\n", encoding="utf-8")
+
+        state = {"b_launched": False}
+
+        def fake_validate(proxy_url: str, timeout: float = 6.0) -> dict:
+            if "8881" in proxy_url:
+                return {"proxy": proxy_url, "ok": True, "ip": "203.0.113.1", "colo": "SJC", "loc": "US", "latency_ms": 10, "error": ""}
+            if "8882" in proxy_url and state["b_launched"]:
+                return {"proxy": proxy_url, "ok": True, "ip": "203.0.113.2", "colo": "YYZ", "loc": "CA", "latency_ms": 12, "error": ""}
+            return {"proxy": proxy_url, "ok": False, "ip": "", "colo": "", "loc": "", "latency_ms": 5, "error": "TCP port unreachable"}
+
+        def fake_launch(exe_path, conf_path, proxy_dir):
+            if Path(conf_path) == conf_b:
+                state["b_launched"] = True
+            return {"ok": True, "pid": 55123, "conf_path": str(conf_path), "error": ""}
+
+        with mock.patch.object(pm, "validate_proxy", side_effect=fake_validate), \
+             mock.patch.object(pm, "kill_wireproxy_processes") as kill_mock, \
+             mock.patch.object(pm, "launch_wireproxy_config", side_effect=fake_launch) as launch_mock, \
+             mock.patch.object(pm, "_tcp_port_open", return_value=True), \
+             mock.patch.object(pm.time, "sleep", lambda _s: None):
+            res = pm.ensure_proxies_ready(
+                ["http://127.0.0.1:8881", "http://127.0.0.1:8882"],
+                proxy_dir=self.proxy_dir,
+                force_relaunch=False,
+                startup_wait_s=0.1,
+            )
+
+        kill_mock.assert_not_called()
+        self.assertTrue(res["relaunched"])
+        self.assertEqual(launch_mock.call_count, 1)
+        self.assertEqual(Path(launch_mock.call_args.args[1]), conf_b)
+        self.assertEqual(res["healthy_proxies"], ["http://127.0.0.1:8881", "http://127.0.0.1:8882"])
+
 
 if __name__ == "__main__":
     unittest.main()
