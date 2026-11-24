@@ -731,6 +731,8 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
     def test_windows_shell32_icon_helpers_graceful_degradation(self):
         import launch_tabulas_hub as hub
 
+        self.assertEqual(hub.SHELL32_CARDBOARD_BOX_ICON_INDEX, 265)
+
         fake_shell32 = mock.Mock()
         fake_shell32.SetCurrentProcessExplicitAppUserModelID.return_value = 0
         fake_shell32.ExtractIconExW.side_effect = lambda _dll, _idx, large, small, _n: (

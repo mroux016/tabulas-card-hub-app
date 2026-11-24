@@ -7305,10 +7305,14 @@ export default function App() {
           {showSkinPopover && (
             <div
               ref={skinRailRef}
-              className="absolute left-full top-0 bottom-0 z-50 h-full w-[340px] bg-[#060b16]/98 backdrop-blur-2xl border-r border-white/15 shadow-[20px_0_50px_rgba(0,0,0,0.75)] flex flex-col"
+              className="absolute left-full top-0 bottom-0 z-50 h-full w-[340px] bg-[#070b14] border-r border-slate-800/80 shadow-2xl flex flex-col"
+              style={{ backgroundColor: '#070b14' }}
             >
               {/* Header */}
-              <div className="px-4 py-3.5 border-b border-white/10 flex items-center justify-between shrink-0">
+              <div
+                className="px-4 py-3.5 bg-[#070b14] border-b border-slate-800/80 flex items-center justify-between shrink-0"
+                style={{ backgroundColor: '#070b14' }}
+              >
                 <div className="flex items-center gap-2">
                   <svg className="w-4 h-4 text-amber-300 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                     <path d="M12 2l2.1 6.4L20.5 10.5l-6.4 2.1L12 19l-2.1-6.4L3.5 10.5l6.4-2.1L12 2zm7 13l1.1 3.2 3.2 1.1-3.2 1.1L19 23.6l-1.1-3.2-3.2-1.1 3.2-1.1L19 15z" />
@@ -7336,7 +7340,8 @@ export default function App() {
               {/* Scrollable Skin Cards List */}
               <div
                 onMouseLeave={() => setHoveredSkinKey(null)}
-                className="flex-1 overflow-y-auto px-3.5 py-1.5 space-y-3"
+                className="flex-1 overflow-y-auto px-3.5 py-1.5 space-y-3 bg-[#070b14]"
+                style={{ backgroundColor: '#070b14' }}
               >
                 {Object.entries(CHROME_PULSE_SKINS).map(([k, sObj], idx) => {
                   const isHighlighted = activePreviewSkinKey === k;
@@ -7375,7 +7380,10 @@ export default function App() {
               </div>
 
               {/* Sticky Footer */}
-              <div className="p-3.5 border-t border-white/10 bg-[#050912]/95 shrink-0 flex items-center gap-2.5">
+              <div
+                className="p-3.5 border-t border-slate-800/80 bg-[#050912] shrink-0 flex items-center gap-2.5"
+                style={{ backgroundColor: '#050912' }}
+              >
                 <button
                   type="button"
                   onClick={applySkinRail}
