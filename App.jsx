@@ -3959,6 +3959,1066 @@ function MultiSelectFilter({ label, options, selected, onChange, searchable = fa
   );
 }
 
+const SPLITTER_PAIR_COLORS = [
+  '#06B6D4', // Pair 1: Cyan
+  '#F59E0B', // Pair 2: Amber
+  '#10B981', // Pair 3: Emerald
+  '#D946EF', // Pair 4: Fuchsia
+  '#3B82F6', // Pair 5: Blue
+  '#EF4444', // Pair 6: Red
+  '#8B5CF6', // Pair 7: Violet
+  '#84CC16', // Pair 8: Lime
+  '#F97316', // Pair 9: Orange
+  '#14B8A6', // Pair 10: Teal
+  '#6366F1', // Pair 11: Indigo
+  '#E11D48', // Pair 12: Rose
+];
+
+function getSplitterPairColor(pairId) {
+  const idx = (Math.max(1, Number(pairId) || 1) - 1) % SPLITTER_PAIR_COLORS.length;
+  return SPLITTER_PAIR_COLORS[idx];
+}
+
+function normalizeSplitterBoxes(boxes) {
+  if (!Array.isArray(boxes)) return [];
+  return boxes.map((b, i) => {
+    const pid = Math.max(1, Math.round(Number(b?.pair_id ?? i + 1) || (i + 1)));
+    return {
+      ...b,
+      cx: Number(b?.cx ?? 0),
+      cy: Number(b?.cy ?? 0),
+      width: Math.max(24, Number(b?.width ?? 180)),
+      height: Math.max(24, Number(b?.height ?? 250)),
+      angle_deg: Number(b?.angle_deg ?? 0),
+      confidence: b?.confidence != null ? Number(b.confidence) : 1.0,
+      pair_id: pid,
+      color: getSplitterPairColor(pid),
+    };
+  });
+}
+
+function MultiCardSplitterReviewStudio({
+  pendingItems,
+  learningProfile,
+  onCommitted,
+  onRefreshPending,
+  onClose,
+  skin,
+  pushNotification,
+}) {
+  const items = Array.isArray(pendingItems) ? pendingItems : [];
+  const [pageIdx, setPageIdx] = useState(0);
+  const safeIdx = items.length > 0 ? Math.max(0, Math.min(pageIdx, items.length - 1)) : 0;
+  const currentItem = items[safeIdx] || null;
+
+  const [frontBoxes, setFrontBoxes] = useState([]);
+  const [backBoxes, setBackBoxes] = useState([]);
+  const [frontSize, setFrontSize] = useState({ w: 1700, h: 2200 });
+  const [backSize, setBackSize] = useState({ w: 1700, h: 2200 });
+
+  // Synchronized Zoom & Pan across both Fronts & Backs canvases
+  const [zoom, setZoom] = useState(1.0);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const frontWrapRef = useRef(null);
+  const backWrapRef = useRef(null);
+  const frontSvgRef = useRef(null);
+  const backSvgRef = useRef(null);
+  const [frontFitted, setFrontFitted] = useState({ w: 420, h: 540 });
+  const [backFitted, setBackFitted] = useState({ w: 420, h: 540 });
+
+  // Selection, Hover Partner Highlighting, Pair Picker & Draw/Drag State
+  const [selected, setSelected] = useState(null); // { side: 'front'|'back', index: number } | null
+  const [hoveredPairId, setHoveredPairId] = useState(null);
+  const [pickerTarget, setPickerTarget] = useState(null); // { side: 'front'|'back', index: number } | null
+  const [drawModeSide, setDrawModeSide] = useState(null); // null | 'front' | 'back'
+  const [drawDraft, setDrawDraft] = useState(null); // { side, x1, y1, x2, y2 } | null
+  const [committing, setCommitting] = useState(false);
+  const [commitFeedback, setCommitFeedback] = useState(null);
+  const [commitError, setCommitError] = useState('');
+
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    if (pageIdx !== safeIdx) setPageIdx(safeIdx);
+  }, [items.length, safeIdx]);
+
+  useEffect(() => {
+    if (!currentItem) {
+      setFrontBoxes([]);
+      setBackBoxes([]);
+      return;
+    }
+    setFrontBoxes(normalizeSplitterBoxes(currentItem.proposed_front_boxes));
+    setBackBoxes(normalizeSplitterBoxes(currentItem.proposed_back_boxes));
+    const fs = Array.isArray(currentItem.front_size) && currentItem.front_size.length === 2
+      ? { w: Math.max(100, Number(currentItem.front_size[0])), h: Math.max(100, Number(currentItem.front_size[1])) }
+      : { w: 1700, h: 2200 };
+    const bs = Array.isArray(currentItem.back_size) && currentItem.back_size.length === 2
+      ? { w: Math.max(100, Number(currentItem.back_size[0])), h: Math.max(100, Number(currentItem.back_size[1])) }
+      : fs;
+    setFrontSize(fs);
+    setBackSize(bs);
+    setSelected(null);
+    setHoveredPairId(null);
+    setPickerTarget(null);
+    setDrawModeSide(null);
+    setDrawDraft(null);
+    setCommitError('');
+    setZoom(1.0);
+    setPan({ x: 0, y: 0 });
+  }, [currentItem?.stage_id]);
+
+  // Measure both canvas wrappers with ResizeObserver for aspect-ratio-preserving fit
+  useEffect(() => {
+    const computeFit = (wrapEl, nat) => {
+      if (!wrapEl) return null;
+      const rect = wrapEl.getBoundingClientRect();
+      const availW = Math.max(180, rect.width - 20);
+      const availH = Math.max(200, rect.height - 20);
+      const aspect = (nat.w || 1700) / Math.max(1, nat.h || 2200);
+      let w = availW;
+      let h = w / aspect;
+      if (h > availH) {
+        h = availH;
+        w = h * aspect;
+      }
+      return { w: Math.round(w), h: Math.round(h) };
+    };
+    const updateAll = () => {
+      const fFit = computeFit(frontWrapRef.current, frontSize);
+      if (fFit) setFrontFitted(fFit);
+      const bFit = computeFit(backWrapRef.current, backSize);
+      if (bFit) setBackFitted(bFit);
+    };
+    updateAll();
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(updateAll);
+      if (frontWrapRef.current) ro.observe(frontWrapRef.current);
+      if (backWrapRef.current) ro.observe(backWrapRef.current);
+      return () => ro.disconnect();
+    }
+    return undefined;
+  }, [frontSize.w, frontSize.h, backSize.w, backSize.h]);
+
+  const selectedBox = useMemo(() => {
+    if (!selected) return null;
+    const arr = selected.side === 'back' ? backBoxes : frontBoxes;
+    return arr[selected.index] || null;
+  }, [selected, frontBoxes, backBoxes]);
+
+  const selectedPairId = selectedBox ? selectedBox.pair_id : null;
+
+  const matchedPairCount = useMemo(() => {
+    const fSet = new Set(frontBoxes.map((b) => Number(b.pair_id)));
+    let cnt = 0;
+    const seen = new Set();
+    backBoxes.forEach((b) => {
+      const pid = Number(b.pair_id);
+      if (fSet.has(pid) && !seen.has(pid)) {
+        seen.add(pid);
+        cnt += 1;
+      }
+    });
+    return cnt;
+  }, [frontBoxes, backBoxes]);
+
+  const maxPairNum = useMemo(() => {
+    let m = Math.max(frontBoxes.length, backBoxes.length, 1);
+    frontBoxes.forEach((b) => { if (Number(b.pair_id) > m) m = Number(b.pair_id); });
+    backBoxes.forEach((b) => { if (Number(b.pair_id) > m) m = Number(b.pair_id); });
+    return m;
+  }, [frontBoxes, backBoxes]);
+
+  const deleteSelectedBox = () => {
+    if (!selected) return;
+    if (selected.side === 'front') {
+      setFrontBoxes((prev) => prev.filter((_, i) => i !== selected.index));
+    } else {
+      setBackBoxes((prev) => prev.filter((_, i) => i !== selected.index));
+    }
+    setSelected(null);
+    setPickerTarget(null);
+  };
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
+        e.preventDefault();
+        deleteSelectedBox();
+      } else if (e.key === 'Escape') {
+        setPickerTarget(null);
+        setDrawModeSide(null);
+        setDrawDraft(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selected]);
+
+  const clientToPageCoords = (svgEl, clientX, clientY, pageW, pageH) => {
+    if (!svgEl) return { x: 0, y: 0 };
+    const r = svgEl.getBoundingClientRect();
+    if (!r.width || !r.height) return { x: 0, y: 0 };
+    return {
+      x: ((clientX - r.left) / r.width) * pageW,
+      y: ((clientY - r.top) / r.height) * pageH,
+    };
+  };
+
+  const updateBoxAt = (side, index, updater) => {
+    const setter = side === 'back' ? setBackBoxes : setFrontBoxes;
+    setter((prev) => prev.map((b, idx) => {
+      if (idx !== index) return b;
+      const next = typeof updater === 'function' ? updater(b) : { ...b, ...updater };
+      const pid = Math.max(1, Math.round(Number(next.pair_id) || 1));
+      return { ...next, pair_id: pid, color: getSplitterPairColor(pid) };
+    }));
+  };
+
+  const assignOrSwapPairId = (side, index, targetPidRaw) => {
+    const targetPid = Math.max(1, Math.round(Number(targetPidRaw) || 1));
+    const setter = side === 'back' ? setBackBoxes : setFrontBoxes;
+    setter((prev) => {
+      const cur = prev[index];
+      if (!cur) return prev;
+      const oldPid = Number(cur.pair_id);
+      if (oldPid === targetPid) return prev;
+      const swapIdx = prev.findIndex((b, idx) => idx !== index && Number(b.pair_id) === targetPid);
+      return prev.map((b, idx) => {
+        if (idx === index) {
+          return { ...b, pair_id: targetPid, color: getSplitterPairColor(targetPid) };
+        }
+        if (swapIdx >= 0 && idx === swapIdx) {
+          return { ...b, pair_id: oldPid, color: getSplitterPairColor(oldPid) };
+        }
+        return b;
+      });
+    });
+    setPickerTarget(null);
+  };
+
+  const nextAvailablePairIdForSide = (side) => {
+    const ownBoxes = side === 'back' ? backBoxes : frontBoxes;
+    const partnerBoxes = side === 'back' ? frontBoxes : backBoxes;
+    const ownIds = new Set(ownBoxes.map((b) => Number(b.pair_id)));
+    const unpairedPartner = partnerBoxes.find((b) => !ownIds.has(Number(b.pair_id)));
+    if (unpairedPartner) return Number(unpairedPartner.pair_id);
+    return maxPairNum + 1;
+  };
+
+  const handleCanvasWheel = (e) => {
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.15 : -0.15;
+    setZoom((z) => {
+      const nz = Math.max(0.5, Math.min(4.0, Number((z + delta).toFixed(2))));
+      if (nz <= 1.0 && delta < 0) setPan({ x: 0, y: 0 });
+      return nz;
+    });
+  };
+
+  const handleWrapPointerDown = (side, e) => {
+    if (e.button !== 0) return;
+    const svgEl = side === 'back' ? backSvgRef.current : frontSvgRef.current;
+    const pageSz = side === 'back' ? backSize : frontSize;
+
+    if (drawModeSide === side && svgEl) {
+      e.stopPropagation();
+      const pt = clientToPageCoords(svgEl, e.clientX, e.clientY, pageSz.w, pageSz.h);
+      const cx = Math.max(0, Math.min(pageSz.w, pt.x));
+      const cy = Math.max(0, Math.min(pageSz.h, pt.y));
+      dragRef.current = { kind: 'draw', side, startX: cx, startY: cy };
+      setDrawDraft({ side, x1: cx, y1: cy, x2: cx, y2: cy });
+      setPickerTarget(null);
+      return;
+    }
+
+    // Pan synchronized canvases when clicking empty background
+    setPickerTarget(null);
+    dragRef.current = {
+      kind: 'pan',
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      origPanX: pan.x,
+      origPanY: pan.y,
+    };
+  };
+
+  const handleWrapPointerMove = (side, e) => {
+    const dr = dragRef.current;
+    if (!dr) return;
+
+    if (dr.kind === 'pan') {
+      setPan({
+        x: dr.origPanX + (e.clientX - dr.startClientX),
+        y: dr.origPanY + (e.clientY - dr.startClientY),
+      });
+      return;
+    }
+
+    const activeSide = dr.side || side;
+    const svgEl = activeSide === 'back' ? backSvgRef.current : frontSvgRef.current;
+    const pageSz = activeSide === 'back' ? backSize : frontSize;
+    if (!svgEl) return;
+    const pt = clientToPageCoords(svgEl, e.clientX, e.clientY, pageSz.w, pageSz.h);
+
+    if (dr.kind === 'draw') {
+      setDrawDraft({
+        side: activeSide,
+        x1: dr.startX,
+        y1: dr.startY,
+        x2: Math.max(0, Math.min(pageSz.w, pt.x)),
+        y2: Math.max(0, Math.min(pageSz.h, pt.y)),
+      });
+      return;
+    }
+
+    const orig = dr.origBox;
+    if (!orig) return;
+
+    if (dr.kind === 'move') {
+      const dx = pt.x - dr.startX;
+      const dy = pt.y - dr.startY;
+      updateBoxAt(activeSide, dr.index, {
+        cx: Number(Math.max(10, Math.min(pageSz.w - 10, orig.cx + dx)).toFixed(2)),
+        cy: Number(Math.max(10, Math.min(pageSz.h - 10, orig.cy + dy)).toFixed(2)),
+      });
+      return;
+    }
+
+    if (dr.kind === 'rotate') {
+      let deg = Math.atan2(pt.y - orig.cy, pt.x - orig.cx) * (180 / Math.PI) + 90;
+      while (deg > 180) deg -= 360;
+      while (deg <= -180) deg += 360;
+      updateBoxAt(activeSide, dr.index, { angle_deg: Number(deg.toFixed(1)) });
+      return;
+    }
+
+    if (dr.kind === 'resize') {
+      const dx = pt.x - dr.startX;
+      const dy = pt.y - dr.startY;
+      const rad = (orig.angle_deg || 0) * (Math.PI / 180);
+      const cosA = Math.cos(rad);
+      const sinA = Math.sin(rad);
+      // Project pointer delta into the box's local rotated axes
+      const localDx = dx * cosA + dy * sinA;
+      const localDy = -dx * sinA + dy * cosA;
+
+      const minDim = 40;
+      let dW = 0;
+      let dH = 0;
+      let shiftLx = 0;
+      let shiftLy = 0;
+
+      if (dr.handle.includes('e')) {
+        const nw = Math.max(minDim, orig.width + localDx);
+        dW = nw - orig.width;
+        shiftLx += dW * 0.5;
+      } else if (dr.handle.includes('w')) {
+        const nw = Math.max(minDim, orig.width - localDx);
+        dW = nw - orig.width;
+        shiftLx -= dW * 0.5;
+      }
+
+      if (dr.handle.includes('s')) {
+        const nh = Math.max(minDim, orig.height + localDy);
+        dH = nh - orig.height;
+        shiftLy += dH * 0.5;
+      } else if (dr.handle.includes('n')) {
+        const nh = Math.max(minDim, orig.height - localDy);
+        dH = nh - orig.height;
+        shiftLy -= dH * 0.5;
+      }
+
+      const worldShiftX = shiftLx * cosA - shiftLy * sinA;
+      const worldShiftY = shiftLx * sinA + shiftLy * cosA;
+      updateBoxAt(activeSide, dr.index, {
+        width: Number((orig.width + dW).toFixed(2)),
+        height: Number((orig.height + dH).toFixed(2)),
+        cx: Number((orig.cx + worldShiftX).toFixed(2)),
+        cy: Number((orig.cy + worldShiftY).toFixed(2)),
+      });
+    }
+  };
+
+  const handleWrapPointerUp = () => {
+    const dr = dragRef.current;
+    dragRef.current = null;
+    if (dr && dr.kind === 'draw' && drawDraft) {
+      const w = Math.abs(drawDraft.x2 - drawDraft.x1);
+      const h = Math.abs(drawDraft.y2 - drawDraft.y1);
+      if (w >= 32 && h >= 32) {
+        const newPid = nextAvailablePairIdForSide(dr.side);
+        const newBox = {
+          cx: Number(((drawDraft.x1 + drawDraft.x2) * 0.5).toFixed(2)),
+          cy: Number(((drawDraft.y1 + drawDraft.y2) * 0.5).toFixed(2)),
+          width: Number(w.toFixed(2)),
+          height: Number(h.toFixed(2)),
+          angle_deg: 0,
+          confidence: 1.0,
+          pair_id: newPid,
+          color: getSplitterPairColor(newPid),
+        };
+        if (dr.side === 'back') {
+          setBackBoxes((prev) => {
+            const next = [...prev, newBox];
+            setSelected({ side: 'back', index: next.length - 1 });
+            return next;
+          });
+        } else {
+          setFrontBoxes((prev) => {
+            const next = [...prev, newBox];
+            setSelected({ side: 'front', index: next.length - 1 });
+            return next;
+          });
+        }
+      }
+      setDrawDraft(null);
+      setDrawModeSide(null);
+    }
+  };
+
+  const handleApproveAndSplit = () => {
+    if (!currentItem || committing) return;
+    setCommitting(true);
+    setCommitError('');
+    fetch(`${NODE_API_BASE}/splitter/commit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stageId: currentItem.stage_id,
+        front_boxes: frontBoxes,
+        back_boxes: backBoxes,
+      }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (!res || !res.success) {
+          setCommitError(res?.error || 'Failed to split staged cards.');
+          return;
+        }
+        const prof = res.learningProfile || {};
+        const pxPct = prof.pad_ratio_x != null ? `${(Number(prof.pad_ratio_x) * 100).toFixed(1)}%` : '—';
+        const pyPct = prof.pad_ratio_y != null ? `${(Number(prof.pad_ratio_y) * 100).toFixed(1)}%` : '—';
+        const msg = `Split ${res.createdCount || 0} card file(s) from ${currentItem.stem_name || currentItem.stage_id}.`;
+        const detail = `Learning profile updated (commits: ${prof.sample_count ?? prof.edit_stats?.commits ?? 1}, margin X/Y: ${pxPct} / ${pyPct}).`;
+        setCommitFeedback({ message: msg, detail });
+        if (pushNotification) {
+          pushNotification('Cards Split & Learned', `${msg} ${detail}`, 'Scan', 'success');
+        }
+        if (onCommitted) onCommitted(res);
+      })
+      .catch((err) => {
+        setCommitError(err?.message || 'Network error while committing split.');
+      })
+      .finally(() => {
+        setCommitting(false);
+      });
+  };
+
+  const renderPageCanvas = (side) => {
+    const isBack = side === 'back';
+    const title = isBack ? 'Backs Page' : 'Fronts Page';
+    const imgPath = isBack ? currentItem?.back_image_url : currentItem?.front_image_url;
+    const imgUrl = imgPath ? `${API_ORIGIN}${imgPath}` : '';
+    const pageSz = isBack ? backSize : frontSize;
+    const fitted = isBack ? backFitted : frontFitted;
+    const boxes = isBack ? backBoxes : frontBoxes;
+    const wrapRef = isBack ? backWrapRef : frontWrapRef;
+    const svgRef = isBack ? backSvgRef : frontSvgRef;
+    const u = Math.max(1, (pageSz.w || 1700) / 900);
+    const isDrawingHere = drawModeSide === side;
+
+    return (
+      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-2.5 flex flex-col gap-2 min-h-0 h-full overflow-hidden`}>
+        <div className="flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-2">
+            <span className={`px-2.5 py-0.5 rounded-lg text-xs font-extrabold border ${isBack ? 'bg-amber-950/70 border-amber-500/50 text-amber-200' : 'bg-cyan-950/70 border-cyan-500/50 text-cyan-200'}`}>
+              {isBack ? '🔄 Backs Page' : '🃏 Fronts Page'}
+            </span>
+            <span className="text-[11px] font-mono text-slate-400">
+              {boxes.length} box(es) • {pageSz.w}×{pageSz.h}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setDrawModeSide((cur) => (cur === side ? null : side));
+              setPickerTarget(null);
+            }}
+            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+              isDrawingHere
+                ? 'bg-emerald-500/25 border-emerald-400 text-emerald-100 ring-1 ring-emerald-400/50'
+                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+            }`}
+          >
+            {isDrawingHere ? '✏️ Drag on Page to Draw (Esc to Cancel)' : `➕ Add ${isBack ? 'Back' : 'Front'} Box`}
+          </button>
+        </div>
+
+        <div
+          ref={wrapRef}
+          onWheel={handleCanvasWheel}
+          onPointerDown={(e) => handleWrapPointerDown(side, e)}
+          onPointerMove={(e) => handleWrapPointerMove(side, e)}
+          onPointerUp={handleWrapPointerUp}
+          onPointerLeave={handleWrapPointerUp}
+          className={`flex-1 min-h-0 flex items-center justify-center bg-slate-950/90 border border-slate-800 rounded-xl overflow-hidden relative select-none ${
+            isDrawingHere ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'
+          }`}
+        >
+          {!imgUrl ? (
+            <div className="text-xs text-slate-500">No {title} image available.</div>
+          ) : (
+            <div
+              className="relative shrink-0"
+              style={{
+                width: `${fitted.w}px`,
+                height: `${fitted.h}px`,
+                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                transformOrigin: 'center center',
+              }}
+            >
+              <img
+                src={imgUrl}
+                alt={title}
+                draggable={false}
+                onLoad={(e) => {
+                  const nw = e.currentTarget.naturalWidth;
+                  const nh = e.currentTarget.naturalHeight;
+                  if (nw > 0 && nh > 0) {
+                    if (isBack) setBackSize({ w: nw, h: nh });
+                    else setFrontSize({ w: nw, h: nh });
+                  }
+                }}
+                className="w-full h-full block select-none rounded-lg"
+              />
+              <svg
+                ref={svgRef}
+                viewBox={`0 0 ${pageSz.w} ${pageSz.h}`}
+                preserveAspectRatio="none"
+                className="absolute inset-0 w-full h-full overflow-visible"
+              >
+                {boxes.map((box, idx) => {
+                  const bw = Math.max(24, box.width);
+                  const bh = Math.max(24, box.height);
+                  const col = getSplitterPairColor(box.pair_id);
+                  const isSel = selected && selected.side === side && selected.index === idx;
+                  const isPartner = (hoveredPairId != null && Number(hoveredPairId) === Number(box.pair_id))
+                    || (selectedPairId != null && Number(selectedPairId) === Number(box.pair_id));
+                  const fillAlpha = isSel ? '38' : isPartner ? '29' : '14';
+                  const strokeW = (isSel ? 4.2 : isPartner ? 3.5 : 2.6) * u;
+                  const handleR = 6.5 * u;
+                  const badgeW = 34 * u;
+                  const badgeH = 24 * u;
+                  const rotStem = 28 * u;
+
+                  const resizeHandles = [
+                    { id: 'nw', hx: -bw * 0.5, hy: -bh * 0.5, cur: 'nwse-resize' },
+                    { id: 'n', hx: 0, hy: -bh * 0.5, cur: 'ns-resize' },
+                    { id: 'ne', hx: bw * 0.5, hy: -bh * 0.5, cur: 'nesw-resize' },
+                    { id: 'e', hx: bw * 0.5, hy: 0, cur: 'ew-resize' },
+                    { id: 'se', hx: bw * 0.5, hy: bh * 0.5, cur: 'nwse-resize' },
+                    { id: 's', hx: 0, hy: bh * 0.5, cur: 'ns-resize' },
+                    { id: 'sw', hx: -bw * 0.5, hy: bh * 0.5, cur: 'nesw-resize' },
+                    { id: 'w', hx: -bw * 0.5, hy: 0, cur: 'ew-resize' },
+                  ];
+
+                  return (
+                    <g
+                      key={`${side}-${idx}-${box.pair_id}`}
+                      transform={`translate(${box.cx} ${box.cy}) rotate(${box.angle_deg || 0})`}
+                      onPointerEnter={() => setHoveredPairId(Number(box.pair_id))}
+                      onPointerLeave={() => setHoveredPairId((cur) => (Number(cur) === Number(box.pair_id) ? null : cur))}
+                    >
+                      {isPartner && (
+                        <rect
+                          x={-bw * 0.5 - 3 * u}
+                          y={-bh * 0.5 - 3 * u}
+                          width={bw + 6 * u}
+                          height={bh + 6 * u}
+                          rx={4 * u}
+                          fill="none"
+                          stroke="#ffffff"
+                          strokeOpacity="0.65"
+                          strokeWidth={2 * u}
+                          style={{ pointerEvents: 'none' }}
+                        />
+                      )}
+
+                      {/* Mostly transparent card box — drag inside to reposition */}
+                      <rect
+                        x={-bw * 0.5}
+                        y={-bh * 0.5}
+                        width={bw}
+                        height={bh}
+                        rx={3 * u}
+                        fill={`${col}${fillAlpha}`}
+                        stroke={col}
+                        strokeWidth={strokeW}
+                        style={{ cursor: isDrawingHere ? 'crosshair' : 'move' }}
+                        onPointerDown={(e) => {
+                          if (isDrawingHere || e.button !== 0) return;
+                          e.stopPropagation();
+                          setSelected({ side, index: idx });
+                          setPickerTarget(null);
+                          const pt = clientToPageCoords(svgRef.current, e.clientX, e.clientY, pageSz.w, pageSz.h);
+                          dragRef.current = {
+                            kind: 'move',
+                            side,
+                            index: idx,
+                            startX: pt.x,
+                            startY: pt.y,
+                            origBox: { ...box },
+                          };
+                        }}
+                      />
+
+                      {/* Clickable Numbered Pair Badge (One-Click Pair Swap / Reassignment) */}
+                      <g
+                        transform={`translate(${-bw * 0.5 + 6 * u} ${-bh * 0.5 + 6 * u})`}
+                        style={{ cursor: 'pointer' }}
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setSelected({ side, index: idx });
+                          setPickerTarget((cur) =>
+                            cur && cur.side === side && cur.index === idx ? null : { side, index: idx }
+                          );
+                        }}
+                      >
+                        <rect
+                          x={0}
+                          y={0}
+                          width={badgeW}
+                          height={badgeH}
+                          rx={6 * u}
+                          fill={col}
+                          stroke="#020617"
+                          strokeWidth={2 * u}
+                        />
+                        <text
+                          x={badgeW * 0.5}
+                          y={badgeH * 0.68}
+                          textAnchor="middle"
+                          fill="#020617"
+                          fontSize={14 * u}
+                          fontWeight="900"
+                          fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+                          style={{ pointerEvents: 'none', userSelect: 'none' }}
+                        >
+                          {box.pair_id}
+                        </text>
+                      </g>
+
+                      {/* Confidence pill on top-right when hovered or selected */}
+                      {(isSel || isPartner) && box.confidence != null && (
+                        <g transform={`translate(${bw * 0.5 - 48 * u} ${-bh * 0.5 + 6 * u})`} style={{ pointerEvents: 'none' }}>
+                          <rect x={0} y={0} width={42 * u} height={18 * u} rx={4 * u} fill="rgba(2,6,23,0.82)" stroke={col} strokeWidth={1.2 * u} />
+                          <text
+                            x={21 * u}
+                            y={12.5 * u}
+                            textAnchor="middle"
+                            fill="#e2e8f0"
+                            fontSize={10 * u}
+                            fontWeight="700"
+                            fontFamily="ui-monospace, monospace"
+                          >
+                            {Math.round(Number(box.confidence) * 100)}%
+                          </text>
+                        </g>
+                      )}
+
+                      {/* Direct Manipulation Resize + Rotation Handles */}
+                      {(isSel || isPartner) && (
+                        <g>
+                          {/* Dedicated Rotation Handle above top-center */}
+                          <line
+                            x1={0}
+                            y1={-bh * 0.5}
+                            x2={0}
+                            y2={-bh * 0.5 - rotStem}
+                            stroke={col}
+                            strokeWidth={2.2 * u}
+                            style={{ pointerEvents: 'none' }}
+                          />
+                          <circle
+                            cx={0}
+                            cy={-bh * 0.5 - rotStem}
+                            r={8 * u}
+                            fill="#0f172a"
+                            stroke={col}
+                            strokeWidth={2.5 * u}
+                            style={{ cursor: 'grab' }}
+                            onPointerDown={(e) => {
+                              if (e.button !== 0) return;
+                              e.stopPropagation();
+                              setSelected({ side, index: idx });
+                              setPickerTarget(null);
+                              dragRef.current = {
+                                kind: 'rotate',
+                                side,
+                                index: idx,
+                                origBox: { ...box },
+                              };
+                            }}
+                          />
+                          <text
+                            x={0}
+                            y={-bh * 0.5 - rotStem + 3.5 * u}
+                            textAnchor="middle"
+                            fill={col}
+                            fontSize={10 * u}
+                            fontWeight="900"
+                            style={{ pointerEvents: 'none', userSelect: 'none' }}
+                          >
+                            ↻
+                          </text>
+
+                          {/* 8 Corner + Edge Resize Handles */}
+                          {resizeHandles.map((rh) => (
+                            <rect
+                              key={rh.id}
+                              x={rh.hx - handleR}
+                              y={rh.hy - handleR}
+                              width={handleR * 2}
+                              height={handleR * 2}
+                              rx={2 * u}
+                              fill="#020617"
+                              stroke={col}
+                              strokeWidth={2.2 * u}
+                              style={{ cursor: rh.cur }}
+                              onPointerDown={(e) => {
+                                if (e.button !== 0) return;
+                                e.stopPropagation();
+                                setSelected({ side, index: idx });
+                                setPickerTarget(null);
+                                const pt = clientToPageCoords(svgRef.current, e.clientX, e.clientY, pageSz.w, pageSz.h);
+                                dragRef.current = {
+                                  kind: 'resize',
+                                  handle: rh.id,
+                                  side,
+                                  index: idx,
+                                  startX: pt.x,
+                                  startY: pt.y,
+                                  origBox: { ...box },
+                                };
+                              }}
+                            />
+                          ))}
+                        </g>
+                      )}
+                    </g>
+                  );
+                })}
+
+                {/* Active Draw Draft Preview */}
+                {drawDraft && drawDraft.side === side && (
+                  <rect
+                    x={Math.min(drawDraft.x1, drawDraft.x2)}
+                    y={Math.min(drawDraft.y1, drawDraft.y2)}
+                    width={Math.abs(drawDraft.x2 - drawDraft.x1)}
+                    height={Math.abs(drawDraft.y2 - drawDraft.y1)}
+                    fill="rgba(16,185,129,0.22)"
+                    stroke="#10b981"
+                    strokeWidth={3 * u}
+                    strokeDasharray={`${8 * u} ${5 * u}`}
+                    style={{ pointerEvents: 'none' }}
+                  />
+                )}
+              </svg>
+            </div>
+          )}
+
+          {/* Inline One-Click Pair Number Picker / Swap Popover */}
+          {pickerTarget && pickerTarget.side === side && boxes[pickerTarget.index] && (() => {
+            const targetBox = boxes[pickerTarget.index];
+            const choiceMax = Math.max(maxPairNum + 1, boxes.length + 1);
+            const choices = Array.from({ length: choiceMax }, (_, k) => k + 1);
+            return (
+              <div
+                onPointerDown={(e) => e.stopPropagation()}
+                className="absolute top-3 left-3 z-30 w-64 bg-slate-950/95 border border-slate-700 rounded-xl p-2.5 shadow-2xl space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5">
+                  <span className="text-[11px] font-bold text-white">
+                    Assign / Swap Pair # ({isBack ? 'Back' : 'Front'})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setPickerTarget(null)}
+                    className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  Current: <span className="font-bold text-white">Pair {targetBox.pair_id}</span>. Picking an existing number swaps both boxes in place.
+                </div>
+                <div className="grid grid-cols-3 gap-1.5 max-h-44 overflow-y-auto">
+                  {choices.map((pid) => {
+                    const col = getSplitterPairColor(pid);
+                    const isCurrent = Number(targetBox.pair_id) === pid;
+                    const wouldSwap = !isCurrent && boxes.some((b, i) => i !== pickerTarget.index && Number(b.pair_id) === pid);
+                    return (
+                      <button
+                        key={pid}
+                        type="button"
+                        onClick={() => assignOrSwapPairId(side, pickerTarget.index, pid)}
+                        className={`flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg text-[11px] font-bold border transition ${
+                          isCurrent
+                            ? 'bg-slate-800 border-white text-white ring-1 ring-white/40'
+                            : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-200'
+                        }`}
+                      >
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: col }} />
+                        <span>{pid}</span>
+                        {wouldSwap && <span className="text-[9px] text-amber-300">⇄</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+    );
+  };
+
+  if (!currentItem) {
+    return (
+      <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-6">
+        <div className={`${skin.cardBg} border ${skin.border} rounded-2xl p-6 max-w-md w-full text-center space-y-3`}>
+          <div className="text-lg font-extrabold text-white">✂️ Multi-Card Review Studio</div>
+          {commitFeedback ? (
+            <div className="p-3 rounded-xl bg-emerald-950/70 border border-emerald-600/60 text-xs text-emerald-200 space-y-1">
+              <div className="font-bold">{commitFeedback.message}</div>
+              <div className="text-[11px] text-emerald-300/90">{commitFeedback.detail}</div>
+            </div>
+          ) : (
+            <div className="text-xs text-slate-400">All staged multi-card flatbed pages have been reviewed and split.</div>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className={`px-4 py-2 rounded-xl text-xs font-bold ${skin.accentBtn}`}
+          >
+            Done & Return to Batches
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md flex flex-col p-3 gap-2.5 overflow-hidden">
+      {/* TOP STUDIO HEADER & TOOLBAR */}
+      <div className={`${skin.cardBg} border ${skin.border} rounded-2xl px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0`}>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200"
+          >
+            ⬅ Close
+          </button>
+          <div>
+            <div className="text-sm font-extrabold text-white flex items-center gap-2">
+              <span>✂️ Multi-Card Review Studio</span>
+              <span className="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[10px] font-mono text-cyan-300">
+                Page {safeIdx + 1} of {items.length}
+              </span>
+              <span className="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[10px] font-mono text-emerald-300">
+                {matchedPairCount} Paired
+              </span>
+              {currentItem.flip_mode_detected && (
+                <span className="px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-[10px] font-mono text-amber-300">
+                  flip: {currentItem.flip_mode_detected}
+                </span>
+              )}
+            </div>
+            <div className="text-[11px] text-slate-400 font-mono">
+              {currentItem.batch_name || 'Batch'} • {currentItem.stem_name || currentItem.stage_id}
+              {learningProfile && learningProfile.sample_count > 0 && (
+                <span className="ml-2 text-cyan-400/90">
+                  • Learned Margin: {(Number(learningProfile.pad_ratio_x || 0.075) * 100).toFixed(1)}% / {(Number(learningProfile.pad_ratio_y || 0.065) * 100).toFixed(1)}% ({learningProfile.sample_count} samples)
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* SYNCHRONIZED ZOOM, BOX TOOLS, QUEUE NAV & APPROVE BUTTON */}
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <div className="flex items-center bg-slate-950 border border-slate-800 rounded-xl px-1.5 py-1 gap-1">
+            <button
+              type="button"
+              onClick={() => setZoom((z) => Math.max(0.5, Number((z - 0.25).toFixed(2))))}
+              className="px-1.5 font-bold text-slate-300 hover:text-white"
+              title="Zoom Out"
+            >
+              −
+            </button>
+            <span className="font-mono text-[11px] text-sky-300 w-11 text-center">{Math.round(zoom * 100)}%</span>
+            <button
+              type="button"
+              onClick={() => setZoom((z) => Math.min(4.0, Number((z + 0.25).toFixed(2))))}
+              className="px-1.5 font-bold text-slate-300 hover:text-white"
+              title="Zoom In"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              onClick={() => { setZoom(1.0); setPan({ x: 0, y: 0 }); }}
+              className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-bold text-cyan-200"
+              title="Fit to Screen & Reset View"
+            >
+              Fit / Reset
+            </button>
+          </div>
+
+          <button
+            type="button"
+            disabled={!selected}
+            onClick={deleteSelectedBox}
+            className="px-2.5 py-1.5 rounded-xl bg-rose-950/70 hover:bg-rose-800 disabled:opacity-40 border border-rose-700/70 text-rose-200 font-bold text-[11px]"
+            title="Delete selected box (Del)"
+          >
+            🗑️ Delete Box
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setFrontBoxes(normalizeSplitterBoxes(currentItem.proposed_front_boxes));
+              setBackBoxes(normalizeSplitterBoxes(currentItem.proposed_back_boxes));
+              setSelected(null);
+              setPickerTarget(null);
+            }}
+            className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-semibold text-[11px]"
+          >
+            ↺ Reset Boxes
+          </button>
+
+          {items.length > 1 && (
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={safeIdx <= 0}
+                onClick={() => setPageIdx((i) => Math.max(0, i - 1))}
+                className="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-40 border border-slate-700 text-[11px] font-bold"
+              >
+                ◀ Prev
+              </button>
+              <button
+                type="button"
+                disabled={safeIdx >= items.length - 1}
+                onClick={() => setPageIdx((i) => Math.min(items.length - 1, i + 1))}
+                className="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-40 border border-slate-700 text-[11px] font-bold"
+              >
+                Next Page ▶
+              </button>
+            </div>
+          )}
+
+          {onRefreshPending && (
+            <button
+              type="button"
+              onClick={onRefreshPending}
+              className="px-2 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[11px] text-sky-300 font-semibold"
+              title="Reload pending queue"
+            >
+              🔄
+            </button>
+          )}
+
+          <button
+            type="button"
+            disabled={committing || frontBoxes.length === 0}
+            onClick={handleApproveAndSplit}
+            className={`px-4 py-1.5 rounded-xl font-extrabold text-xs disabled:opacity-50 ${skin.accentBtn}`}
+          >
+            {committing ? '⏳ Splitting...' : `✅ Approve & Split Cards (${matchedPairCount})`}
+          </button>
+        </div>
+      </div>
+
+      {/* SELECTED BOX FINE-TUNE BAR + COMMIT FEEDBACK */}
+      {(selectedBox || commitFeedback || commitError) && (
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-[11px] shrink-0">
+          {selectedBox ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-bold text-white flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: getSplitterPairColor(selectedBox.pair_id) }} />
+                Selected: {selected.side === 'back' ? 'Back' : 'Front'} Pair #{selectedBox.pair_id}
+              </span>
+              <span className="font-mono text-slate-400">
+                {Math.round(selectedBox.width)}×{Math.round(selectedBox.height)} px
+              </span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-400">Angle:</span>
+                <button
+                  type="button"
+                  onClick={() => updateBoxAt(selected.side, selected.index, { angle_deg: Number((selectedBox.angle_deg - 1).toFixed(1)) })}
+                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
+                >
+                  −1°
+                </button>
+                <input
+                  type="range"
+                  min="-45"
+                  max="45"
+                  step="0.5"
+                  value={selectedBox.angle_deg || 0}
+                  onChange={(e) => updateBoxAt(selected.side, selected.index, { angle_deg: Number(e.target.value) })}
+                  className="w-28 accent-cyan-400"
+                />
+                <button
+                  type="button"
+                  onClick={() => updateBoxAt(selected.side, selected.index, { angle_deg: Number((selectedBox.angle_deg + 1).toFixed(1)) })}
+                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono"
+                >
+                  +1°
+                </button>
+                <span className="font-mono text-cyan-300 w-12 text-right">{Number(selectedBox.angle_deg || 0).toFixed(1)}°</span>
+                <button
+                  type="button"
+                  onClick={() => updateBoxAt(selected.side, selected.index, { angle_deg: 0 })}
+                  className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+                >
+                  0°
+                </button>
+              </div>
+              <span className="text-slate-500">Tip: Click badge #{selectedBox.pair_id} on any box to swap pair numbers in place.</span>
+            </div>
+          ) : (
+            <div className="text-slate-400">Click any box to drag, resize, rotate, or click its numbered badge to reassign/swap pairs.</div>
+          )}
+
+          {commitFeedback && (
+            <div className="px-2.5 py-1 rounded-lg bg-emerald-950/80 border border-emerald-600/60 text-emerald-200 font-semibold">
+              ✅ {commitFeedback.message} <span className="text-emerald-300/80 font-normal">({commitFeedback.detail})</span>
+            </div>
+          )}
+          {commitError && (
+            <div className="px-2.5 py-1 rounded-lg bg-rose-950/80 border border-rose-600/60 text-rose-200 font-semibold">
+              ⚠️ {commitError}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SIDE-BY-SIDE SYNCHRONIZED CANVASES: FRONTS (LEFT) & BACKS (RIGHT) */}
+      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-3 overflow-hidden">
+        {renderPageCanvas('front')}
+        {renderPageCanvas('back')}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [skinKey, setSkinKey] = useState(() => resolveChromePulseSkinKey(localStorage.getItem('tabulas_skin')));
   const [devMode, setDevMode] = useState(() => localStorage.getItem('tabulas_dev_mode') === 'true');
@@ -4235,6 +5295,9 @@ export default function App() {
   const [ingestParallelHeavy, setIngestParallelHeavy] = useState(false);
   const [ingestAutoSplitFlatbed, setIngestAutoSplitFlatbed] = useState(true);
   const [ingestCardSightFb, setIngestCardSightFb] = useState(true);
+  const [pendingSplitterReviews, setPendingSplitterReviews] = useState([]);
+  const [splitterLearningProfile, setSplitterLearningProfile] = useState(null);
+  const [showSplitterStudio, setShowSplitterStudio] = useState(false);
   const [activeBatchName, setActiveBatchName] = useState('');
   const activeBatchNameRef = useRef('');
   const prevLaneStatesRef = useRef({});
@@ -4755,6 +5818,18 @@ export default function App() {
     }).catch(() => {});
   };
 
+  const refreshPendingSplitterReviews = (batchName = '') => {
+    const qs = batchName ? `?batch=${encodeURIComponent(batchName)}` : '';
+    return fetch(`${NODE_API_BASE}/splitter/pending${qs}`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && Array.isArray(d.pending)) setPendingSplitterReviews(d.pending);
+        if (d && d.profile) setSplitterLearningProfile(d.profile);
+        return d;
+      })
+      .catch(() => null);
+  };
+
   const refreshAllHubData = (preferredBatch = null, opts = {}) => {
     fetch(`${NODE_API_BASE}/status`).then((r) => r.json()).then((d) => {
       if (d && d.ok) {
@@ -4774,6 +5849,7 @@ export default function App() {
       }
     }).catch(() => {});
     fetch(`${NODE_API_BASE}/incoming-scans`).then((r) => r.json()).then((d) => Array.isArray(d) && setIncomingScans(d)).catch(() => {});
+    refreshPendingSplitterReviews();
     loadBatchesFromDisk(preferredBatch);
     if (!opts.preserveChecklist) fetchFilteredChecklists();
     fetch(`${NODE_API_BASE}/config/tracked-sets`).then((r) => r.json()).then((d) => {
@@ -7664,12 +8740,42 @@ export default function App() {
                           🚀 Process
                         </button>
                         <button
-                          onClick={() => fetch(`${NODE_API_BASE}/batches/split-flatbed`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ batchName: selectedIncomingBatch }) }).then((r) => r.json()).then((res) => { if (res.success) { refreshAllHubData(); pushNotification('Flatbed Split Complete', `Created ${res.createdCount || 0} individual Front/Back card PDF(s).`, 'Scan', 'success'); } })}
-                          title="Split multi-card flatbed PDFs into individual 2-page card PDFs"
+                          onClick={() => fetch(`${NODE_API_BASE}/batches/split-flatbed`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ batchName: selectedIncomingBatch }) }).then((r) => r.json()).then((res) => {
+                            if (res && res.success) {
+                              if (res.status === 'PENDING_REVIEW') {
+                                refreshPendingSplitterReviews().then((pd) => {
+                                  const items = Array.isArray(pd?.pending) ? pd.pending : (Array.isArray(res.stagedItems) ? res.stagedItems : []);
+                                  if (Array.isArray(res.stagedItems) && res.stagedItems.length > 0 && (!pd || !Array.isArray(pd.pending) || pd.pending.length === 0)) {
+                                    setPendingSplitterReviews(res.stagedItems);
+                                  }
+                                  if (items.length > 0 || (res.stagedItems && res.stagedItems.length > 0)) {
+                                    setShowSplitterStudio(true);
+                                    pushNotification('Flatbed Pages Staged for Review', `Staged ${res.pendingCount || items.length} multi-card page pair(s). Review boxes & pairs in the studio.`, 'Scan', 'info');
+                                  } else {
+                                    pushNotification('No Multi-Card Sheets Found', 'No multi-card flatbed PDFs required splitting in the selected batch.', 'Scan', 'info');
+                                  }
+                                });
+                              } else {
+                                refreshAllHubData();
+                                pushNotification('Flatbed Split Complete', `Created ${res.createdCount || 0} individual Front/Back card PDF(s).`, 'Scan', 'success');
+                              }
+                            }
+                          })}
+                          title="Detect & review multi-card flatbed PDFs before splitting into individual 2-page card PDFs"
                           className="py-2 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold shrink-0"
                         >
                           ✂️ Split
                         </button>
+                        {pendingSplitterReviews.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowSplitterStudio(true)}
+                            className="py-2 px-2.5 rounded-xl bg-cyan-950/90 hover:bg-cyan-900 border border-cyan-500/60 text-cyan-200 text-xs font-bold shrink-0"
+                            title="Open Visual Multi-Card Review Studio for staged flatbed scans"
+                          >
+                            ✂️ Review ({pendingSplitterReviews.length})
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -13843,6 +14949,29 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {showSplitterStudio && pendingSplitterReviews.length > 0 && (
+        <MultiCardSplitterReviewStudio
+          pendingItems={pendingSplitterReviews}
+          learningProfile={splitterLearningProfile}
+          onCommitted={(res) => {
+            if (Array.isArray(res?.pending)) {
+              setPendingSplitterReviews(res.pending);
+            } else {
+              refreshPendingSplitterReviews();
+            }
+            if (res?.learningProfile) setSplitterLearningProfile(res.learningProfile);
+            fetch(`${NODE_API_BASE}/incoming-scans`).then((r) => r.json()).then((d) => Array.isArray(d) && setIncomingScans(d)).catch(() => {});
+          }}
+          onRefreshPending={() => refreshPendingSplitterReviews()}
+          onClose={() => {
+            setShowSplitterStudio(false);
+            refreshAllHubData();
+          }}
+          skin={skin}
+          pushNotification={pushNotification}
+        />
+      )}
     </div>
   );
 }
