@@ -750,6 +750,142 @@ class ScraperHygieneAndProxyTests(unittest.TestCase):
             self.assertEqual(hub.extract_shell32_icon_handles(), (0, 0))
             self.assertFalse(hub.apply_windows_window_icon(98765))
 
+    # ------------------------------------------------------------------
+    # 11. Stable-mismatch subset throttling (runs 1-2 scrape, 3-5 skip, 6 re-scrape)
+    # ------------------------------------------------------------------
+    def test_stable_mismatch_cooldown_runs_1_to_6_parallel_and_empty_placeholder(self):
+        base_url = "https://www.tcdb.com/Checklist.cfm/sid/500/2024-Test-Set"
+        inserts_url = "https://www.tcdb.com/Inserts.cfm/sid/500/2024-Test-Set"
+        par_url = "https://www.tcdb.com/Checklist.cfm/sid/501/Gold-Foil"
+        empty_url = "https://www.tcdb.com/Checklist.cfm/sid/502/Placeholder-Promo"
+
+        base_html = _make_checklist_html([
+            {"cid": "5001", "cnum": "1", "player": "Player One"},
+            {"cid": "5002", "cnum": "2", "player": "Player Two"},
+            {"cid": "5003", "cnum": "3", "player": "Player Three"},
+        ])
+        # Gold Foil reports 2 cards on TCDB but HTML only yields 1 card (persistent count_mismatch);
+        # Placeholder-Promo reports 5 cards on TCDB but HTML yields 0 rows (missing_locally placeholder).
+        par_html = _make_checklist_html([
+            {"cid": "5101", "cnum": "1", "player": "Player One"},
+        ])
+        empty_html = "<html><body><table></table></body></html>"
+        inserts_html = _make_inserts_html_with_totals(
+            [("501", "Gold Foil", 2), ("502", "Placeholder Promo", 5)],
+            include_header_total=False,
+        )
+
+        routes = {
+            base_url: _MockResponse(200, text=base_html, url=base_url),
+            "https://www.tcdb.com/Errors.cfm/sid/500/2024-Test-Set": _MockResponse(200, text=empty_html),
+            inserts_url: _MockResponse(200, text=inserts_html, url=inserts_url),
+            par_url: _MockResponse(200, text=par_html, url=par_url),
+            empty_url: _MockResponse(200, text=empty_html, url=empty_url),
+        }
+
+        def _run_once():
+            # Ensure Gold Foil (501) is not masked by multiline-dedup checkpoint so it exercises count_mismatch
+            cp = self.se.load_set_checkpoint("2024 Test Set", alt_folder_name="2024_Test_Set")
+            if isinstance(cp.get("subsets"), dict) and "501" in cp["subsets"]:
+                cp["subsets"].pop("501", None)
+                self.se.save_set_checkpoint("2024 Test Set", cp)
+            sess = _CapturingMockSession(routes)
+            logs: list[str] = []
+            self.se.set_log_callback(logs.append)
+            with mock.patch.object(self.se.time, "sleep", lambda _s: None):
+                self.se.scrape_tcdb_checklist_set(
+                    sess,
+                    "https://www.tcdb.com/ViewSet.cfm/sid/500/2024-Test-Set",
+                    "2024 Test Set",
+                    folder_name="2024_Test_Set",
+                    include_inserts=True,
+                    download_images_card_by_card=False,
+                    prefetched_inserts={"501": (par_url, "Gold Foil"), "502": (empty_url, "Placeholder Promo")},
+                    prefetched_insert_counts={"501": 2, "502": 5},
+                    prefetched_base_html=base_html,
+                    incremental=True,
+                    force_refresh=False,
+                )
+            fetched_urls = [c["url"] for c in sess.calls]
+            return fetched_urls, logs
+
+        # Runs 1 & 2: both mismatched subsets must be scraped to confirm stability
+        for run_idx in (1, 2):
+            urls_hit, logs = _run_once()
+            self.assertIn(par_url, urls_hit, f"Run {run_idx} should scrape Gold Foil")
+            self.assertIn(empty_url, urls_hit, f"Run {run_idx} should scrape Placeholder Promo")
+            self.assertFalse(any("[SKIP-STABLE-MISMATCH]" in ln for ln in logs))
+
+        # Runs 3, 4, 5: both subsets must be skipped with [SKIP-STABLE-MISMATCH] & zero HTTP GETs
+        for run_idx in (3, 4, 5):
+            urls_hit, logs = _run_once()
+            self.assertNotIn(par_url, urls_hit, f"Run {run_idx} should skip Gold Foil")
+            self.assertNotIn(empty_url, urls_hit, f"Run {run_idx} should skip Placeholder Promo")
+            skip_logs = [ln for ln in logs if "[SKIP-STABLE-MISMATCH]" in ln]
+            self.assertEqual(len(skip_logs), 2, f"Run {run_idx} logs: {logs}")
+
+        # Run 6 (4th run after confirmation): periodic verification re-scrape must trigger
+        urls_hit_6, logs_6 = _run_once()
+        self.assertIn(par_url, urls_hit_6, "Run 6 should run periodic verification scrape for Gold Foil")
+        self.assertIn(empty_url, urls_hit_6, "Run 6 should run periodic verification scrape for Placeholder Promo")
+        self.assertFalse(any("[SKIP-STABLE-MISMATCH]" in ln for ln in logs_6))
+
+    # ------------------------------------------------------------------
+    # 12. Immediate bypass when tcdb_reported changes or force_refresh=True
+    # ------------------------------------------------------------------
+    def test_stable_mismatch_immediate_bypass_on_tcdb_change_and_force_refresh(self):
+        base_url = "https://www.tcdb.com/Checklist.cfm/sid/600/2024-Bypass-Set"
+        par_url = "https://www.tcdb.com/Checklist.cfm/sid/601/Blue-Foil"
+        base_html = _make_checklist_html([
+            {"cid": "6001", "cnum": "1", "player": "Player One"},
+            {"cid": "6002", "cnum": "2", "player": "Player Two"},
+            {"cid": "6003", "cnum": "3", "player": "Player Three"},
+        ])
+        par_html = _make_checklist_html([
+            {"cid": "6101", "cnum": "1", "player": "Player One"},
+        ])
+        routes = {
+            base_url: _MockResponse(200, text=base_html, url=base_url),
+            "https://www.tcdb.com/Errors.cfm/sid/600/2024-Bypass-Set": _MockResponse(200, text="<html><body><table></table></body></html>"),
+            par_url: _MockResponse(200, text=par_html, url=par_url),
+        }
+
+        def _run(tcdb_cnt: int, force_refresh: bool = False):
+            sess = _CapturingMockSession(routes)
+            logs: list[str] = []
+            self.se.set_log_callback(logs.append)
+            with mock.patch.object(self.se.time, "sleep", lambda _s: None):
+                self.se.scrape_tcdb_checklist_set(
+                    sess,
+                    "https://www.tcdb.com/ViewSet.cfm/sid/600/2024-Bypass-Set",
+                    "2024 Bypass Set",
+                    folder_name="2024_Bypass_Set",
+                    include_inserts=True,
+                    download_images_card_by_card=False,
+                    prefetched_inserts={"601": (par_url, "Blue Foil")},
+                    prefetched_insert_counts={"601": tcdb_cnt},
+                    prefetched_base_html=base_html,
+                    incremental=True,
+                    force_refresh=force_refresh,
+                )
+            return [c["url"] for c in sess.calls], logs
+
+        # Confirm stability on runs 1 & 2 (tcdb=3, extracted=1)
+        _run(3)
+        _run(3)
+
+        # Run 3 with tcdb_reported changed from 3 -> 4 must bypass cooldown immediately
+        urls_changed, logs_changed = _run(4)
+        self.assertIn(par_url, urls_changed)
+        self.assertFalse(any("[SKIP-STABLE-MISMATCH]" in ln for ln in logs_changed))
+
+        # Re-confirm stability at tcdb=4 (need one more scrape since consecutive_stable_scrapes reset to 1)
+        _run(4)
+        # Next run with same tcdb=4 would skip, but force_refresh=True must bypass immediately
+        urls_forced, logs_forced = _run(4, force_refresh=True)
+        self.assertIn(par_url, urls_forced)
+        self.assertFalse(any("[SKIP-STABLE-MISMATCH]" in ln for ln in logs_forced))
+
 
 if __name__ == "__main__":
     unittest.main()

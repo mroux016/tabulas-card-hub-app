@@ -265,48 +265,21 @@ def render_pdf_page_to_pil(pdf_path: Path, page_index: int = 0, dpi: int = 600) 
 # 1. MULTI-CARD FLATBED PDF SPLITTER & FRONT/BACK PAIRING ENGINE
 # ==============================================================================
 def _detect_flatbed_card_regions(page_img: Image.Image) -> list[tuple[int, int, int, int]]:
-    w, h = page_img.size
-    page_area = float(w * h)
-    scale = 1200.0 / max(w, h)
-    sw, sh = max(100, int(w * scale)), max(100, int(h * scale))
-    small = np.array(page_img.resize((sw, sh), Image.Resampling.BILINEAR))
+    from Core.flatbed_splitter import detect_cards_on_page
 
-    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edges = cv2.Canny(blur, 30, 110)
-    non_white = ((gray < 242) & (gray > 12)).astype(np.uint8) * 255
-    combined = cv2.bitwise_or(edges, non_white)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    small_area = float(sw * sh)
-
-    boxes = []
-    for c in cnts:
-        x, y, cw, ch = cv2.boundingRect(c)
-        box_area = float(cw * ch)
-        if not (0.045 * small_area <= box_area <= 0.42 * small_area):
-            continue
-        aspect = max(cw, ch) / max(1.0, float(min(cw, ch)))
-        if not (1.12 <= aspect <= 1.85):
-            continue
-        pad_x = int(cw * 0.03)
-        pad_y = int(ch * 0.03)
-        ox1 = max(0, int((x - pad_x) / scale))
-        oy1 = max(0, int((y - pad_y) / scale))
-        ox2 = min(w, int((x + cw + pad_x) / scale))
-        oy2 = min(h, int((y + ch + pad_y) / scale))
-        if (ox2 - ox1) * (oy2 - oy1) < 0.70 * page_area:
-            boxes.append((ox1, oy1, ox2, oy2))
-
-    if len(boxes) <= 1:
+    obbs = detect_cards_on_page(page_img)
+    if len(obbs) <= 1:
         return []
-
-    row_band_h = max(100, int(h * 0.18))
-    boxes.sort(key=lambda b: (int(((b[1] + b[3]) * 0.5) // row_band_h), (b[0] + b[2]) * 0.5))
+    w, h = page_img.size
+    boxes: list[tuple[int, int, int, int]] = []
+    for ob in obbs:
+        cx, cy = float(ob["cx"]), float(ob["cy"])
+        bw, bh = float(ob["width"]), float(ob["height"])
+        x1 = max(0, int(round(cx - bw * 0.5)))
+        y1 = max(0, int(round(cy - bh * 0.5)))
+        x2 = min(w, int(round(cx + bw * 0.5)))
+        y2 = min(h, int(round(cy + bh * 0.5)))
+        boxes.append((x1, y1, x2, y2))
     return boxes
 
 
@@ -315,11 +288,36 @@ def expand_flatbed_pdfs_in_batch_folder(
     pdf_files: Optional[list[Path]] = None,
     flip_mode: str = "auto",
     log_cb: Optional[Callable[[str], None]] = None,
+    stage_for_review: bool = False,
+    staging_dir: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
 ) -> tuple[list[Path], int]:
+    from Core.flatbed_splitter import (
+        crop_oriented_box,
+        detect_cards_on_page,
+        load_splitter_profile,
+        match_front_back_pancake,
+        stage_flatbed_pdfs_for_review,
+    )
+
     batch_folder = Path(batch_folder)
     if pdf_files is None:
         pdf_files = sorted(batch_folder.glob("*.pdf"))
 
+    if stage_for_review:
+        staged = stage_flatbed_pdfs_for_review(
+            batch_folder,
+            pdf_files=pdf_files,
+            flip_mode=flip_mode,
+            staging_dir=staging_dir,
+            profile_path=profile_path,
+            log_cb=log_cb,
+        )
+        staged_pdfs = {str(Path(s["source_pdf"]).resolve()) for s in staged if s.get("source_pdf")}
+        remaining = [p for p in pdf_files if str(p.resolve()) not in staged_pdfs]
+        return remaining, 0
+
+    profile = load_splitter_profile(profile_path)
     created_count = 0
     for pdf_p in list(pdf_files):
         if "_FBCard" in pdf_p.stem:
@@ -348,54 +346,37 @@ def expand_flatbed_pdfs_in_batch_folder(
         if p1_img is None or p2_img is None:
             continue
 
-        boxes_p1 = _detect_flatbed_card_regions(p1_img)
+        boxes_p1 = detect_cards_on_page(p1_img, profile=profile)
         if len(boxes_p1) < 2:
             continue
 
-        boxes_p2 = _detect_flatbed_card_regions(p2_img)
-        if len(boxes_p2) != len(boxes_p1):
-            boxes_p2 = list(boxes_p1)
+        boxes_p2 = detect_cards_on_page(p2_img, profile=profile)
+        if not boxes_p2:
+            boxes_p2 = [dict(b) for b in boxes_p1]
+
+        paired_f, paired_b, _ = match_front_back_pancake(
+            boxes_p1, boxes_p2, p1_img.size, p2_img.size, flip_mode=flip_mode, profile=profile
+        )
 
         p1_hi = render_pdf_page_to_pil(pdf_p, 0, dpi=RUNTIME_CONFIG.get("scanner_dpi", 600)) or p1_img
         p2_hi = render_pdf_page_to_pil(pdf_p, 1, dpi=RUNTIME_CONFIG.get("scanner_dpi", 600)) or p2_img
-        sx = p1_hi.width / float(p1_img.width)
-        sy = p1_hi.height / float(p1_img.height)
+        sx_f = p1_hi.width / float(p1_img.width)
+        sy_f = p1_hi.height / float(p1_img.height)
+        sx_b = p2_hi.width / float(p2_img.width)
+        sy_b = p2_hi.height / float(p2_img.height)
 
-        if flip_mode == "mirrored_x":
-            row_band = max(100, int(p2_img.height * 0.18))
-            grouped_rows: dict[int, list[tuple[int, int, int, int]]] = defaultdict(list)
-            for b in boxes_p2:
-                r_key = int(((b[1] + b[3]) * 0.5) // row_band)
-                grouped_rows[r_key].append(b)
-            paired_b2 = []
-            for r_key in sorted(grouped_rows.keys()):
-                row_list = sorted(grouped_rows[r_key], key=lambda b: b[0], reverse=True)
-                paired_b2.extend(row_list)
-            boxes_p2 = paired_b2
-        else:
-            used_b2 = set()
-            matched_b2 = []
-            for b1 in boxes_p1:
-                cx1, cy1 = (b1[0] + b1[2]) * 0.5, (b1[1] + b1[3]) * 0.5
-                best_j = 0
-                best_d = 1e18
-                for j, b2 in enumerate(boxes_p2):
-                    if j in used_b2:
-                        continue
-                    cx2, cy2 = (b2[0] + b2[2]) * 0.5, (b2[1] + b2[3]) * 0.5
-                    d = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
-                    if d < best_d:
-                        best_d = d
-                        best_j = j
-                used_b2.add(best_j)
-                matched_b2.append(boxes_p2[best_j])
-            boxes_p2 = matched_b2
+        back_by_pid = {int(b["pair_id"]): b for b in paired_b if "pair_id" in b}
+        for idx_c, fb in enumerate(paired_f, 1):
+            pid = int(fb.get("pair_id", idx_c))
+            bb = back_by_pid.get(pid)
+            if bb is None:
+                continue
+            fb_hi = {**fb, "cx": fb["cx"] * sx_f, "cy": fb["cy"] * sy_f, "width": fb["width"] * sx_f, "height": fb["height"] * sy_f}
+            bb_hi = {**bb, "cx": bb["cx"] * sx_b, "cy": bb["cy"] * sy_b, "width": bb["width"] * sx_b, "height": bb["height"] * sy_b}
+            c_front = crop_oriented_box(p1_hi, fb_hi)
+            c_back = crop_oriented_box(p2_hi, bb_hi)
 
-        for idx_c, (b1, b2) in enumerate(zip(boxes_p1, boxes_p2), 1):
-            c_front = p1_hi.crop((int(b1[0] * sx), int(b1[1] * sy), int(b1[2] * sx), int(b1[3] * sy)))
-            c_back = p2_hi.crop((int(b2[0] * sx), int(b2[1] * sy), int(b2[2] * sx), int(b2[3] * sy)))
-
-            out_pdf = batch_folder / f"{pdf_p.stem}_FBCard{idx_c:02d}.pdf"
+            out_pdf = batch_folder / f"{pdf_p.stem}_FBCard{pid:02d}.pdf"
             new_doc = fitz.open()
             for side_im in (c_front, c_back):
                 buf = io.BytesIO()

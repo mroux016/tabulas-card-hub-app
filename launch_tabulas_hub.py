@@ -273,6 +273,7 @@ from Core.config import (
     SET_CHECKLISTS_DIR,
     SET_LIBRARY_ROOT,
     SOLD_CARDS_CSV,
+    SPLITTER_STAGING_DIR,
     TRACKING_FILE,
     atomic_write_bytes,
     atomic_write_text,
@@ -1352,6 +1353,10 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             rel_part = route[len("/static/labels/"):].lstrip("/\\")
             self._serve_static_file(LABELS_OUTPUT_DIR / rel_part, root_dir=LABELS_OUTPUT_DIR)
             return
+        if route.startswith("/static/splitter/"):
+            rel_part = route[len("/static/splitter/"):].lstrip("/\\")
+            self._serve_static_file(SPLITTER_STAGING_DIR / rel_part, root_dir=SPLITTER_STAGING_DIR)
+            return
 
         if route == "/api/status":
             from Core.config import APP_RELEASE_VERSION, inspect_all_module_versions
@@ -1614,6 +1619,18 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
         if route == "/api/batches":
             batch_name = (query.get("batch") or [""])[0]
             self._send_json(_discover_uncommitted_batches(include_cards_for=batch_name))
+            return
+
+        if route == "/api/splitter/pending":
+            from Core.flatbed_splitter import list_pending_splitter_reviews, load_splitter_profile
+            batch_name = (query.get("batch") or [""])[0].strip()
+            pending_items = list_pending_splitter_reviews(batch_name=batch_name)
+            self._send_json({
+                "success": True,
+                "pending": pending_items,
+                "count": len(pending_items),
+                "profile": load_splitter_profile(),
+            })
             return
 
         if route == "/api/checklists/lookup":
@@ -2829,16 +2846,64 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
 
         if route == "/api/batches/split-flatbed" and isinstance(payload, dict):
             from Core.database import find_unarchived_scan_batches
+            from Core.flatbed_splitter import stage_flatbed_pdfs_for_review
             from Core.vision_grader import expand_flatbed_pdfs_in_batch_folder
             target_name = str(payload.get("batchName") or "ALL").strip()
+            flip_mode = str(payload.get("flipMode") or "auto").strip()
+            immediate = bool(payload.get("immediate", False))
             discovered = find_unarchived_scan_batches()
-            total_split = 0
+            if immediate:
+                total_split = 0
+                for b_name, b_path, b_pdfs in discovered:
+                    if target_name in ("", "ALL") or b_name == target_name:
+                        _, cnt = expand_flatbed_pdfs_in_batch_folder(
+                            b_path, pdf_files=b_pdfs, flip_mode=flip_mode, stage_for_review=False
+                        )
+                        total_split += cnt
+                _log_ui_action_to_file("Scan", "Flatbed Split", f"Created {total_split} individual card PDF(s) for {target_name}")
+                self._send_json({"success": True, "createdCount": total_split, "incomingScans": _discover_incoming_scans()})
+                return
+            staged_all = []
             for b_name, b_path, b_pdfs in discovered:
                 if target_name in ("", "ALL") or b_name == target_name:
-                    _, cnt = expand_flatbed_pdfs_in_batch_folder(b_path, pdf_files=b_pdfs, flip_mode="auto")
-                    total_split += cnt
-            _log_ui_action_to_file("Scan", "Flatbed Split", f"Created {total_split} individual card PDF(s) for {target_name}")
-            self._send_json({"success": True, "createdCount": total_split, "incomingScans": _discover_incoming_scans()})
+                    staged_all.extend(
+                        stage_flatbed_pdfs_for_review(b_path, pdf_files=b_pdfs, flip_mode=flip_mode)
+                    )
+            _log_ui_action_to_file("Scan", "Flatbed Stage", f"Staged {len(staged_all)} multi-card page pair(s) for review ({target_name})")
+            self._send_json({
+                "success": True,
+                "status": "PENDING_REVIEW",
+                "stagedItems": staged_all,
+                "pendingCount": len(staged_all),
+                "incomingScans": _discover_incoming_scans(),
+            })
+            return
+
+        if route == "/api/splitter/commit" and isinstance(payload, dict):
+            from Core.flatbed_splitter import commit_staged_splitter_review, list_pending_splitter_reviews
+            stage_id = str(payload.get("stageId") or payload.get("stage_id") or "").strip()
+            front_boxes = payload.get("front_boxes") if isinstance(payload.get("front_boxes"), list) else (payload.get("frontBoxes") or [])
+            back_boxes = payload.get("back_boxes") if isinstance(payload.get("back_boxes"), list) else (payload.get("backBoxes") or [])
+            if not stage_id:
+                self._send_json({"success": False, "error": "Missing stageId."}, status=400)
+                return
+            try:
+                res = commit_staged_splitter_review(
+                    stage_id=stage_id,
+                    front_boxes=list(front_boxes),
+                    back_boxes=list(back_boxes),
+                )
+            except FileNotFoundError as exc:
+                self._send_json({"success": False, "error": str(exc)}, status=404)
+                return
+            except ValueError as exc:
+                self._send_json({"success": False, "error": str(exc)}, status=400)
+                return
+            _log_ui_action_to_file("Scan", "Splitter Commit", f"Committed {stage_id}: {res.get('createdCount', 0)} file(s)")
+            self._send_json({
+                **res,
+                "pending": list_pending_splitter_reviews(),
+            })
             return
 
         if route == "/api/config/tracked-sets" and isinstance(payload, list):

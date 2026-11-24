@@ -299,6 +299,9 @@ if IS_REORGANIZED_V24:
 
     ACTIVE_BATCH_FILE = CACHE_INVENTORY_DIR / "Active_Staging_Batch.csv"
     BATCH_REVIEW_SELECTION_FILE = CACHE_INVENTORY_DIR / "batch_review_selection.json"
+    SPLITTER_LEARNING_PROFILE_FILE = CACHE_INVENTORY_DIR / "splitter_learning_profile.json"
+    SPLITTER_STAGING_DIR = CACHE_INVENTORY_DIR / "Splitter_Review"
+    SUBSET_STABILITY_CACHE_FILE = CACHE_CHECKLISTS_DIR / "subset_stability.json"
 
     GRADING_TIERS_CACHE_FILE = CACHE_SALES_MARKET_DIR / "grading_tiers_cache.json"
     MARKET_ALERTS_FILE = CACHE_SALES_MARKET_DIR / "market_alerts.json"
@@ -324,6 +327,9 @@ else:
     DEAD_FRONTS_CACHE_PATH = SET_LIBRARY_CACHE_DIR / "tcdb_dead_fronts_cache.json"
     CACHE_CHECKPOINTS_DIR = SET_LIBRARY_CACHE_DIR / "Checkpoints"
     BATCH_REVIEW_SELECTION_FILE = LOGS_DIR / "batch_review_selection.json"
+    SPLITTER_LEARNING_PROFILE_FILE = LOGS_DIR / "splitter_learning_profile.json"
+    SPLITTER_STAGING_DIR = LOGS_DIR / "Splitter_Review"
+    SUBSET_STABILITY_CACHE_FILE = SET_LIBRARY_CACHE_DIR / "subset_stability.json"
 
 
 def get_daily_log_dir(date_obj: Optional[datetime] = None) -> Path:
@@ -340,6 +346,8 @@ COMPUTE_SETTINGS_FILE = LOGS_DIR / "compute_settings.json"
 GPU_WORKER_CLAIMS_FILE = LOGS_DIR / "gpu_worker_claims.json"
 SCRAPER_SETTINGS_FILE = LOGS_DIR / "scraper_settings.json"
 DEFAULT_SCRAPER_SETTINGS = {"scraper_proxy_pool": []}
+STABLE_MISMATCH_CONFIRM_RUNS = 2
+STABLE_MISMATCH_SCRAPE_EVERY_N_RUNS = 4
 
 # Standard TCDB Glossary & Card Attribute Definitions
 TCDB_STANDARD_GLOSSARY = {

@@ -75,6 +75,9 @@ from Core.config import (
     SET_CART_JSON_FILE,
     SET_CHECKLISTS_DIR,
     SET_LIBRARY_CACHE_DIR,
+    STABLE_MISMATCH_CONFIRM_RUNS,
+    STABLE_MISMATCH_SCRAPE_EVERY_N_RUNS,
+    SUBSET_STABILITY_CACHE_FILE,
     TABULAS_VENV_PYTHON,
     TCDB_STANDARD_GLOSSARY,
     TRACKING_FILE,
@@ -3938,6 +3941,129 @@ def save_set_checkpoint(set_name_or_key: str, checkpoint: dict):
         pass
 
 
+_DEFAULT_SUBSET_STABILITY_CACHE_FILE = SUBSET_STABILITY_CACHE_FILE
+_DEFAULT_CACHE_CHECKPOINTS_DIR = CACHE_CHECKPOINTS_DIR
+
+
+def _get_subset_stability_cache_path(override: Optional[Path] = None) -> Path:
+    if override is not None:
+        return Path(override)
+    if SUBSET_STABILITY_CACHE_FILE != _DEFAULT_SUBSET_STABILITY_CACHE_FILE:
+        return Path(SUBSET_STABILITY_CACHE_FILE)
+    if CACHE_CHECKPOINTS_DIR != _DEFAULT_CACHE_CHECKPOINTS_DIR:
+        return CACHE_CHECKPOINTS_DIR.parent / "subset_stability.json"
+    return Path(SUBSET_STABILITY_CACHE_FILE)
+
+
+def make_subset_stability_key(set_name: str, sid_key: str, subset_name: str) -> str:
+    set_norm = canonicalize_checklist_set_title(set_name).lower()
+    sub_part = str(sid_key or "").strip() or canonical_subset_key(subset_name)
+    return f"{set_norm}::{sub_part}"
+
+
+def load_subset_stability_cache(cache_path: Optional[Path] = None) -> dict:
+    target = _get_subset_stability_cache_path(cache_path)
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                data.setdefault("schema_version", 1)
+                data.setdefault("subsets", {})
+                return data
+        except Exception:
+            pass
+    return {"schema_version": 1, "subsets": {}}
+
+
+def save_subset_stability_cache(data: dict, cache_path: Optional[Path] = None) -> None:
+    target = _get_subset_stability_cache_path(cache_path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data.setdefault("schema_version", 1)
+        data.setdefault("subsets", {})
+        atomic_write_text(target, json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _check_stable_mismatch_skip(
+    stability_cache: dict,
+    set_name: str,
+    sid_key: str,
+    subset_name: str,
+    tcdb_reported: int,
+    local_count: int,
+    incremental: bool,
+    force_refresh: bool,
+    clean_slate_reset: bool,
+) -> tuple[bool, Optional[dict], int]:
+    key = make_subset_stability_key(set_name, sid_key, subset_name)
+    entry = (stability_cache.get("subsets") or {}).get(key)
+    if not incremental or force_refresh or clean_slate_reset:
+        return False, entry, 0
+    if not isinstance(entry, dict):
+        return False, None, 0
+
+    confirm_runs = max(1, int(STABLE_MISMATCH_CONFIRM_RUNS))
+    every_n = max(2, int(STABLE_MISMATCH_SCRAPE_EVERY_N_RUNS))
+
+    if (
+        int(entry.get("consecutive_stable_scrapes", 0)) >= confirm_runs
+        and int(entry.get("last_tcdb_reported", -1)) == int(tcdb_reported)
+        and int(entry.get("last_extracted_count", -1)) == int(local_count)
+    ):
+        skips = int(entry.get("skips_since_last_scrape", 0))
+        if skips < (every_n - 1):
+            entry["skips_since_last_scrape"] = skips + 1
+            remaining = every_n - entry["skips_since_last_scrape"]
+            return True, entry, remaining
+        entry["skips_since_last_scrape"] = 0
+        return False, entry, 0
+
+    return False, entry, 0
+
+
+def _record_subset_mismatch_result(
+    stability_cache: dict,
+    set_name: str,
+    sid_key: str,
+    subset_name: str,
+    tcdb_reported: int,
+    extracted_count: int,
+    is_mismatch: bool,
+) -> Optional[dict]:
+    subsets_map = stability_cache.setdefault("subsets", {})
+    key = make_subset_stability_key(set_name, sid_key, subset_name)
+    if not is_mismatch:
+        subsets_map.pop(key, None)
+        return None
+
+    prev = subsets_map.get(key)
+    tcdb_i = int(tcdb_reported)
+    ext_i = int(extracted_count)
+    if (
+        isinstance(prev, dict)
+        and int(prev.get("last_tcdb_reported", -1)) == tcdb_i
+        and int(prev.get("last_extracted_count", -1)) == ext_i
+    ):
+        consec = int(prev.get("consecutive_stable_scrapes", 0)) + 1
+    else:
+        consec = 1
+
+    entry = {
+        "set_name": str(set_name),
+        "sid": str(sid_key),
+        "subset_name": str(subset_name),
+        "last_tcdb_reported": tcdb_i,
+        "last_extracted_count": ext_i,
+        "consecutive_stable_scrapes": consec,
+        "skips_since_last_scrape": 0,
+        "updated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    subsets_map[key] = entry
+    return entry
+
+
 def compute_subset_rows_checksum(rows: list[dict]) -> str:
     """
     Computes a canonical SHA-256 checksum over sorted
@@ -5542,6 +5668,7 @@ def scrape_tcdb_checklist_set(
     progress_ctx: Optional[dict] = None,
     incremental: bool = True,
     force_refresh: bool = False,
+    clean_slate_reset: bool = False,
     card_delay_range: Optional[tuple[float, float]] = None,
     breather_every_cards: Optional[int] = None,
     breather_duration_range: Optional[tuple[float, float]] = None,
@@ -6050,6 +6177,7 @@ def scrape_tcdb_checklist_set(
     }
     checkpoint["set_sid"] = extract_tcdb_sid(viewset_url)
     checkpoint["viewset_url"] = viewset_url
+    stability_cache = load_subset_stability_cache()
     local_rows_by_key, _, _ = _load_local_set_csv_rows_by_subset(checklist_set_name, folder_name=cat_key)
     subset_rows_store: dict[str, list[dict]] = {}
     if incremental and not force_refresh and local_rows_by_key:
@@ -6158,15 +6286,58 @@ def scrape_tcdb_checklist_set(
         else:
             log_msg(f"  [SKIP] Base ({base_detail})")
     else:
-        log_msg(f"  [QUEUE: {base_reason}] Base ({base_detail})")
-        subsets_fetched += 1
-        base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
-        subset_rows_store[canonical_subset_key("Base")] = base_rows
-        if base_rows:
-            _register_parent_subset("Base", base_rows, from_csv=False)
-            _record_subset_checkpoint(base_sid, urls["checklist"], "Base", base_expected or len(base_rows), base_rows, is_base=True)
-            changed_since_flush += 1
-        log_msg(f"  + Base Set: {len(base_rows)} card rows extracted (with TCDB_CIDs).")
+        base_local_existing = _lookup_local_subset_rows(local_rows_by_key, "Base")
+        base_stab_skip, base_stab_ent, base_stab_rem = _check_stable_mismatch_skip(
+            stability_cache,
+            checklist_set_name,
+            base_sid,
+            "Base",
+            base_expected,
+            len(base_local_existing),
+            incremental=incremental,
+            force_refresh=force_refresh,
+            clean_slate_reset=clean_slate_reset,
+        )
+        if base_stab_skip:
+            save_subset_stability_cache(stability_cache)
+            subsets_skipped += 1
+            p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
+            p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(base_local_existing)
+            if base_local_existing:
+                subset_rows_store[canonical_subset_key("Base")] = base_local_existing
+                _register_parent_subset("Base", base_local_existing, from_csv=True)
+            log_msg(
+                f"  [SKIP-STABLE-MISMATCH] Base (extracted={len(base_local_existing)}, tcdb={base_expected}; "
+                f"stable x{base_stab_ent['consecutive_stable_scrapes']}, next check in {base_stab_rem} run(s))"
+            )
+            base_skip = True
+        else:
+            if base_stab_ent is not None:
+                save_subset_stability_cache(stability_cache)
+            log_msg(f"  [QUEUE: {base_reason}] Base ({base_detail})")
+            subsets_fetched += 1
+            base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
+            subset_rows_store[canonical_subset_key("Base")] = base_rows
+            if base_rows:
+                _register_parent_subset("Base", base_rows, from_csv=False)
+                _record_subset_checkpoint(base_sid, urls["checklist"], "Base", base_expected or len(base_rows), base_rows, is_base=True)
+                changed_since_flush += 1
+            base_is_mismatch = (
+                base_reason == "count_mismatch"
+                or (base_reason == "missing_locally" and len(base_rows) == 0)
+                or (base_expected > 0 and len(base_rows) != base_expected)
+            )
+            _record_subset_mismatch_result(
+                stability_cache,
+                checklist_set_name,
+                base_sid,
+                "Base",
+                base_expected,
+                len(base_rows),
+                is_mismatch=base_is_mismatch,
+            )
+            save_subset_stability_cache(stability_cache)
+            log_msg(f"  + Base Set: {len(base_rows)} card rows extracted (with TCDB_CIDs).")
 
     err_cp = checkpoint.get("errors_page") if isinstance(checkpoint.get("errors_page"), dict) else {}
     if incremental and not force_refresh and base_skip:
@@ -6239,6 +6410,35 @@ def scrape_tcdb_checklist_set(
                         log_msg(f"    [{idx}/{len(insert_by_sid)}] [SKIP] {fallback_label} ({sub_detail})")
                     continue
 
+                sub_local_rows = _lookup_local_subset_rows(local_rows_by_key, fallback_label)
+                sub_stab_skip, sub_stab_ent, sub_stab_rem = _check_stable_mismatch_skip(
+                    stability_cache,
+                    checklist_set_name,
+                    sid_k,
+                    fallback_label,
+                    exp_ins_cards,
+                    len(sub_local_rows),
+                    incremental=incremental,
+                    force_refresh=force_refresh,
+                    clean_slate_reset=clean_slate_reset,
+                )
+                if sub_stab_skip:
+                    save_subset_stability_cache(stability_cache)
+                    subsets_skipped += 1
+                    p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
+                    p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(sub_local_rows)
+                    if sub_local_rows:
+                        subset_rows_store[canonical_subset_key(fallback_label)] = sub_local_rows
+                        _register_parent_subset(fallback_label, sub_local_rows, from_csv=True)
+                    log_msg(
+                        f"    [{idx}/{len(insert_by_sid)}] [SKIP-STABLE-MISMATCH] {fallback_label} "
+                        f"(extracted={len(sub_local_rows)}, tcdb={exp_ins_cards}; "
+                        f"stable x{sub_stab_ent['consecutive_stable_scrapes']}, next check in {sub_stab_rem} run(s))"
+                    )
+                    continue
+                if sub_stab_ent is not None:
+                    save_subset_stability_cache(stability_cache)
+
                 log_msg(f"    [{idx}/{len(insert_by_sid)}] [QUEUE: {sub_reason}] {fallback_label} ({sub_detail})")
                 subsets_fetched += 1
                 _parent_name, resolved_parent_cards = _resolve_parallel_parent_subset(
@@ -6246,7 +6446,6 @@ def scrape_tcdb_checklist_set(
                     parent_cards_pool,
                     expected_cards=exp_ins_cards,
                 )
-                sub_local_rows = _lookup_local_subset_rows(local_rows_by_key, fallback_label)
                 sub_local_by_cid = {
                     normalize_numeric_tcdb_cid(r.get("TCDB_CID", "")): r
                     for r in sub_local_rows
@@ -6270,6 +6469,22 @@ def scrape_tcdb_checklist_set(
                     _register_parent_subset(resolved_lbl, sub_rows, from_csv=False)
                     _record_subset_checkpoint(sid_k, ins_url, resolved_lbl, exp_ins_cards or len(sub_rows), sub_rows, is_base=False)
                     changed_since_flush += 1
+                sub_is_mismatch = (
+                    sub_reason == "count_mismatch"
+                    or interp_stats.get("reason") == "count_mismatch"
+                    or (sub_reason == "missing_locally" and len(sub_rows) == 0)
+                    or (exp_ins_cards > 0 and len(sub_rows) != exp_ins_cards)
+                )
+                _record_subset_mismatch_result(
+                    stability_cache,
+                    checklist_set_name,
+                    sid_k,
+                    resolved_lbl,
+                    exp_ins_cards,
+                    len(sub_rows),
+                    is_mismatch=sub_is_mismatch,
+                )
+                save_subset_stability_cache(stability_cache)
                 log_msg(f"    [{idx}/{len(insert_by_sid)}] {resolved_lbl}: {len(sub_rows)} rows extracted.")
                 if changed_since_flush >= flush_every:
                     merged_partial = [r for rows_l in subset_rows_store.values() for r in rows_l]
@@ -6295,6 +6510,12 @@ def scrape_tcdb_checklist_set(
         save_dead_fronts_cache(dead_fronts)
 
     final_df = apply_excel_formulas_and_combine(all_raw_rows, checklist_set_name)
+    if not final_df.empty and changed_since_flush > 0:
+        try:
+            set_csv_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            final_df.to_csv(set_csv_checkpoint, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
     # Reconcile checkpoint local_deduped_count & rows_sha256 against final deduped CSV rows
     # while preserving TCDB's raw reported count (`tcdb_reported_count`) so multiline/combo
     # deduplication never triggers false `count_mismatch` deep-dives on subsequent runs.
@@ -6425,6 +6646,7 @@ def run_tcdb_checklist_pipeline(
                 progress_ctx=p_ctx,
                 incremental=incremental,
                 force_refresh=force_refresh,
+                clean_slate_reset=clean_slate_reset,
             )
             if not df_set.empty:
                 _merge_set_checklist_into_master(df_set, chk_title, replace_set_cleanly=True)
@@ -7033,6 +7255,7 @@ def mode_checklist_and_images_card_by_card(
                 progress_ctx=p_ctx,
                 incremental=incremental,
                 force_refresh=force_refresh,
+                clean_slate_reset=clean_slate_reset,
             )
             if not df_set.empty:
                 _merge_set_checklist_into_master(df_set, chk_title, replace_set_cleanly=True)
