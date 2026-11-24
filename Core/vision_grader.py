@@ -328,8 +328,10 @@ def expand_flatbed_pdfs_in_batch_folder(
             num_pages = len(doc)
             max_pt_dim = 0.0
             if num_pages >= 2:
-                r0 = doc.load_page(0).rect
-                max_pt_dim = max(float(r0.width), float(r0.height))
+                max_pt_dim = max(
+                    max(float(doc.load_page(i).rect.width), float(doc.load_page(i).rect.height))
+                    for i in range(num_pages)
+                )
             doc.close()
         except Exception:
             continue
@@ -340,63 +342,79 @@ def expand_flatbed_pdfs_in_batch_folder(
         if 0.0 < max_pt_dim < 420.0:
             continue
         if log_cb:
-            log_cb(f"  ✂️ Checking large PDF '{pdf_p.name}' ({max_pt_dim / 72.0:.1f} in) for multi-card flatbed layout...")
+            log_cb(f"  ✂️ Checking large PDF '{pdf_p.name}' ({max_pt_dim / 72.0:.1f} in, {num_pages} page(s)) for multi-card flatbed layout...")
 
-        p1_img = render_pdf_page_to_pil(pdf_p, 0, dpi=300)
-        p2_img = render_pdf_page_to_pil(pdf_p, 1, dpi=300)
-        if p1_img is None or p2_img is None:
-            continue
-
-        boxes_p1 = detect_cards_on_page(p1_img, profile=profile)
-        if len(boxes_p1) < 2:
-            continue
-
-        boxes_p2 = detect_cards_on_page(p2_img, profile=profile)
-        if not boxes_p2:
-            boxes_p2 = [dict(b) for b in boxes_p1]
-
-        paired_f, paired_b, _ = match_front_back_pancake(
-            boxes_p1, boxes_p2, p1_img.size, p2_img.size, flip_mode=flip_mode, profile=profile
-        )
-
-        p1_hi = render_pdf_page_to_pil(pdf_p, 0, dpi=RUNTIME_CONFIG.get("scanner_dpi", 600)) or p1_img
-        p2_hi = render_pdf_page_to_pil(pdf_p, 1, dpi=RUNTIME_CONFIG.get("scanner_dpi", 600)) or p2_img
-        sx_f = p1_hi.width / float(p1_img.width)
-        sy_f = p1_hi.height / float(p1_img.height)
-        sx_b = p2_hi.width / float(p2_img.width)
-        sy_b = p2_hi.height / float(p2_img.height)
-
-        back_by_pid = {int(b["pair_id"]): b for b in paired_b if "pair_id" in b}
-        for idx_c, fb in enumerate(paired_f, 1):
-            pid = int(fb.get("pair_id", idx_c))
-            bb = back_by_pid.get(pid)
-            if bb is None:
+        pdf_created_count = 0
+        dpi_val = int(RUNTIME_CONFIG.get("scanner_dpi", 600))
+        total_sheets = num_pages // 2
+        for pair_idx in range(0, num_pages - 1, 2):
+            p1_img = render_pdf_page_to_pil(pdf_p, pair_idx, dpi=300)
+            p2_img = render_pdf_page_to_pil(pdf_p, pair_idx + 1, dpi=300)
+            if p1_img is None or p2_img is None:
                 continue
-            fb_hi = {**fb, "cx": fb["cx"] * sx_f, "cy": fb["cy"] * sy_f, "width": fb["width"] * sx_f, "height": fb["height"] * sy_f}
-            bb_hi = {**bb, "cx": bb["cx"] * sx_b, "cy": bb["cy"] * sy_b, "width": bb["width"] * sx_b, "height": bb["height"] * sy_b}
-            c_front = crop_oriented_box(p1_hi, fb_hi)
-            c_back = crop_oriented_box(p2_hi, bb_hi)
 
-            out_pdf = batch_folder / f"{pdf_p.stem}_FBCard{pid:02d}.pdf"
-            new_doc = fitz.open()
-            for side_im in (c_front, c_back):
-                buf = io.BytesIO()
-                side_im.save(buf, format="JPEG", quality=95)
-                img_bytes = buf.getvalue()
-                w_pt = side_im.width * 72.0 / float(RUNTIME_CONFIG.get("scanner_dpi", 600))
-                h_pt = side_im.height * 72.0 / float(RUNTIME_CONFIG.get("scanner_dpi", 600))
-                page = new_doc.new_page(width=w_pt, height=h_pt)
-                page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), stream=img_bytes)
-            new_doc.save(str(out_pdf))
-            new_doc.close()
-            created_count += 1
+            boxes_p1 = detect_cards_on_page(p1_img, profile=profile)
+            boxes_p2 = detect_cards_on_page(p2_img, profile=profile)
 
-        arc_fb_dir = batch_folder / "Archive_Flatbed_Sheets"
-        arc_fb_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            pdf_p.replace(arc_fb_dir / pdf_p.name)
-        except Exception:
-            pass
+            if num_pages == 2 and len(boxes_p1) < 2 and len(boxes_p2) < 2:
+                continue
+            if not boxes_p1 and not boxes_p2:
+                continue
+            if not boxes_p1:
+                boxes_p1 = [dict(b) for b in boxes_p2]
+            if not boxes_p2:
+                boxes_p2 = [dict(b) for b in boxes_p1]
+
+            paired_f, paired_b, _ = match_front_back_pancake(
+                boxes_p1, boxes_p2, p1_img.size, p2_img.size, flip_mode=flip_mode, profile=profile
+            )
+
+            p1_hi = render_pdf_page_to_pil(pdf_p, pair_idx, dpi=dpi_val) or p1_img
+            p2_hi = render_pdf_page_to_pil(pdf_p, pair_idx + 1, dpi=dpi_val) or p2_img
+            sx_f = p1_hi.width / float(p1_img.width)
+            sy_f = p1_hi.height / float(p1_img.height)
+            sx_b = p2_hi.width / float(p2_img.width)
+            sy_b = p2_hi.height / float(p2_img.height)
+
+            sheet_num = pair_idx // 2 + 1
+            stem_out = f"{pdf_p.stem}_s{sheet_num:02d}" if num_pages > 2 else pdf_p.stem
+
+            back_by_pid = {int(b["pair_id"]): b for b in paired_b if "pair_id" in b}
+            for idx_c, fb in enumerate(paired_f, 1):
+                pid = int(fb.get("pair_id", idx_c))
+                bb = back_by_pid.get(pid)
+                if bb is None:
+                    continue
+                fb_hi = {**fb, "cx": fb["cx"] * sx_f, "cy": fb["cy"] * sy_f, "width": fb["width"] * sx_f, "height": fb["height"] * sy_f}
+                bb_hi = {**bb, "cx": bb["cx"] * sx_b, "cy": bb["cy"] * sy_b, "width": bb["width"] * sx_b, "height": bb["height"] * sy_b}
+                c_front = crop_oriented_box(p1_hi, fb_hi)
+                c_back = crop_oriented_box(p2_hi, bb_hi)
+
+                out_pdf = batch_folder / f"{stem_out}_FBCard{pid:02d}.pdf"
+                new_doc = fitz.open()
+                for side_im in (c_front, c_back):
+                    buf = io.BytesIO()
+                    side_im.save(buf, format="JPEG", quality=95)
+                    img_bytes = buf.getvalue()
+                    w_pt = side_im.width * 72.0 / float(dpi_val)
+                    h_pt = side_im.height * 72.0 / float(dpi_val)
+                    page = new_doc.new_page(width=w_pt, height=h_pt)
+                    page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), stream=img_bytes)
+                new_doc.save(str(out_pdf))
+                new_doc.close()
+                created_count += 1
+                pdf_created_count += 1
+
+            if log_cb and num_pages > 2:
+                log_cb(f"  ✂️ Split '{pdf_p.name}' sheet {sheet_num}/{total_sheets} (p{pair_idx + 1}-{pair_idx + 2}): {len(paired_f)} card(s).")
+
+        if pdf_created_count > 0:
+            arc_fb_dir = batch_folder / "Archive_Flatbed_Sheets"
+            arc_fb_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                pdf_p.replace(arc_fb_dir / pdf_p.name)
+            except Exception:
+                pass
 
     final_pdfs = sorted(batch_folder.glob("*.pdf"))
     return final_pdfs, created_count

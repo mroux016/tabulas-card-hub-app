@@ -302,6 +302,36 @@ def _box_center_overlap_dup(b1: dict, b2: dict) -> bool:
     return dx < 0.35 * min_dim and dy < 0.35 * min_dim
 
 
+def compute_rotated_box_overlap_area(b1: dict, b2: dict, use_raw: bool = False) -> float:
+    """Return the intersection area (in px^2) of two oriented bounding boxes."""
+    w1 = float(b1.get("raw_width", b1["width"])) if use_raw else float(b1["width"])
+    h1 = float(b1.get("raw_height", b1["height"])) if use_raw else float(b1["height"])
+    w2 = float(b2.get("raw_width", b2["width"])) if use_raw else float(b2["width"])
+    h2 = float(b2.get("raw_height", b2["height"])) if use_raw else float(b2["height"])
+    if w1 <= 0.0 or h1 <= 0.0 or w2 <= 0.0 or h2 <= 0.0:
+        return 0.0
+    r1 = ((float(b1["cx"]), float(b1["cy"])), (w1, h1), float(b1.get("angle_deg", 0.0)))
+    r2 = ((float(b2["cx"]), float(b2["cy"])), (w2, h2), float(b2.get("angle_deg", 0.0)))
+    res, pts = cv2.rotatedRectangleIntersection(r1, r2)
+    if res == cv2.INTERSECT_NONE or pts is None or len(pts) < 3:
+        return 0.0
+    return float(cv2.contourArea(cv2.convexHull(pts)))
+
+
+def _is_duplicate_box(b1: dict, b2: dict) -> bool:
+    """Return True if two detections represent the same physical card (center proximity or high IoU/containment)."""
+    if _box_center_overlap_dup(b1, b2):
+        return True
+    inter = compute_rotated_box_overlap_area(b1, b2, use_raw=True)
+    if inter <= 0.0:
+        return False
+    a1 = max(1.0, float(b1.get("raw_width", b1["width"])) * float(b1.get("raw_height", b1["height"])))
+    a2 = max(1.0, float(b2.get("raw_width", b2["width"])) * float(b2.get("raw_height", b2["height"])))
+    iou = inter / max(1.0, a1 + a2 - inter)
+    containment = inter / min(a1, a2)
+    return iou >= 0.40 or containment >= 0.55
+
+
 def _estimate_background_candidates(
     small_rgb: np.ndarray,
     lab: np.ndarray,
@@ -602,7 +632,7 @@ def _extract_boxes_from_mask(
     candidates.sort(key=lambda b: b["confidence"], reverse=True)
     kept: list[dict[str, Any]] = []
     for cand in candidates:
-        if any(_box_center_overlap_dup(cand, k) for k in kept):
+        if any(_is_duplicate_box(cand, k) for k in kept):
             continue
         kept.append(cand)
     return kept
@@ -648,6 +678,173 @@ def _detect_for_bg_candidate(
             return edge_boxes
 
     return boxes
+
+
+def _obb_axes_and_corners(
+    b: dict[str, Any],
+) -> tuple[tuple[float, float], tuple[float, float], list[tuple[float, float]]]:
+    theta = math.radians(float(b.get("angle_deg", 0.0)))
+    ux, uy = math.cos(theta), math.sin(theta)
+    vx, vy = -math.sin(theta), math.cos(theta)
+    cx, cy = float(b["cx"]), float(b["cy"])
+    hw = float(b["width"]) * 0.5
+    hh = float(b["height"]) * 0.5
+    corners = [
+        (cx + sx * hw * ux + sy * hh * vx, cy + sx * hw * uy + sy * hh * vy)
+        for sx in (-1.0, 1.0)
+        for sy in (-1.0, 1.0)
+    ]
+    return (ux, uy), (vx, vy), corners
+
+
+def _trim_box_face(
+    b: dict[str, Any],
+    axis_is_u: bool,
+    positive_side: bool,
+    trim_px: float,
+) -> float:
+    """Trim only the encroaching side of an OBB while leaving its opposite side anchored."""
+    if trim_px <= 0.0:
+        return 0.0
+    theta = math.radians(float(b.get("angle_deg", 0.0)))
+    cur_dim = float(b["width"] if axis_is_u else b["height"])
+    raw_dim = float(b.get("raw_width", cur_dim) if axis_is_u else b.get("raw_height", cur_dim))
+    min_dim = max(24.0, 0.35 * raw_dim)
+    max_trim = max(0.0, cur_dim - min_dim)
+    actual_trim = min(float(trim_px), max_trim)
+    if actual_trim <= 0.0:
+        return 0.0
+
+    shift = (-0.5 * actual_trim) if positive_side else (0.5 * actual_trim)
+    if axis_is_u:
+        b["width"] = cur_dim - actual_trim
+        b["cx"] = float(b["cx"]) + shift * math.cos(theta)
+        b["cy"] = float(b["cy"]) + shift * math.sin(theta)
+    else:
+        b["height"] = cur_dim - actual_trim
+        b["cx"] = float(b["cx"]) - shift * math.sin(theta)
+        b["cy"] = float(b["cy"]) + shift * math.cos(theta)
+    return actual_trim
+
+
+def _resolve_box_overlaps(
+    boxes: list[dict[str, Any]],
+    page_w: int,
+    page_h: int,
+    min_gap_px: float = 3.0,
+) -> list[dict[str, Any]]:
+    """
+    Resolve overlaps between neighboring padded OBBs using SAT minimum-penetration-axis
+    face trimming (clamping only the shared boundary side) plus a strict intersection fallback.
+    """
+    if len(boxes) < 2:
+        return boxes
+
+    resolved = [copy.deepcopy(b) for b in boxes]
+    gap = max(2.0, float(min_gap_px))
+
+    # Stage 1: SAT minimum-penetration-axis face trimming
+    for _ in range(16):
+        changed = False
+        for i in range(len(resolved)):
+            for j in range(i + 1, len(resolved)):
+                bi = resolved[i]
+                bj = resolved[j]
+                ui, vi, ci = _obb_axes_and_corners(bi)
+                uj, vj, cj = _obb_axes_and_corners(bj)
+
+                min_pen = float("inf")
+                best_axis: Optional[tuple[float, float]] = None
+                separated = False
+
+                for ax, ay in (ui, vi, uj, vj):
+                    projs_i = [px * ax + py * ay for px, py in ci]
+                    projs_j = [px * ax + py * ay for px, py in cj]
+                    pen = min(max(projs_i), max(projs_j)) - max(min(projs_i), min(projs_j)) + gap
+                    if pen <= 0.0:
+                        separated = True
+                        break
+                    if pen < min_pen:
+                        min_pen = pen
+                        best_axis = (ax, ay)
+
+                if separated or best_axis is None or min_pen <= 0.0:
+                    continue
+
+                ax, ay = best_axis
+                dcx = float(bj["cx"]) - float(bi["cx"])
+                dcy = float(bj["cy"]) - float(bi["cy"])
+                if dcx * ax + dcy * ay < 0.0:
+                    ax, ay = -ax, -ay
+
+                dot_ui = ui[0] * ax + ui[1] * ay
+                dot_vi = vi[0] * ax + vi[1] * ay
+                i_is_u = abs(dot_ui) >= abs(dot_vi)
+                dot_i = dot_ui if i_is_u else dot_vi
+
+                dot_uj = uj[0] * (-ax) + uj[1] * (-ay)
+                dot_vj = vj[0] * (-ax) + vj[1] * (-ay)
+                j_is_u = abs(dot_uj) >= abs(dot_vj)
+                dot_j = dot_uj if j_is_u else dot_vj
+
+                cur_hi = 0.5 * float(bi["width"] if i_is_u else bi["height"])
+                raw_hi = 0.5 * float(bi.get("raw_width", bi["width"]) if i_is_u else bi.get("raw_height", bi["height"]))
+                slack_i = max(0.0, cur_hi - raw_hi)
+
+                cur_hj = 0.5 * float(bj["width"] if j_is_u else bj["height"])
+                raw_hj = 0.5 * float(bj.get("raw_width", bj["width"]) if j_is_u else bj.get("raw_height", bj["height"]))
+                slack_j = max(0.0, cur_hj - raw_hj)
+
+                needed = min_pen + 0.5
+                tot_slack = slack_i + slack_j
+                if tot_slack > 1e-3:
+                    share_i = needed * (slack_i / tot_slack)
+                    share_j = needed * (slack_j / tot_slack)
+                else:
+                    share_i = needed * 0.5
+                    share_j = needed * 0.5
+
+                trim_i = share_i / max(0.5, abs(dot_i))
+                trim_j = share_j / max(0.5, abs(dot_j))
+
+                t1 = _trim_box_face(bi, i_is_u, dot_i >= 0.0, trim_i)
+                t2 = _trim_box_face(bj, j_is_u, dot_j >= 0.0, trim_j)
+                if t1 > 0.0 or t2 > 0.0:
+                    changed = True
+        if not changed:
+            break
+
+    # Stage 2: Strict exact-intersection safety fallback
+    for i in range(len(resolved)):
+        for j in range(i + 1, len(resolved)):
+            bi = resolved[i]
+            bj = resolved[j]
+            for _ in range(25):
+                if compute_rotated_box_overlap_area(bi, bj, use_raw=False) <= 0.0:
+                    break
+                for b in (bi, bj):
+                    b["width"] = max(24.0, float(b["width"]) * 0.98)
+                    b["height"] = max(24.0, float(b["height"]) * 0.98)
+
+    for b in resolved:
+        b["cx"] = round(max(0.0, min(float(page_w), float(b["cx"]))), 2)
+        b["cy"] = round(max(0.0, min(float(page_h), float(b["cy"]))), 2)
+        b["width"] = round(max(24.0, float(b["width"])), 2)
+        b["height"] = round(max(24.0, float(b["height"])), 2)
+
+    # Final post-rounding safety check so overlap_area is strictly 0.0
+    for i in range(len(resolved)):
+        for j in range(i + 1, len(resolved)):
+            bi = resolved[i]
+            bj = resolved[j]
+            for _ in range(10):
+                if compute_rotated_box_overlap_area(bi, bj, use_raw=False) <= 0.0:
+                    break
+                for b in (bi, bj):
+                    b["width"] = round(max(24.0, float(b["width"]) - 0.5), 2)
+                    b["height"] = round(max(24.0, float(b["height"]) - 0.5), 2)
+
+    return resolved
 
 
 def detect_cards_on_page(
@@ -703,6 +900,13 @@ def detect_cards_on_page(
 
     if not best_kept:
         return []
+
+    best_kept = _resolve_box_overlaps(
+        best_kept,
+        w,
+        h,
+        min_gap_px=max(2.0, min(6.0, 0.002 * float(min(w, h)))),
+    )
 
     med_h = float(np.median([b["height"] for b in best_kept]))
     row_band = max(40.0, 0.55 * med_h)
@@ -1232,8 +1436,10 @@ def stage_flatbed_pdfs_for_review(
             num_pages = len(doc)
             max_pt_dim = 0.0
             if num_pages >= 2:
-                r0 = doc.load_page(0).rect
-                max_pt_dim = max(float(r0.width), float(r0.height))
+                max_pt_dim = max(
+                    max(float(doc.load_page(i).rect.width), float(doc.load_page(i).rect.height))
+                    for i in range(num_pages)
+                )
             doc.close()
         except Exception:
             continue
@@ -1248,9 +1454,13 @@ def stage_flatbed_pdfs_for_review(
                 continue
 
             f_boxes = detect_cards_on_page(p1_img, profile=profile)
-            if len(f_boxes) < 2:
-                continue
             b_boxes = detect_cards_on_page(p2_img, profile=profile)
+            if num_pages == 2 and len(f_boxes) < 2 and len(b_boxes) < 2:
+                continue
+            if not f_boxes and not b_boxes:
+                continue
+            if not f_boxes:
+                f_boxes = copy.deepcopy(b_boxes)
             if not b_boxes:
                 b_boxes = copy.deepcopy(f_boxes)
 

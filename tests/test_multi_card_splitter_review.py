@@ -415,6 +415,158 @@ class MultiCardSplitterReviewTests(unittest.TestCase):
         boxes = self.fs.detect_cards_on_page(Image.fromarray(canvas, mode="RGB"), profile=profile)
         self.assertEqual(len(boxes), 3, f"Expected 3 cards inside white lid + black bezel, got {len(boxes)}: {boxes}")
 
+    def test_tight_grid_boxes_never_overlap_and_deduplicate_high_iou(self):
+        """Tightly spaced 3x3 grid & rotated grid must have zero inter-box overlap and deduplicate high-IoU boxes."""
+        # Direct unit check for _is_duplicate_box on high-IoU / nested detections
+        base = {"cx": 300.0, "cy": 400.0, "width": 230.0, "height": 320.0, "raw_width": 200.0, "raw_height": 280.0, "angle_deg": 2.0}
+        near_dup = {"cx": 315.0, "cy": 410.0, "width": 225.0, "height": 315.0, "raw_width": 195.0, "raw_height": 275.0, "angle_deg": 2.5}
+        nested_dup = {"cx": 305.0, "cy": 405.0, "width": 180.0, "height": 240.0, "raw_width": 160.0, "raw_height": 210.0, "angle_deg": 1.0}
+        neighbor = {"cx": 560.0, "cy": 400.0, "width": 230.0, "height": 320.0, "raw_width": 200.0, "raw_height": 280.0, "angle_deg": 0.0}
+        self.assertTrue(self.fs._is_duplicate_box(base, near_dup))
+        self.assertTrue(self.fs._is_duplicate_box(base, nested_dup))
+        self.assertFalse(self.fs._is_duplicate_box(base, neighbor))
+
+        profile = self.fs.load_splitter_profile(self.profile_path)
+        # Tight 3x3 axis-aligned grid where naive 7.5%/6.5% padding would overlap
+        tight_specs = []
+        colors = [
+            (200, 50, 50), (50, 175, 70), (50, 90, 210),
+            (215, 160, 40), (170, 55, 195), (45, 175, 185),
+            (210, 95, 50), (120, 185, 55), (90, 110, 215),
+        ]
+        idx = 0
+        for row in range(3):
+            for col in range(3):
+                tight_specs.append({
+                    "cx": 260 + col * 245,
+                    "cy": 280 + row * 335,
+                    "w": 225,
+                    "h": 310,
+                    "angle": 0.0 if (row + col) % 2 == 0 else 1.5,
+                    "rgb": colors[idx],
+                })
+                idx += 1
+
+        page_img = _synthesize_flatbed_page(tight_specs, page_size=(1020, 1260))
+        boxes = self.fs.detect_cards_on_page(page_img, profile=profile)
+        self.assertEqual(len(boxes), 9, f"Expected 9 cards on tight 3x3 grid, got {len(boxes)}")
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                oa = self.fs.compute_rotated_box_overlap_area(boxes[i], boxes[j], use_raw=False)
+                self.assertEqual(oa, 0.0, f"Boxes {i + 1} and {j + 1} overlapped by {oa} px^2")
+
+    def test_expand_flatbed_pdfs_splits_all_sheet_pairs_in_multipage_pdf(self):
+        """Multi-sheet flatbed PDF (6 pages = 3 sheet pairs) must split ALL pairs, not just pages 0-1."""
+        import fitz
+        import Core.vision_grader as vg
+
+        batch_dir = self.root / "MultiSheetBatch"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = batch_dir / "multi_sheet_scan.pdf"
+
+        sheet_layouts = [
+            [  # Sheet 1 (p0-1): 3 cards
+                {"cx": 280, "cy": 380, "w": 210, "h": 295, "angle": 0.0, "rgb": (200, 45, 45)},
+                {"cx": 600, "cy": 380, "w": 210, "h": 295, "angle": 0.0, "rgb": (45, 170, 65)},
+                {"cx": 920, "cy": 380, "w": 210, "h": 295, "angle": 0.0, "rgb": (45, 85, 210)},
+            ],
+            [  # Sheet 2 (p2-3): 4 cards
+                {"cx": 300, "cy": 360, "w": 210, "h": 295, "angle": 0.0, "rgb": (210, 150, 35)},
+                {"cx": 860, "cy": 360, "w": 210, "h": 295, "angle": 0.0, "rgb": (165, 50, 190)},
+                {"cx": 300, "cy": 1080, "w": 210, "h": 295, "angle": 0.0, "rgb": (40, 175, 185)},
+                {"cx": 860, "cy": 1080, "w": 210, "h": 295, "angle": 0.0, "rgb": (210, 95, 50)},
+            ],
+            [  # Sheet 3 (p4-5): 2 cards
+                {"cx": 330, "cy": 600, "w": 210, "h": 295, "angle": 0.0, "rgb": (110, 180, 50)},
+                {"cx": 850, "cy": 600, "w": 210, "h": 295, "angle": 0.0, "rgb": (95, 95, 215)},
+            ],
+        ]
+
+        doc = fitz.open()
+        for specs in sheet_layouts:
+            for _side in range(2):
+                im = _synthesize_flatbed_page(specs, page_size=(1200, 1500))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=92)
+                w_pt, h_pt = 612.0, 792.0  # US Letter (> 420pt flatbed threshold)
+                page = doc.new_page(width=w_pt, height=h_pt)
+                page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), stream=buf.getvalue())
+        doc.save(str(pdf_path))
+        doc.close()
+
+        with mock.patch.dict(vg.RUNTIME_CONFIG, {"scanner_dpi": 150}), \
+             mock.patch.object(self.fs, "SPLITTER_LEARNING_PROFILE_FILE", self.profile_path):
+            final_pdfs, created_count = vg.expand_flatbed_pdfs_in_batch_folder(
+                batch_dir,
+                stage_for_review=False,
+                profile_path=self.profile_path,
+            )
+
+        self.assertEqual(created_count, 9)
+        self.assertEqual(len(final_pdfs), 9)
+        self.assertTrue((batch_dir / "Archive_Flatbed_Sheets" / "multi_sheet_scan.pdf").exists())
+        expected_names = [
+            "multi_sheet_scan_s01_FBCard01.pdf",
+            "multi_sheet_scan_s01_FBCard02.pdf",
+            "multi_sheet_scan_s01_FBCard03.pdf",
+            "multi_sheet_scan_s02_FBCard01.pdf",
+            "multi_sheet_scan_s02_FBCard02.pdf",
+            "multi_sheet_scan_s02_FBCard03.pdf",
+            "multi_sheet_scan_s02_FBCard04.pdf",
+            "multi_sheet_scan_s03_FBCard01.pdf",
+            "multi_sheet_scan_s03_FBCard02.pdf",
+        ]
+        for name in expected_names:
+            out_p = batch_dir / name
+            self.assertTrue(out_p.exists(), f"Missing split output {name}")
+            d = fitz.open(str(out_p))
+            self.assertEqual(len(d), 2)
+            d.close()
+
+    def test_fixture_multicard_pdf_all_sheets_and_zero_overlaps(self):
+        """Verify real multi-sheet fixture PDF has zero overlapping boxes on all 8 pages and splits all 4 sheet pairs."""
+        import shutil
+        import fitz
+        import Core.vision_grader as vg
+
+        fixture_pdf = REPO_ROOT / "tests" / "fixtures" / "multicard_pdfs" / "Combined Test Batch (Scanned 061826).pdf"
+        if not fixture_pdf.exists():
+            self.skipTest("Fixture multi-card PDF not present")
+
+        # Check zero overlaps on all 8 pages
+        profile = self.fs.load_splitter_profile(self.profile_path)
+        doc = fitz.open(str(fixture_pdf))
+        self.assertEqual(len(doc), 8)
+        expected_counts = [9, 9, 6, 6, 6, 6, 6, 6]
+        for page_idx in range(len(doc)):
+            pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(200.0 / 72.0, 200.0 / 72.0), alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            boxes = self.fs.detect_cards_on_page(img, profile=profile)
+            self.assertEqual(len(boxes), expected_counts[page_idx], f"Page {page_idx} box count mismatch")
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    oa = self.fs.compute_rotated_box_overlap_area(boxes[i], boxes[j], use_raw=False)
+                    self.assertEqual(oa, 0.0, f"Page {page_idx} boxes {i + 1} & {j + 1} overlap by {oa}")
+        doc.close()
+
+        # Copy fixture to isolated temp dir and verify full 4-sheet immediate split (9 + 6 + 6 + 6 = 27 cards)
+        batch_dir = self.root / "FixtureBatch"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        temp_pdf = batch_dir / fixture_pdf.name
+        shutil.copy2(fixture_pdf, temp_pdf)
+
+        with mock.patch.dict(vg.RUNTIME_CONFIG, {"scanner_dpi": 150}), \
+             mock.patch.object(self.fs, "SPLITTER_LEARNING_PROFILE_FILE", self.profile_path):
+            final_pdfs, created_count = vg.expand_flatbed_pdfs_in_batch_folder(
+                batch_dir,
+                stage_for_review=False,
+                profile_path=self.profile_path,
+            )
+
+        self.assertEqual(created_count, 27)
+        self.assertEqual(len(final_pdfs), 27)
+        self.assertTrue((batch_dir / "Archive_Flatbed_Sheets" / fixture_pdf.name).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

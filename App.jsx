@@ -4114,6 +4114,124 @@ function normalizeSplitterBoxes(boxes) {
   });
 }
 
+function resolveSplitterBoxOverlaps(boxes, gapPx = 3) {
+  if (!Array.isArray(boxes) || boxes.length < 2) return boxes || [];
+  const res = boxes.map((b) => ({ ...b }));
+  const gap = Math.max(2, Number(gapPx) || 3);
+
+  const obbAxesAndCorners = (b) => {
+    const theta = ((Number(b.angle_deg) || 0) * Math.PI) / 180;
+    const ux = Math.cos(theta);
+    const uy = Math.sin(theta);
+    const vx = -Math.sin(theta);
+    const vy = Math.cos(theta);
+    const hw = Number(b.width) * 0.5;
+    const hh = Number(b.height) * 0.5;
+    const cx = Number(b.cx);
+    const cy = Number(b.cy);
+    const corners = [];
+    for (const sx of [-1, 1]) {
+      for (const sy of [-1, 1]) {
+        corners.push([cx + sx * hw * ux + sy * hh * vx, cy + sx * hw * uy + sy * hh * vy]);
+      }
+    }
+    return { u: [ux, uy], v: [vx, vy], corners };
+  };
+
+  const trimFace = (b, axisIsU, posSide, trimPx) => {
+    if (trimPx <= 0) return 0;
+    const theta = ((Number(b.angle_deg) || 0) * Math.PI) / 180;
+    const curDim = Number(axisIsU ? b.width : b.height);
+    const rawDim = Number(axisIsU ? (b.raw_width ?? curDim) : (b.raw_height ?? curDim));
+    const minDim = Math.max(24, 0.35 * rawDim);
+    const maxTrim = Math.max(0, curDim - minDim);
+    const actualTrim = Math.min(trimPx, maxTrim);
+    if (actualTrim <= 0) return 0;
+    const shift = posSide ? -0.5 * actualTrim : 0.5 * actualTrim;
+    if (axisIsU) {
+      b.width = Number((curDim - actualTrim).toFixed(2));
+      b.cx = Number((Number(b.cx) + shift * Math.cos(theta)).toFixed(2));
+      b.cy = Number((Number(b.cy) + shift * Math.sin(theta)).toFixed(2));
+    } else {
+      b.height = Number((curDim - actualTrim).toFixed(2));
+      b.cx = Number((Number(b.cx) - shift * Math.sin(theta)).toFixed(2));
+      b.cy = Number((Number(b.cy) + shift * Math.cos(theta)).toFixed(2));
+    }
+    return actualTrim;
+  };
+
+  for (let pass = 0; pass < 12; pass += 1) {
+    let changed = false;
+    for (let i = 0; i < res.length; i += 1) {
+      for (let j = i + 1; j < res.length; j += 1) {
+        const bi = res[i];
+        const bj = res[j];
+        const gi = obbAxesAndCorners(bi);
+        const gj = obbAxesAndCorners(bj);
+        let minPen = Infinity;
+        let bestAxis = null;
+        let separated = false;
+        for (const [ax, ay] of [gi.u, gi.v, gj.u, gj.v]) {
+          let minI = Infinity, maxI = -Infinity;
+          for (const [px, py] of gi.corners) {
+            const p = px * ax + py * ay;
+            if (p < minI) minI = p;
+            if (p > maxI) maxI = p;
+          }
+          let minJ = Infinity, maxJ = -Infinity;
+          for (const [px, py] of gj.corners) {
+            const p = px * ax + py * ay;
+            if (p < minJ) minJ = p;
+            if (p > maxJ) maxJ = p;
+          }
+          const pen = Math.min(maxI, maxJ) - Math.max(minI, minJ) + gap;
+          if (pen <= 0) {
+            separated = true;
+            break;
+          }
+          if (pen < minPen) {
+            minPen = pen;
+            bestAxis = [ax, ay];
+          }
+        }
+        if (separated || !bestAxis || minPen <= 0) continue;
+        let [ax, ay] = bestAxis;
+        if ((bj.cx - bi.cx) * ax + (bj.cy - bi.cy) * ay < 0) {
+          ax = -ax;
+          ay = -ay;
+        }
+        const dotUi = gi.u[0] * ax + gi.u[1] * ay;
+        const dotVi = gi.v[0] * ax + gi.v[1] * ay;
+        const iIsU = Math.abs(dotUi) >= Math.abs(dotVi);
+        const dotI = iIsU ? dotUi : dotVi;
+
+        const dotUj = gj.u[0] * (-ax) + gj.u[1] * (-ay);
+        const dotVj = gj.v[0] * (-ax) + gj.v[1] * (-ay);
+        const jIsU = Math.abs(dotUj) >= Math.abs(dotVj);
+        const dotJ = jIsU ? dotUj : dotVj;
+
+        const curHi = 0.5 * Number(iIsU ? bi.width : bi.height);
+        const rawHi = 0.5 * Number(iIsU ? (bi.raw_width ?? bi.width) : (bi.raw_height ?? bi.height));
+        const slackI = Math.max(0, curHi - rawHi);
+        const curHj = 0.5 * Number(jIsU ? bj.width : bj.height);
+        const rawHj = 0.5 * Number(jIsU ? (bj.raw_width ?? bj.width) : (bj.raw_height ?? bj.height));
+        const slackJ = Math.max(0, curHj - rawHj);
+
+        const needed = minPen + 0.5;
+        const totSlack = slackI + slackJ;
+        const shareI = totSlack > 1e-3 ? needed * (slackI / totSlack) : needed * 0.5;
+        const shareJ = totSlack > 1e-3 ? needed * (slackJ / totSlack) : needed * 0.5;
+
+        const t1 = trimFace(bi, iIsU, dotI >= 0, shareI / Math.max(0.5, Math.abs(dotI)));
+        const t2 = trimFace(bj, jIsU, dotJ >= 0, shareJ / Math.max(0.5, Math.abs(dotJ)));
+        if (t1 > 0 || t2 > 0) changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return res;
+}
+
 function MultiCardSplitterReviewStudio({
   pendingItems,
   learningProfile,
@@ -4167,8 +4285,8 @@ function MultiCardSplitterReviewStudio({
       setBackBoxes([]);
       return;
     }
-    setFrontBoxes(normalizeSplitterBoxes(currentItem.proposed_front_boxes));
-    setBackBoxes(normalizeSplitterBoxes(currentItem.proposed_back_boxes));
+    setFrontBoxes(resolveSplitterBoxOverlaps(normalizeSplitterBoxes(currentItem.proposed_front_boxes)));
+    setBackBoxes(resolveSplitterBoxOverlaps(normalizeSplitterBoxes(currentItem.proposed_back_boxes)));
     const fs = Array.isArray(currentItem.front_size) && currentItem.front_size.length === 2
       ? { w: Math.max(100, Number(currentItem.front_size[0])), h: Math.max(100, Number(currentItem.front_size[1])) }
       : { w: 1700, h: 2200 };
