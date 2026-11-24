@@ -16,7 +16,9 @@ const CHROME_PULSE_SKINS = {
   screenshot_signature_3d: {
     name: 'Chrome-Pulse 3D (Default)',
     tagline: 'Midnight Navy & Emerald/Cyan beveled 3D depth',
+    description: 'Midnight Navy & Emerald/Cyan beveled 3D depth with luminous cyan glass cards and crisp telemetry highlights.',
     swatch: 'linear-gradient(135deg, #10b981, #06b6d4)',
+    swatches: ['#10b981', '#06b6d4', '#101829', '#080d18'],
     appBg: 'bg-gradient-to-b from-[#080d18] via-[#060a12] to-[#04070d]',
     railBg: 'bg-gradient-to-b from-[#0b1220]/95 to-[#060a12]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#101829]/95 to-[#0a101d]/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(6,182,212,0.28)]',
@@ -30,7 +32,9 @@ const CHROME_PULSE_SKINS = {
   classic_bronze_3d: {
     name: 'Classic Warm Bronze & Obsidian 3D',
     tagline: 'Warm amber-bronze accents paired with deep obsidian-cyan',
+    description: 'Warm amber-bronze workbench accents paired with deep obsidian-cyan 3D surfaces and metallic trim.',
     swatch: 'linear-gradient(135deg, #f59e0b, #06b6d4)',
+    swatches: ['#f59e0b', '#06b6d4', '#1e1609', '#0a101f'],
     appBg: 'bg-gradient-to-b from-[#141008] via-[#0a101f] to-[#04070d]',
     railBg: 'bg-gradient-to-b from-[#1a1206]/95 to-[#080d19]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#1e1609]/95 to-[#0d1322]/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(245,158,11,0.25)]',
@@ -44,7 +48,9 @@ const CHROME_PULSE_SKINS = {
   superfractor_gold: {
     name: 'Superfractor 1/1 (Gold Foil & Carbon)',
     tagline: 'Brushed carbon slate with metallic 24k gold foil trim',
+    description: 'Inspired by Topps 1/1 Superfractors — brushed carbon slate surfaces with radiant 24k gold foil trim.',
     swatch: 'linear-gradient(135deg, #eab308, #fde047)',
+    swatches: ['#eab308', '#fde047', '#27272a', '#0c0c0e'],
     appBg: 'bg-gradient-to-b from-[#121216] via-[#0c0c0e] to-[#08080a]',
     railBg: 'bg-gradient-to-b from-[#141004]/95 to-[#08080a]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-br from-zinc-900/95 to-neutral-950/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(234,179,8,0.28)]',
@@ -58,7 +64,9 @@ const CHROME_PULSE_SKINS = {
   sapphire_edition: {
     name: 'Topps Sapphire Chrome (Cracked Ice)',
     tagline: 'Deep crystalline sapphire blue with ice-blue refractor borders',
+    description: 'Deep crystalline sapphire blue backdrop with ice-blue refractor borders and prismatic 3D card depth.',
     swatch: 'linear-gradient(135deg, #38bdf8, #3b82f6)',
+    swatches: ['#38bdf8', '#3b82f6', '#0b1f4a', '#040d21'],
     appBg: 'bg-gradient-to-b from-[#061330] via-[#040d21] to-[#030917]',
     railBg: 'bg-gradient-to-b from-[#08193d]/95 to-[#030917]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#0b1f4a]/95 to-[#06122e]/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(56,189,248,0.32)]',
@@ -72,7 +80,9 @@ const CHROME_PULSE_SKINS = {
   quant_terminal: {
     name: 'Quant Drop Terminal (OLED Pro)',
     tagline: 'Pitch-black OLED institutional terminal & neon telemetry',
+    description: 'Pitch-black OLED institutional trading terminal with high-contrast emerald & amber neon telemetry.',
     swatch: 'linear-gradient(135deg, #10b981, #f59e0b)',
+    swatches: ['#10b981', '#f59e0b', '#070d14', '#020408'],
     appBg: 'bg-[#020408]',
     railBg: 'bg-black/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#070d14] to-[#04070b] shadow-[0_10px_30px_-10px_rgba(16,185,129,0.25)]',
@@ -86,7 +96,9 @@ const CHROME_PULSE_SKINS = {
   finest_refractor: {
     name: "Finest '93 Refractor (Holo Prism)",
     tagline: '90s Topps Finest violet-indigo glass with fuchsia-cyan holo sheen',
+    description: '90s Topps Finest Refractor — violet-indigo glass surfaces with fuchsia-cyan holographic prism sheen.',
     swatch: 'linear-gradient(135deg, #e879f9, #22d3ee)',
+    swatches: ['#e879f9', '#22d3ee', '#1b1038', '#0c061a'],
     appBg: 'bg-gradient-to-br from-[#120924] via-[#0c061a] to-[#070310]',
     railBg: 'bg-gradient-to-b from-[#160b2b]/95 to-[#080412]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#1b1038]/90 to-[#110924]/90 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(232,121,249,0.30)]',
@@ -100,7 +112,9 @@ const CHROME_PULSE_SKINS = {
   stadium_club: {
     name: 'Stadium Club Modern (Slate & Crimson)',
     tagline: 'Brushed zinc-slate 3D surfaces with iconic Topps crimson-red',
+    description: 'Luxury collector suite — brushed zinc-slate 3D surfaces with iconic Topps crimson-red accents.',
     swatch: 'linear-gradient(135deg, #f43f5e, #38bdf8)',
+    swatches: ['#f43f5e', '#38bdf8', '#27272a', '#09090b'],
     appBg: 'bg-gradient-to-b from-zinc-900 via-zinc-950 to-[#09090b]',
     railBg: 'bg-gradient-to-b from-zinc-900/95 to-zinc-950/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-zinc-900/95 to-zinc-950/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(244,63,94,0.28)]',
@@ -114,7 +128,9 @@ const CHROME_PULSE_SKINS = {
   bowman_turf_3d: {
     name: 'Bowman Draft Emerald Turf 3D',
     tagline: 'Deep stadium forest-emerald 3D surfaces with lime-gold highlights',
+    description: 'Deep stadium forest-emerald 3D surfaces with crisp diamond-white text and lime-gold highlights.',
     swatch: 'linear-gradient(135deg, #34d399, #a3e635)',
+    swatches: ['#34d399', '#a3e635', '#09261b', '#04140e'],
     appBg: 'bg-gradient-to-b from-[#061a12] via-[#04140e] to-[#030d09]',
     railBg: 'bg-gradient-to-b from-[#061c13]/95 to-[#03100b]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#09261b]/95 to-[#051710]/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(52,211,153,0.28)]',
@@ -128,7 +144,9 @@ const CHROME_PULSE_SKINS = {
   cosmic_chrome_3d: {
     name: 'Cosmic Chrome Nebula 3D',
     tagline: 'Deep-space ultraviolet & electric cyan planetary glow',
+    description: 'Deep-space ultraviolet & electric cyan planetary glow with elevated nebula glass cards.',
     swatch: 'linear-gradient(135deg, #818cf8, #22d3ee)',
+    swatches: ['#818cf8', '#22d3ee', '#121036', '#070617'],
     appBg: 'bg-gradient-to-b from-[#0b0924] via-[#070617] to-[#04030e]',
     railBg: 'bg-gradient-to-b from-[#0f0c2e]/95 to-[#060514]/95 backdrop-blur-xl',
     cardBg: 'bg-gradient-to-b from-[#121036]/95 to-[#0a0821]/95 backdrop-blur-md shadow-[0_10px_30px_-10px_rgba(129,140,248,0.32)]',
@@ -3943,13 +3961,11 @@ function MultiSelectFilter({ label, options, selected, onChange, searchable = fa
 
 export default function App() {
   const [skinKey, setSkinKey] = useState(() => resolveChromePulseSkinKey(localStorage.getItem('tabulas_skin')));
-  const skin = CHROME_PULSE_SKINS[skinKey] || CHROME_PULSE_SKINS.screenshot_signature_3d;
   const [devMode, setDevMode] = useState(() => localStorage.getItem('tabulas_dev_mode') === 'true');
 
   const [activePage, setActivePage] = useState('dashboard');
   const [navPinned, setNavPinned] = useState(false);
   const [navHovered, setNavHovered] = useState(false);
-  const [hoveredCatId, setHoveredCatId] = useState(null);
   const [unlockedHiddenPages, setUnlockedHiddenPages] = useState({});
 
   const activeCategoryId = useMemo(
@@ -4125,18 +4141,69 @@ export default function App() {
   const [pendingRestartRequired, setPendingRestartRequired] = useState(false);
   const [copiedNotifId, setCopiedNotifId] = useState('');
   const [showSkinPopover, setShowSkinPopover] = useState(false);
+  const [selectedSkinKey, setSelectedSkinKey] = useState(skinKey);
+  const [hoveredSkinKey, setHoveredSkinKey] = useState(null);
   const [toggledCats, setToggledCats] = useState({});
   const skinPopoverRef = useRef(null);
+  const skinRailRef = useRef(null);
+
+  const activePreviewSkinKey = showSkinPopover ? (hoveredSkinKey || selectedSkinKey || skinKey) : skinKey;
+  const skin = CHROME_PULSE_SKINS[activePreviewSkinKey] || CHROME_PULSE_SKINS.screenshot_signature_3d;
+
+  const openSkinRail = () => {
+    setSelectedSkinKey(skinKey);
+    setHoveredSkinKey(null);
+    setShowSkinPopover(true);
+  };
+  const cancelSkinRail = () => {
+    setHoveredSkinKey(null);
+    setSelectedSkinKey(skinKey);
+    setShowSkinPopover(false);
+  };
+  const applySkinRail = () => {
+    changeSkin(selectedSkinKey || skinKey);
+    setHoveredSkinKey(null);
+    setShowSkinPopover(false);
+  };
+  const toggleSkinRail = () => {
+    if (showSkinPopover) {
+      cancelSkinRail();
+    } else {
+      openSkinRail();
+    }
+  };
 
   useEffect(() => {
+    if (!activeCategoryId) return;
+    setToggledCats((prev) => {
+      if (prev[activeCategoryId] === undefined) return prev;
+      const next = { ...prev };
+      delete next[activeCategoryId];
+      return next;
+    });
+  }, [activeCategoryId]);
+
+  useEffect(() => {
+    if (!showSkinPopover) return;
     const onOutsideSkinClick = (e) => {
-      if (showSkinPopover && skinPopoverRef.current && !skinPopoverRef.current.contains(e.target)) {
-        setShowSkinPopover(false);
+      const inTrigger = skinPopoverRef.current && skinPopoverRef.current.contains(e.target);
+      const inRail = skinRailRef.current && skinRailRef.current.contains(e.target);
+      if (!inTrigger && !inRail) {
+        cancelSkinRail();
+      }
+    };
+    const onEscapeKey = (e) => {
+      if (e.key === 'Escape') {
+        cancelSkinRail();
       }
     };
     document.addEventListener('mousedown', onOutsideSkinClick);
-    return () => document.removeEventListener('mousedown', onOutsideSkinClick);
-  }, [showSkinPopover]);
+    document.addEventListener('keydown', onEscapeKey);
+    return () => {
+      document.removeEventListener('mousedown', onOutsideSkinClick);
+      document.removeEventListener('keydown', onEscapeKey);
+    };
+  }, [showSkinPopover, skinKey]);
   const [alertCfg, setAlertCfg] = useState({
     min_grade_net_gain: 15.0, min_grade_roi_pct: 35.0, price_spike_pct: 25.0,
     email_enabled: false, delivery_method: 'ntfy_topic', ntfy_topic: 'tabulas_mroux_cards',
@@ -6013,13 +6080,13 @@ export default function App() {
       {/* LEFT CHROME-PULSE AUTO-COLLAPSING & PINNABLE NAVIGATION RAIL */}
       <div
         onMouseEnter={() => setNavHovered(true)}
-        onMouseLeave={() => { setNavHovered(false); setHoveredCatId(null); if (!showSkinPopover) setToggledCats({}); }}
+        onMouseLeave={() => { setNavHovered(false); if (!navPinned && !showSkinPopover) setToggledCats({}); }}
         className={`relative z-30 h-full shrink-0 transition-all duration-200 ease-out ${navPinned ? 'w-64' : 'w-[74px]'}`}
       >
         <aside
           className={`h-full ${skin.railBg} border-r ${skin.border} flex flex-col transition-all duration-200 ease-out shadow-2xl ${
             navExpanded ? 'w-64' : 'w-[74px]'
-          } ${!navPinned && navHovered ? 'absolute left-0 top-0 bottom-0 z-40' : 'relative'}`}
+          } ${!navPinned && (navHovered || showSkinPopover) ? 'absolute left-0 top-0 bottom-0 z-40' : 'relative'}`}
         >
           <div className={`px-2.5 py-2.5 border-b ${skin.border} flex items-center ${navExpanded ? 'justify-between gap-2' : 'justify-center'} shrink-0`}>
             <button
@@ -6059,23 +6126,16 @@ export default function App() {
                 return true;
               });
               const isCatActive = cat.id === activeCategoryId;
-              const isCatExpanded = navExpanded && (toggledCats[cat.id] !== undefined ? toggledCats[cat.id] : (isCatActive || hoveredCatId === cat.id));
+              const isCatExpanded = navExpanded && (toggledCats[cat.id] !== undefined ? toggledCats[cat.id] : isCatActive);
               const catBadge =
                 cat.id === 'inventory_mgmt' && batches.length > 0 ? batches.length :
                 cat.id === 'sales_hub' && gradingCandidates.length > 0 ? gradingCandidates.length :
                 cat.id === 'settings' && updaterInfo.pending_count > 0 ? updaterInfo.pending_count : 0;
 
               return (
-                <div key={cat.id} onMouseEnter={() => setHoveredCatId(cat.id)} className="space-y-1">
+                <div key={cat.id} className="space-y-1">
                   <button
-                    onClick={() => {
-                      if (!isCatActive && visibleItems[0]) {
-                        setActivePage(visibleItems[0].id);
-                        setToggledCats({ [cat.id]: true });
-                      } else {
-                        setToggledCats({ [cat.id]: !isCatExpanded });
-                      }
-                    }}
+                    onClick={() => setToggledCats((prev) => ({ ...prev, [cat.id]: !isCatExpanded }))}
                     className={`relative w-full flex items-center ${navExpanded ? 'justify-between px-2' : 'justify-center'} py-1.5 rounded-xl border transition-all duration-150 ${
                       isCatActive ? `${skin.accentActive} shadow-md border-l-4` : 'border-transparent hover:bg-slate-800/70 text-slate-300'
                     }`}
@@ -6140,8 +6200,9 @@ export default function App() {
 
           <div ref={skinPopoverRef} className={`relative p-2.5 border-t ${skin.border} shrink-0`}>
             <button
-              onClick={() => setShowSkinPopover((prev) => !prev)}
-              title={`Switch Chrome-Pulse Skin (Current: ${skin.name})`}
+              type="button"
+              onClick={toggleSkinRail}
+              title={`Skins & 3D Themes (Current: ${skin.name})`}
               className={`w-full flex items-center ${navExpanded ? 'justify-between px-2.5 py-2' : 'justify-center py-1.5'} rounded-xl border transition-all ${
                 showSkinPopover ? skin.accentActive : 'bg-slate-950/70 hover:bg-slate-800/80 border-slate-700/80 text-slate-200'
               }`}
@@ -6154,49 +6215,108 @@ export default function App() {
                   🎨
                 </div>
                 {navExpanded && (
-                  <div className="text-left min-w-0 flex-1">
-                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Theme Skin</div>
-                    <div className={`text-[11px] font-bold leading-tight whitespace-normal break-words ${skin.accentText}`}>{skin.name}</div>
-                  </div>
+                  <span className="text-xs font-bold text-slate-100 truncate">Skins &amp; 3D Themes</span>
                 )}
               </div>
-              {navExpanded && <span className="text-xs opacity-70">{showSkinPopover ? '▲' : '▼'}</span>}
+              {navExpanded && (
+                <span className={`text-xs font-extrabold px-1.5 py-0.5 rounded-md ${skin.accentText}`}>
+                  {Object.keys(CHROME_PULSE_SKINS).length}
+                </span>
+              )}
             </button>
-
-            {showSkinPopover && (
-              <div className="absolute left-full bottom-0 pl-2 z-50">
-                <div className="w-80 bg-slate-900/95 backdrop-blur-xl border border-slate-700 rounded-2xl shadow-2xl p-3 space-y-2">
-                  <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
-                    <span className="text-xs font-bold text-white">🎨 Chrome-Pulse 3D Skins (9)</span>
-                    <button onClick={() => setShowSkinPopover(false)} className="text-[10px] text-slate-400 hover:text-white">✖</button>
-                  </div>
-                  <div className="grid grid-cols-1 gap-1.5 max-h-80 overflow-y-auto pr-0.5">
-                    {Object.entries(CHROME_PULSE_SKINS).map(([k, sObj]) => {
-                      const isSelSkin = skinKey === k;
-                      return (
-                        <button
-                          key={k}
-                          onClick={() => { changeSkin(k); setShowSkinPopover(false); }}
-                          className={`w-full flex items-center justify-between px-2.5 py-2 rounded-xl border text-left transition ${
-                            isSelSkin ? `${sObj.accentActive} border-2` : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:bg-slate-800/80'
-                          }`}
-                        >
-                          <span className="flex items-center gap-2.5 min-w-0">
-                            <span className="w-4 h-4 rounded-full shadow ring-1 ring-white/40 shrink-0" style={{ background: sObj.swatch }} />
-                            <span className="min-w-0">
-                              <span className="block text-xs font-bold truncate">{sObj.name}</span>
-                              {sObj.tagline && <span className="block text-[9.5px] text-slate-400 truncate">{sObj.tagline}</span>}
-                            </span>
-                          </span>
-                          {isSelSkin && <span className="text-xs font-bold shrink-0 ml-1">✓</span>}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
+
+          {showSkinPopover && (
+            <div
+              ref={skinRailRef}
+              className="absolute left-full top-0 bottom-0 z-50 h-full w-[340px] bg-[#060b16]/98 backdrop-blur-2xl border-r border-white/15 shadow-[20px_0_50px_rgba(0,0,0,0.75)] flex flex-col"
+            >
+              {/* Header */}
+              <div className="px-4 py-3.5 border-b border-white/10 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-2">
+                  <svg className="w-4 h-4 text-amber-300 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M12 2l2.1 6.4L20.5 10.5l-6.4 2.1L12 19l-2.1-6.4L3.5 10.5l6.4-2.1L12 2zm7 13l1.1 3.2 3.2 1.1-3.2 1.1L19 23.6l-1.1-3.2-3.2-1.1 3.2-1.1L19 15z" />
+                  </svg>
+                  <span className="text-xs font-extrabold uppercase tracking-wider text-white">3D SKINS RAIL</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={cancelSkinRail}
+                  title="Close 3D Skins Rail"
+                  className="w-7 h-7 rounded-lg flex items-center justify-center text-slate-400 hover:text-white hover:bg-white/10 transition text-base leading-none"
+                >
+                  ×
+                </button>
+              </div>
+
+              {/* Sub-header pill */}
+              <div className="mx-3.5 mt-3 mb-2 px-3.5 py-2 rounded-xl bg-black/50 border border-white/10 flex items-center justify-between shrink-0">
+                <span className="text-[11px] font-medium text-slate-400">Previewing Palette:</span>
+                <span className={`text-[11px] font-extrabold uppercase tracking-wider ${skin.accentText}`}>
+                  {devMode ? 'DEV PALETTE' : 'LIVE PALETTE'}
+                </span>
+              </div>
+
+              {/* Scrollable Skin Cards List */}
+              <div
+                onMouseLeave={() => setHoveredSkinKey(null)}
+                className="flex-1 overflow-y-auto px-3.5 py-1.5 space-y-3"
+              >
+                {Object.entries(CHROME_PULSE_SKINS).map(([k, sObj], idx) => {
+                  const isHighlighted = activePreviewSkinKey === k;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onMouseEnter={() => setHoveredSkinKey(k)}
+                      onClick={() => setSelectedSkinKey(k)}
+                      className={`w-full rounded-2xl p-3.5 text-left transition-all duration-150 ${sObj.cardBg} ${
+                        isHighlighted
+                          ? 'border-2 border-white shadow-[0_0_22px_rgba(255,255,255,0.22)] ring-1 ring-white/40'
+                          : `border ${sObj.border} hover:border-white/50`
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span className={`text-[12px] font-extrabold leading-snug ${sObj.accentText}`}>
+                          {idx + 1}. {sObj.name}
+                        </span>
+                        <span className="flex items-center gap-1.5 shrink-0">
+                          {(sObj.swatches || []).slice(0, 4).map((hex, sIdx) => (
+                            <span
+                              key={sIdx}
+                              className="w-3.5 h-3.5 rounded-full border border-white/25 shadow-sm"
+                              style={{ backgroundColor: hex }}
+                            />
+                          ))}
+                        </span>
+                      </div>
+                      <p className={`text-[11.5px] leading-relaxed whitespace-normal break-words opacity-85 ${sObj.textMain}`}>
+                        {sObj.description || sObj.tagline}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Sticky Footer */}
+              <div className="p-3.5 border-t border-white/10 bg-[#050912]/95 shrink-0 flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={applySkinRail}
+                  className={`flex-1 py-2.5 px-4 rounded-xl text-xs font-extrabold transition ${skin.accentBtn}`}
+                >
+                  Apply Skin
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelSkinRail}
+                  className="flex-1 py-2.5 px-4 rounded-xl text-xs font-bold bg-slate-800/90 hover:bg-slate-700/90 text-slate-200 border border-slate-600/60 transition"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </aside>
       </div>
 
