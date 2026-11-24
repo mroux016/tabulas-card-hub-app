@@ -623,18 +623,43 @@ def _get_cached_inventory_records() -> list[dict]:
 def _get_cached_directory_records() -> list[dict]:
     """mtime-validated in-memory cache for TCDB_Set_Directory.csv."""
     try:
+        from Core.config import normalize_brand_name
+        from Core.scraper_engine import (
+            format_release_date_display,
+            is_pre_release_set,
+            load_tcdb_master_directory,
+            normalize_release_date,
+        )
+
+        def _enrich_dir_rows(raw_rows: list[dict]) -> list[dict]:
+            enriched = []
+            for row in raw_rows:
+                r = dict(row)
+                rel_iso = normalize_release_date(str(r.get("Release_Date") or ""))
+                rel_unrel = str(r.get("Release_Status") or "").strip().lower() == "pre-release"
+                r["Release_Date"] = rel_iso
+                r["Release_Date_Display"] = format_release_date_display(rel_iso)
+                r["Release_Status"] = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else ""
+                r["Manufacturer"] = normalize_brand_name(
+                    str(r.get("Set_Name") or ""),
+                    url=str(r.get("TCDB_URL") or ""),
+                    existing_mfg=str(r.get("Manufacturer") or ""),
+                    category=str(r.get("Category") or ""),
+                )
+                enriched.append(r)
+            return enriched
+
         with _MEM_CACHE_LOCK:
             if MASTER_DIRECTORY_CSV_FILE.exists():
                 mt = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
                 if _DIR_MEM_CACHE["mtime"] == mt and _DIR_MEM_CACHE["rows"]:
-                    return list(_DIR_MEM_CACHE["rows"])
-            from Core.scraper_engine import load_tcdb_master_directory
+                    return _enrich_dir_rows(_DIR_MEM_CACHE["rows"])
             df_dir = load_tcdb_master_directory()
             rows = df_dir.to_dict(orient="records")
             if MASTER_DIRECTORY_CSV_FILE.exists():
                 _DIR_MEM_CACHE["rows"] = rows
                 _DIR_MEM_CACHE["mtime"] = MASTER_DIRECTORY_CSV_FILE.stat().st_mtime
-            return list(rows)
+            return _enrich_dir_rows(rows)
     except Exception:
         return []
 
@@ -1011,39 +1036,82 @@ def _get_live_lanes_and_logs() -> dict:
 
 
 def _load_tracked_sets_list() -> list[dict]:
-    from Core.scraper_engine import load_tracked_sets_meta
+    from Core.config import DEAD_BACKS_CACHE_PATH, DEAD_FRONTS_CACHE_PATH, format_display_set_name, normalize_brand_name
+    from Core.scraper_engine import (
+        _stat_mtime_size,
+        format_release_date_display,
+        get_tracked_set_queue_metrics,
+        is_pre_release_set,
+        load_tracked_sets_meta,
+        normalize_release_date,
+        sort_sets_by_release_date,
+    )
+
     meta = load_tracked_sets_meta(prioritize=True)
-    return [
-        {
-            "Folder_Name": m.get("folder_name", ""),
+    db_mt, _ = _stat_mtime_size(DEAD_BACKS_CACHE_PATH)
+    df_mt, _ = _stat_mtime_size(DEAD_FRONTS_CACHE_PATH)
+
+    items: list[dict] = []
+    for u, m in meta.items():
+        fn = m.get("folder_name", "")
+        disp_name = format_display_set_name(fn)
+        chk_title = str(m.get("checklist_set_name") or disp_name).strip()
+        rel_iso = normalize_release_date(str(m.get("release_date") or ""))
+        rel_unrel = str(m.get("release_status") or "").strip().lower() == "pre-release"
+        rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else ""
+        try:
+            q_metrics = get_tracked_set_queue_metrics(
+                set_url=u,
+                folder_name=fn,
+                chk_title=chk_title,
+                dead_backs_mtime=db_mt,
+                dead_fronts_mtime=df_mt,
+            )
+        except Exception:
+            q_metrics = {"subset_updates_needed": 0, "missing_fronts": 0, "missing_backs": 0}
+
+        items.append({
+            "Folder_Name": fn,
+            "Display_Name": disp_name,
             "Sport": m.get("sport", "Baseball"),
             "Year": m.get("year", ""),
-            "Manufacturer": m.get("manufacturer", "Topps"),
+            "Manufacturer": normalize_brand_name(chk_title or disp_name, url=u, existing_mfg=m.get("manufacturer", "")),
             "Checklist_Source": m.get("checklist_source", "Auto"),
             "Last_Scraped": m.get("last_scraped", "") or "NEVER",
             "Last_Upgraded": m.get("last_upgraded", "") or "NEVER",
+            "Release_Date": rel_iso,
+            "Release_Date_Display": format_release_date_display(rel_iso),
+            "Release_Status": rel_status,
+            "Subset_Updates_Needed": q_metrics["subset_updates_needed"],
+            "Missing_Fronts": q_metrics["missing_fronts"],
+            "Missing_Backs": q_metrics["missing_backs"],
             "TCDB_URL": u,
-        }
-        for u, m in meta.items()
-    ]
+        })
+    return sort_sets_by_release_date(items, date_key="Release_Date", name_key="Display_Name")
 
 
 def _save_tracked_sets_list(items: list[dict]):
-    from Core.scraper_engine import save_all_tracked_sets
+    from Core.config import normalize_brand_name
+    from Core.scraper_engine import is_pre_release_set, normalize_release_date, save_all_tracked_sets
+
     new_dict = {}
     for r in items:
         u = str(r.get("TCDB_URL") or "").strip()
         fn = str(r.get("Folder_Name") or "").strip().replace(" ", "_")
         if not u or not fn:
             continue
+        rel_iso = normalize_release_date(str(r.get("Release_Date") or ""))
+        rel_unrel = str(r.get("Release_Status") or "").strip().lower() == "pre-release"
         new_dict[u] = {
             "folder_name": fn,
             "sport": str(r.get("Sport") or "Baseball").strip(),
             "year": str(r.get("Year") or "").strip(),
-            "manufacturer": str(r.get("Manufacturer") or "Topps").strip(),
+            "manufacturer": normalize_brand_name(fn, url=u, existing_mfg=str(r.get("Manufacturer") or "").strip()),
             "checklist_source": str(r.get("Checklist_Source") or "Auto").strip(),
             "last_scraped": "" if str(r.get("Last_Scraped", "")).upper() == "NEVER" else str(r.get("Last_Scraped", "")),
             "last_upgraded": "" if str(r.get("Last_Upgraded", "")).upper() == "NEVER" else str(r.get("Last_Upgraded", "")),
+            "release_date": rel_iso,
+            "release_status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
         }
     save_all_tracked_sets(new_dict)
 

@@ -1369,3 +1369,116 @@ def save_scraper_settings(payload: dict, settings_file: Optional[Path] = None) -
         current["scraper_proxy_pool"] = normalize_proxy_pool(payload.get("scraper_proxy_pool"))
     atomic_write_text(target, json.dumps(current, indent=2))
     return current
+
+
+# ==============================================================================
+# BRAND / MANUFACTURER NORMALIZATION & DISPLAY FORMATTING
+# ==============================================================================
+BRAND_NORMALIZATION_RULES: tuple[tuple[str, str], ...] = (
+    # Priority 1: Distinct Product Lines / Sub-Brands (resolve to actual brand/line before parent company)
+    (r"\b(?:Donruss\s+)?Optic\b", "Optic"),
+    (r"\bPrizm\b", "Prizm"),
+    (r"\bSelect\b", "Select"),
+    (r"\bMosaic\b", "Mosaic"),
+    (r"\bDonruss\b", "Donruss"),
+    (r"\bContenders\b", "Contenders"),
+    (r"\bChronicles\b", "Chronicles"),
+    (r"\bNational\s+Treasures\b", "National Treasures"),
+    (r"\bImmaculate\b", "Immaculate"),
+    (r"\bFlawless\b", "Flawless"),
+    (r"\bSpectra\b", "Spectra"),
+    (r"\bObsidian\b", "Obsidian"),
+    (r"\bOrigins\b", "Origins"),
+    (r"\bPhoenix\b", "Phoenix"),
+    (r"\bCertified\b", "Certified"),
+    (r"\bAbsolute\b", "Absolute"),
+    (r"\bPrestige\b", "Prestige"),
+    (r"\bIllusions\b", "Illusions"),
+    (r"\b(?:NBA\s+)?Hoops\b", "Hoops"),
+    (r"\bBowman\b", "Bowman"),
+    (r"\bFinest\b", "Finest"),
+    (r"\bO-Pee-Chee\b|\bOPC\b", "O-Pee-Chee"),
+    (r"\bSkyBox\b|\bMetal\s+Universe\b", "SkyBox"),
+    (r"\bFleer\b", "Fleer"),
+    (r"\bScore\b", "Score"),
+    # Priority 2: Explicit Manufacturers / Publishers
+    (r"\bTopps\b|\bBazooka\b|\bMerlin\b|\bMatch\s+Attax\b|\bTurbo\s+Attax\b", "Topps"),
+    (r"\bPanini\b", "Panini"),
+    (r"\bUpper\s+Deck\b|\bUD\s+(?:Choice|Reserve|Authentics|Icons|Premier|Black|Ice)\b", "Upper Deck"),
+    (r"\bLeaf\b", "Leaf"),
+    (r"\bWild\s+Card\b", "Wild Card"),
+    (r"\bONIT\b", "ONIT Athlete"),
+    (r"\bSage\b", "Sage"),
+    (r"\bPress\s+Pass\b", "Press Pass"),
+    (r"\bTriStar\b|\bTri-Star\b", "TriStar"),
+    (r"\bOnyx\b", "Onyx"),
+    (r"\bHistoric\s+Autographs\b", "Historic Autographs"),
+    (r"\bJersey\s+Fusion\b", "Jersey Fusion"),
+    (r"\bSuper\s+Break\b", "Super Break"),
+    (r"\bKeepsake\b", "Keepsake"),
+    (r"\bFutera\b", "Futera"),
+    (r"\bParkside\b", "Parkside"),
+    (r"\bSportkings\b", "Sportkings"),
+    (r"\bPro\s+Set\b", "Pro Set"),
+    (r"\bPacific\b", "Pacific"),
+    (r"\bPinnacle\b", "Pinnacle"),
+    (r"\bPlayoff\b", "Playoff"),
+    (r"\bClassic\b", "Classic"),
+    (r"\bCollector'?s\s+Edge\b", "Collector's Edge"),
+    (r"\bAction\s+Packed\b", "Action Packed"),
+    (r"\bParkhurst\b", "Parkhurst"),
+    (r"\bIn\s+The\s+Game\b|\bITG\b", "In The Game"),
+    (r"\bPresident'?s\s+Choice\b", "President's Choice"),
+    (r"\bRittenhouse\b", "Rittenhouse"),
+    (r"\bCryptozoic\b", "Cryptozoic"),
+    (r"\bChampions\s+Deck\b", "Champions Deck"),
+    (r"\bFanatics\b", "Fanatics"),
+    (r"\bPieces\s+of\s+the\s+Past\b", "Pieces of the Past"),
+    (r"\bChoice\s+Marketing\b|\bGrandstand\b|\bMulti-Ad\b|\bTeam\s+Best\b|\bJust\s+Minors\b", "Minor League / Regional"),
+    # Priority 3: Remaining Manufacturer-Only Sub-Brands
+    (
+        r"\b(Playbook|Noir|Court\s+Kings|Revolution|Crown\s+Royale|Photogenic|Recon|Eminence|"
+        r"One\s+and\s+One|Zenith|Rookies\s*&\s*Stars|Gold\s+Standard|Limited|Encased|Impeccable|"
+        r"Plates\s*&\s*Patches|Adrenalyn|Panini\s+Instant)\b",
+        "Panini",
+    ),
+    (
+        r"\b(SP\s+Authentic|SP\s+Game\s+Used|SP\s+Signature|SPx|Artifacts|Allure|The\s+Cup|Stature|"
+        r"Synergy|Black\s+Diamond|Goodwin\s+Champions|Exquisite|Credentials|Trilogy|Clear\s+Cut|"
+        r"Engrained|Tim\s+Hortons)\b",
+        "Upper Deck",
+    ),
+    (
+        r"\b(Allen\s*&\s*Ginter|Stadium\s+Club|Gypsy\s+Queen|Triple\s+Threads|Museum\s+Collection|"
+        r"Tier\s+One|Definitive|Dynasty|Luminaries|Transcendent|Big\s+League|Opening\s+Day|"
+        r"Pro\s+Debut|Cosmic\s+Chrome|Logofractor|Eccellenza|Lights\s+Out|Resurgence|Inception|"
+        r"Tribute|Pristine|Heritage|Archives|Gallery)\b",
+        "Topps",
+    ),
+)
+
+
+def normalize_brand_name(set_title: str, url: str = "", existing_mfg: str = "", category: str = "") -> str:
+    """
+    Resolves brand/manufacturer consistently from set title & URL using config-driven
+    priority rules so sub-brands (Donruss, Optic, Prizm, Select, Bowman, Finest, etc.)
+    map to their actual brand line rather than being flattened into parent companies.
+    """
+    combined = f"{set_title} {url}".replace("_", " ").replace("-", " ")
+    for pat, brand_name in BRAND_NORMALIZATION_RULES:
+        if re.search(pat, combined, re.IGNORECASE):
+            return brand_name
+    ex_clean = str(existing_mfg or "").strip()
+    if ex_clean and ex_clean.lower() not in ("topps", "panini", "unknown", "none", "nan"):
+        return ex_clean
+    cat_low = str(category or "").lower()
+    if any(k in cat_low for k in ("college", "team issue", "stadium giveaway", "sga", "promo")) or any(
+        k in combined.lower() for k in ("sga", "juco", "world series", "community college")
+    ):
+        return "Team / School Issue"
+    return "Other"
+
+
+def format_display_set_name(raw_name: str) -> str:
+    """Masks underscores as normal spaces for UI display without mutating stored folder/CSV keys."""
+    return re.sub(r"\s+", " ", str(raw_name or "").replace("_", " ")).strip()

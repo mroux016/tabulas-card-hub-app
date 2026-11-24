@@ -3835,6 +3835,112 @@ function GradingDeepDiveStudio({
   );
 }
 
+function formatSetDisplayName(name) {
+  return String(name || '').replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function formatIsoDateDisplay(iso) {
+  const s = String(iso || '').trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return '';
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const yr = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const dy = parseInt(m[3], 10);
+  if (mo < 1 || mo > 12 || dy < 1 || dy > 31) return '';
+  return `${months[mo - 1]} ${dy}, ${yr}`;
+}
+
+function isRowPreRelease(row, todayIso) {
+  if (!row) return false;
+  if (String(row.Release_Status || '').trim().toLowerCase() === 'pre-release') return true;
+  const rd = String(row.Release_Date || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(rd) && rd > todayIso;
+}
+
+function compareReleaseDateDescThenAlpha(a, b, nameGetter, dir = 'desc') {
+  const da = String(a?.Release_Date || '').trim();
+  const db = String(b?.Release_Date || '').trim();
+  const hasA = /^\d{4}-\d{2}-\d{2}$/.test(da);
+  const hasB = /^\d{4}-\d{2}-\d{2}$/.test(db);
+  if (hasA !== hasB) return hasA ? -1 : 1; // blank/unknown dates always at bottom
+  if (hasA && hasB && da !== db) {
+    return dir === 'asc' ? da.localeCompare(db) : db.localeCompare(da);
+  }
+  const na = formatSetDisplayName(nameGetter(a)).toLowerCase();
+  const nb = formatSetDisplayName(nameGetter(b)).toLowerCase();
+  return na.localeCompare(nb, undefined, { numeric: true });
+}
+
+function MultiSelectFilter({ label, options, selected, onChange, searchable = false }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const boxRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDocDown = (e) => {
+      if (boxRef.current && !boxRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocDown);
+    return () => document.removeEventListener('mousedown', onDocDown);
+  }, [open]);
+
+  const selArr = Array.isArray(selected) ? selected : [];
+  const selSet = new Set(selArr);
+  const filteredOpts = (options || []).filter((o) => !q.trim() || String(o).toLowerCase().includes(q.toLowerCase()));
+  const summary = selArr.length === 0
+    ? `All ${label}`
+    : (selArr.length === 1 ? selArr[0] : `${label} (${selArr.length})`);
+
+  const toggleOpt = (opt) => {
+    if (selSet.has(opt)) onChange(selArr.filter((x) => x !== opt));
+    else onChange([...selArr, opt]);
+  };
+
+  return (
+    <div ref={boxRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`w-full flex items-center justify-between gap-1.5 bg-slate-950 border rounded-xl px-2.5 py-1.5 text-xs text-left transition ${selArr.length > 0 ? 'border-cyan-500/70 text-cyan-200 font-semibold' : 'border-slate-700 text-slate-200 hover:border-slate-500'}`}
+      >
+        <span className="truncate">{summary}</span>
+        <span className="text-[10px] text-slate-400 shrink-0">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 mt-1 w-56 max-w-[80vw] z-40 bg-slate-950 border border-slate-700 rounded-xl shadow-2xl p-2 space-y-1.5">
+          <div className="flex items-center justify-between gap-1 pb-1 border-b border-slate-800 text-[10.5px]">
+            <button type="button" onClick={() => onChange([...(options || [])])} className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-semibold">Select All</button>
+            <button type="button" onClick={() => onChange([])} className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300">Clear</button>
+          </div>
+          {searchable && (
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder={`Filter ${label}...`}
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white"
+            />
+          )}
+          <div className="max-h-52 overflow-y-auto space-y-0.5">
+            {filteredOpts.length === 0 ? (
+              <div className="text-[11px] text-slate-500 px-2 py-1">No options</div>
+            ) : filteredOpts.map((opt) => {
+              const checked = selSet.has(opt);
+              return (
+                <label key={opt} className={`flex items-center gap-2 px-2 py-1 rounded-lg text-xs cursor-pointer ${checked ? 'bg-cyan-950/60 text-cyan-100' : 'text-slate-300 hover:bg-slate-900'}`}>
+                  <input type="checkbox" checked={checked} onChange={() => toggleOpt(opt)} className="shrink-0" />
+                  <span className="truncate">{opt}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [skinKey, setSkinKey] = useState(() => resolveChromePulseSkinKey(localStorage.getItem('tabulas_skin')));
   const skin = CHROME_PULSE_SKINS[skinKey] || CHROME_PULSE_SKINS.screenshot_signature_3d;
@@ -3984,8 +4090,8 @@ export default function App() {
   const [trackedYearF, setTrackedYearF] = useState('All Years');
   const [trackedMfgF, setTrackedMfgF] = useState('All Manufacturers');
   const [trackedDupOnly, setTrackedDupOnly] = useState(false);
-  const [trackedSortBy, setTrackedSortBy] = useState('Folder_Name');
-  const [trackedSortDir, setTrackedSortDir] = useState('asc');
+  const [trackedSortBy, setTrackedSortBy] = useState('Release_Date');
+  const [trackedSortDir, setTrackedSortDir] = useState('desc');
   const [showManualAddInv, setShowManualAddInv] = useState(false);
   const [manualCard, setManualCard] = useState({ Set: '2026 Topps Baseball', Subset: 'Base', CardNumber: '', Player: '', Team: '', PrintRun: '', HoldTag: 'For Sale', RawPrice: '1.00', Qty: 1 });
   const [showCompsExplorer, setShowCompsExplorer] = useState(false);
@@ -4199,9 +4305,13 @@ export default function App() {
   };
 
   const [dirSearch, setDirSearch] = useState('');
-  const [dirSportFilter, setDirSportFilter] = useState('All Sports');
-  const [dirMfgFilter, setDirMfgFilter] = useState('All Manufacturers');
-  const [dirCategoryFilter, setDirCategoryFilter] = useState('All Categories');
+  const [dirSportFilters, setDirSportFilters] = useState([]);
+  const [dirYearFilters, setDirYearFilters] = useState([]);
+  const [dirMfgFilters, setDirMfgFilters] = useState([]);
+  const [dirCategoryFilters, setDirCategoryFilters] = useState(['Major Releases', 'On-Demand']);
+  const [dirStatusFilters, setDirStatusFilters] = useState([]);
+  const [dirSortBy, setDirSortBy] = useState('Release_Date');
+  const [dirSortDir, setDirSortDir] = useState('desc');
   const [dirEraFilter, setDirEraFilter] = useState('All Eras');
   const [dirHideTracked, setDirHideTracked] = useState(false);
   const [showQuickAddWidget, setShowQuickAddWidget] = useState(false);
@@ -4796,7 +4906,7 @@ export default function App() {
 
   useEffect(() => { setChkPage(1); }, [chkSetF, chkYearF, chkSubsetF, chkAttrF, chkStatusF, chkSearchF]);
   useEffect(() => { setInvPage(1); }, [invSetFilter, invHoldFilter, invStatusFilter, invSearch]);
-  useEffect(() => { setDirPage(1); }, [dirSportFilter, dirMfgFilter, dirCategoryFilter, dirEraFilter, dirSearch, dirHideTracked]);
+  useEffect(() => { setDirPage(1); }, [dirSportFilters, dirYearFilters, dirMfgFilters, dirCategoryFilters, dirStatusFilters, dirEraFilter, dirSearch, dirHideTracked]);
   useEffect(() => { setCompPage(1); }, [completionSet, completionModeIdx, completionExclSN, compTableView, compSubsetF, compSearch]);
   useEffect(() => { setBatchPage(1); }, [activeBatchName, batchReviewFilter, batchConfFilter, batchSubsetFilter, batchSearchQ]);
 
@@ -9733,10 +9843,11 @@ export default function App() {
               );
             })()}
 
-            {/* 6. CHECKLIST BUILDER (WITH WRENCH MAINTENANCE WIDGET & TRACKED SETS QUEUE) */}
+            {/* 6. CHECKLIST BUILDER (TRACKED SETS QUEUE) */}
             {activePage === 'checklist_builder' && (() => {
               const targetCount = Object.keys(targetScraperQueueMap).length;
               const scopeLbl = selectedTrackedUrls.length > 0 ? `${targetCount} Selected` : `All ${targetCount}`;
+              const todayIso = new Date().toISOString().slice(0, 10);
 
               const extractSid = (u) => {
                 const m = String(u || '').match(/\/sid\/(\d+)/i);
@@ -9758,7 +9869,22 @@ export default function App() {
                 const ck = `${String(ts.Sport || '').toLowerCase()}|${canonSetNorm(ts.Folder_Name)}`;
                 const isDupSid = !!(sid && sidCounts[sid] > 1);
                 const isDupName = canonCounts[ck] > 1;
-                return { ...ts, _sid: sid, _isDup: isDupSid || isDupName, _dupReason: isDupSid ? `SID ${sid}` : (isDupName ? 'Name' : '') };
+                const dispName = ts.Display_Name || formatSetDisplayName(ts.Folder_Name);
+                const missF = Number(ts.Missing_Fronts || 0);
+                const missB = Number(ts.Missing_Backs || 0);
+                const subUpd = Number(ts.Subset_Updates_Needed || 0);
+                return {
+                  ...ts,
+                  _sid: sid,
+                  _dispName: dispName,
+                  _isDup: isDupSid || isDupName,
+                  _dupReason: isDupSid ? `SID ${sid}` : (isDupName ? 'Name' : ''),
+                  _isPreRelease: isRowPreRelease(ts, todayIso),
+                  _subsetUpdates: subUpd,
+                  _missingFronts: missF,
+                  _missingBacks: missB,
+                  _missingFbTotal: missF + missB,
+                };
               });
 
               const totalDupRows = enrichedTracked.filter((t) => t._isDup).length;
@@ -9771,7 +9897,7 @@ export default function App() {
                   setTrackedSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
                 } else {
                   setTrackedSortBy(colKey);
-                  setTrackedSortDir('asc');
+                  setTrackedSortDir(['Release_Date', '_subsetUpdates', '_missingFbTotal'].includes(colKey) ? 'desc' : 'asc');
                 }
               };
               const sortInd = (colKey) => (trackedSortBy === colKey ? (trackedSortDir === 'asc' ? ' ▲' : ' ▼') : '');
@@ -9782,14 +9908,19 @@ export default function App() {
                   if (trackedYearF !== 'All Years' && ts.Year !== trackedYearF) return false;
                   if (trackedMfgF !== 'All Manufacturers' && ts.Manufacturer !== trackedMfgF) return false;
                   if (trackedDupOnly && !ts._isDup) return false;
-                  if (trackedSearch.trim() && !`${ts.Folder_Name} ${ts.Sport} ${ts.Year} ${ts.Manufacturer} ${ts._sid} ${ts.TCDB_URL}`.toLowerCase().includes(trackedSearch.toLowerCase())) return false;
+                  if (trackedSearch.trim() && !`${ts._dispName} ${ts.Folder_Name} ${ts.Sport} ${ts.Year} ${ts.Manufacturer} ${ts.Release_Date || ''} ${ts._sid} ${ts.TCDB_URL}`.toLowerCase().includes(trackedSearch.toLowerCase())) return false;
                   return true;
                 })
                 .sort((a, b) => {
+                  if (trackedSortBy === 'Release_Date') {
+                    return compareReleaseDateDescThenAlpha(a, b, (x) => x._dispName || x.Folder_Name, trackedSortDir);
+                  }
                   const dir = trackedSortDir === 'asc' ? 1 : -1;
                   if (trackedSortBy === '_sid') return (parseInt(a._sid || '0', 10) - parseInt(b._sid || '0', 10)) * dir;
-                  const va = String(a[trackedSortBy] || '').toLowerCase();
-                  const vb = String(b[trackedSortBy] || '').toLowerCase();
+                  if (trackedSortBy === '_subsetUpdates') return (a._subsetUpdates - b._subsetUpdates) * dir;
+                  if (trackedSortBy === '_missingFbTotal') return (a._missingFbTotal - b._missingFbTotal) * dir;
+                  const va = String(trackedSortBy === 'Folder_Name' ? a._dispName : (a[trackedSortBy] || '')).toLowerCase();
+                  const vb = String(trackedSortBy === 'Folder_Name' ? b._dispName : (b[trackedSortBy] || '')).toLowerCase();
                   return va.localeCompare(vb, undefined, { numeric: true }) * dir;
                 });
               return (
@@ -9800,28 +9931,7 @@ export default function App() {
                         <h2 className="text-sm font-bold text-white">🕷️ Unified TCDB Checklist &amp; Image Builder ({trackedSets.length} Tracked Sets)</h2>
                         <p className="text-xs text-slate-400 mt-0.5">Builds 11-column checklists with TCDB_CIDs and downloads Front &amp; Back template images to {SET_LIBRARY_ROOT}. Check rows below to target specific sets.</p>
                       </div>
-                      <button onClick={() => setShowMaintenanceWidget(!showMaintenanceWidget)} className={`px-3 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition ${showMaintenanceWidget ? skin.accentActive : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'}`}>
-                        🔧 Maintenance {totalDupRows > 0 ? `(${totalDupRows} Dup)` : ''} {showMaintenanceWidget ? '⌄' : '›'}
-                      </button>
                     </div>
-                    {showMaintenanceWidget && (
-                      <div className="p-3.5 bg-slate-950/85 border border-amber-500/30 rounded-xl space-y-2.5">
-                        <div className="text-xs font-bold text-amber-300">🛠️ Checklist &amp; Reference Library Maintenance Tools</div>
-                        <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
-                          <button
-                            onClick={() => triggerJob('set_scraper', 'Clean & Dedupe Tracked Sets & Directory', 'deduplicate_tracked_sets', { estimated_total: Math.max(1, trackedSets.length) })}
-                            className="py-2 px-3 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs shadow"
-                          >
-                            🧹 Clean &amp; Dedupe Tracked Sets {totalDupRows > 0 ? `(${totalDupRows})` : ''}
-                          </button>
-                          <button onClick={() => triggerJob('set_scraper', 'Clean Reference Library Folders & Filenames', 'clean_reference_library', { estimated_total: Math.max(1, trackedSets.length) })} className={`py-2 px-3 rounded-xl font-bold text-xs ${skin.accentBtn}`}>🗂️ Clean Ref Library Folders &amp; Names</button>
-                          <button onClick={() => triggerJob('set_scraper', 'Repair Existing Checklist CSVs', 'repair_checklists', { estimated_total: Math.max(1, trackedSets.length) })} className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 font-bold text-xs">🔧 Repair LL / CPC / Var CSVs</button>
-                          <button onClick={() => triggerJob('set_scraper', 'Sync Set Library Download Status', 'sync_set_library_status', { estimated_total: Math.max(1, trackedSets.length) })} className="py-2 px-3 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs">🔄 Sync Download Status</button>
-                          <button onClick={() => triggerJob('set_scraper', 'Rebuild Visual Feature Cache (.pkl)', 'rebuild_feature_cache', { estimated_total: 1 })} className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 font-bold text-xs">🧠 Rebuild Feature Cache</button>
-                          <button onClick={() => triggerJob('system', 'Build / Update DINOv2 Neural Index (GPU)', 'build_neural_index', { batch_size: 32, force_rebuild: false, estimated_total: 1000 })} className="py-2 px-3 rounded-xl bg-indigo-950/90 hover:bg-indigo-800 border border-indigo-600/70 text-indigo-200 font-bold text-xs">🧬 Update Neural Index</button>
-                        </div>
-                      </div>
-                    )}
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div className="flex flex-wrap items-center gap-4">
                         <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -10017,11 +10127,14 @@ export default function App() {
                         <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10 select-none">
                           <tr>
                             <th className="p-2">Sel</th>
-                            <th onClick={() => toggleTrackedSort('Folder_Name')} className="p-2 cursor-pointer hover:text-white">Folder Name{sortInd('Folder_Name')}</th>
+                            <th onClick={() => toggleTrackedSort('Folder_Name')} className="p-2 cursor-pointer hover:text-white">Set Name{sortInd('Folder_Name')}</th>
                             <th onClick={() => toggleTrackedSort('_sid')} className="p-2 cursor-pointer hover:text-white">SID{sortInd('_sid')}</th>
                             <th onClick={() => toggleTrackedSort('Sport')} className="p-2 cursor-pointer hover:text-white">Sport{sortInd('Sport')}</th>
                             <th onClick={() => toggleTrackedSort('Year')} className="p-2 cursor-pointer hover:text-white">Year{sortInd('Year')}</th>
+                            <th onClick={() => toggleTrackedSort('Release_Date')} className="p-2 cursor-pointer hover:text-white">Release Date{sortInd('Release_Date')}</th>
                             <th onClick={() => toggleTrackedSort('Manufacturer')} className="p-2 cursor-pointer hover:text-white">Mfg{sortInd('Manufacturer')}</th>
+                            <th onClick={() => toggleTrackedSort('_subsetUpdates')} className="p-2 cursor-pointer hover:text-white text-right">Subset Updates Needed{sortInd('_subsetUpdates')}</th>
+                            <th onClick={() => toggleTrackedSort('_missingFbTotal')} className="p-2 cursor-pointer hover:text-white text-right">Missing F/B{sortInd('_missingFbTotal')}</th>
                             <th onClick={() => toggleTrackedSort('Last_Scraped')} className="p-2 cursor-pointer hover:text-white">Last Scraped{sortInd('Last_Scraped')}</th>
                             <th className="p-2">TCDB</th>
                             <th className="p-2">Del</th>
@@ -10030,11 +10143,12 @@ export default function App() {
                         <tbody className="divide-y divide-slate-800">
                           {filteredTracked.map((ts) => {
                             const isSel = selectedTrackedUrls.includes(ts.TCDB_URL);
+                            const relDisplay = ts.Release_Date_Display || formatIsoDateDisplay(ts.Release_Date);
                             return (
                               <tr key={ts.TCDB_URL} className={ts._isDup ? 'bg-amber-950/35 hover:bg-amber-950/50' : (isSel ? 'bg-cyan-950/35' : 'hover:bg-slate-800/40')}>
                                 <td className="p-1.5"><input type="checkbox" checked={isSel} onChange={() => setSelectedTrackedUrls((p) => p.includes(ts.TCDB_URL) ? p.filter((u) => u !== ts.TCDB_URL) : [...p, ts.TCDB_URL])} /></td>
-                                <td className="p-1.5 font-mono font-semibold text-white">
-                                  {ts.Folder_Name}{' '}
+                                <td className="p-1.5 font-semibold text-white">
+                                  {ts._dispName}{' '}
                                   {ts._isDup && (
                                     <span title={`Duplicate detected (${ts._dupReason})`} className="ml-1 px-1.5 py-0.5 rounded bg-rose-900/90 border border-rose-600 text-rose-200 text-[9.5px] font-bold">
                                       ⚠️ DUP ({ts._dupReason})
@@ -10044,7 +10158,25 @@ export default function App() {
                                 <td className="p-1.5 font-mono text-slate-400">{ts._sid || '—'}</td>
                                 <td className="p-1.5">{ts.Sport}</td>
                                 <td className="p-1.5 font-mono">{ts.Year}</td>
+                                <td className="p-1.5 font-mono text-slate-200">
+                                  {relDisplay || <span className="text-slate-500">—</span>}
+                                  {ts._isPreRelease && (
+                                    <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-violet-950/90 border border-violet-500/60 text-violet-200 text-[9.5px] font-bold">
+                                      Pre-Release
+                                    </span>
+                                  )}
+                                </td>
                                 <td className="p-1.5">{ts.Manufacturer}</td>
+                                <td className="p-1.5 text-right font-mono">
+                                  <span className={`px-1.5 py-0.5 rounded text-[10.5px] font-bold ${ts._subsetUpdates > 0 ? 'bg-amber-950/80 border border-amber-600/60 text-amber-300' : 'bg-emerald-950/60 border border-emerald-700/50 text-emerald-300'}`}>
+                                    {ts._subsetUpdates.toLocaleString()}
+                                  </span>
+                                </td>
+                                <td className="p-1.5 text-right font-mono">
+                                  <span className={`px-1.5 py-0.5 rounded text-[10.5px] font-bold ${ts._missingFbTotal > 0 ? 'bg-violet-950/80 border border-violet-600/60 text-violet-200' : 'bg-emerald-950/60 border border-emerald-700/50 text-emerald-300'}`}>
+                                    {ts._missingFronts.toLocaleString()}F / {ts._missingBacks.toLocaleString()}B
+                                  </span>
+                                </td>
                                 <td className="p-1.5 font-mono text-emerald-400">{ts.Last_Scraped || 'NEVER'}</td>
                                 <td className="p-1.5"><a href={ts.TCDB_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Open ↗</a></td>
                                 <td className="p-1.5"><button onClick={() => { setTrackedSets((prev) => prev.filter((x) => x.TCDB_URL !== ts.TCDB_URL)); setSelectedTrackedUrls((prev) => prev.filter((u) => u !== ts.TCDB_URL)); setTrackedSetsDirty(true); }} title="Remove from queue (click Save Queue to persist)" className="text-rose-400 hover:text-rose-200 px-1">🗑️</button></td>
@@ -10132,25 +10264,58 @@ export default function App() {
               </div>
             )}
 
-            {/* 8. SET BROWSER (CRAWL OPTIONS POP-DOWN + AUTO-UPDATING ERA TABS + CATEGORY FILTER) */}
+            {/* 8. SET BROWSER (CRAWL OPTIONS POP-DOWN + AUTO-UPDATING ERA TABS + MULTI-SELECT FILTERS) */}
             {activePage === 'set_browser' && (() => {
               const curCalYear = new Date().getFullYear();
+              const todayIso = new Date().toISOString().slice(0, 10);
               const trkUrls = new Set(trackedSets.map((t) => t.TCDB_URL));
               const cartUrls = new Set(setCart.map((c) => c.TCDB_URL));
 
-              // Compute auto-updating Era for every set dynamically based on current calendar year & released sets
-              const rowsWithDynamicEra = directoryRows.map((d) => ({
-                ...d,
-                _dynEra: computeDynamicEraForYear(d.Year, curCalYear),
-              }));
+              // Compute auto-updating Era, Pre-Release status, and effective Status for every set
+              const rowsWithDynamicEra = directoryRows.map((d) => {
+                const isTrk = trkUrls.has(d.TCDB_URL);
+                const isInCart = cartUrls.has(d.TCDB_URL);
+                const isPreRel = isRowPreRelease(d, todayIso);
+                const primaryStatus = isTrk ? 'Tracked' : (isInCart ? 'In Cart' : (isPreRel ? 'Pre-Release' : 'Available'));
+                return {
+                  ...d,
+                  _dynEra: computeDynamicEraForYear(d.Year, curCalYear),
+                  _catNorm: d.Category || 'Major Releases',
+                  _isTrk: isTrk,
+                  _isInCart: isInCart,
+                  _isPreRelease: isPreRel,
+                  _status: primaryStatus,
+                };
+              });
 
-              // Pre-Era filter pass (Sport, Manufacturer, Category, Hide Tracked, Search) drives live counts on Era tabs
+              const dirSportOptions = Array.from(new Set(rowsWithDynamicEra.map((d) => d.Sport).filter(Boolean))).sort();
+              const dirYearOptions = Array.from(new Set(rowsWithDynamicEra.map((d) => d.Year).filter(Boolean))).sort((a, b) => String(b).localeCompare(String(a), undefined, { numeric: true }));
+              const dirMfgOptions = Array.from(new Set(rowsWithDynamicEra.map((d) => d.Manufacturer).filter(Boolean))).sort();
+              const dirCategoryOptions = Array.from(new Set(['Major Releases', 'On-Demand', ...rowsWithDynamicEra.map((d) => d._catNorm).filter(Boolean)])).sort();
+              const dirStatusOptions = ['Available', 'Pre-Release', 'Tracked', 'In Cart'];
+
+              const toggleDirSort = (colKey) => {
+                if (dirSortBy === colKey) {
+                  setDirSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+                } else {
+                  setDirSortBy(colKey);
+                  setDirSortDir(colKey === 'Release_Date' || colKey === 'Year' ? 'desc' : 'asc');
+                }
+              };
+              const dirSortInd = (colKey) => (dirSortBy === colKey ? (dirSortDir === 'asc' ? ' ▲' : ' ▼') : '');
+
+              // Pre-Era filter pass (Multi-select Sport, Year, Manufacturer, Category, Status, Hide Tracked, Search)
               const baseFilteredDir = rowsWithDynamicEra.filter((d) => {
-                if (dirSportFilter !== 'All Sports' && d.Sport !== dirSportFilter) return false;
-                if (dirMfgFilter !== 'All Manufacturers' && d.Manufacturer !== dirMfgFilter) return false;
-                if (dirCategoryFilter !== 'All Categories' && (d.Category || 'Major Release') !== dirCategoryFilter) return false;
-                if (dirHideTracked && trkUrls.has(d.TCDB_URL)) return false;
-                if (dirSearch.trim() && !`${d.Set_Name} ${d.Year} ${d.SID} ${d.Folder_Name} ${d.Category} ${d.Manufacturer}`.toLowerCase().includes(dirSearch.toLowerCase())) return false;
+                if (dirSportFilters.length > 0 && !dirSportFilters.includes(d.Sport)) return false;
+                if (dirYearFilters.length > 0 && !dirYearFilters.includes(d.Year)) return false;
+                if (dirMfgFilters.length > 0 && !dirMfgFilters.includes(d.Manufacturer)) return false;
+                if (dirCategoryFilters.length > 0 && !dirCategoryFilters.includes(d._catNorm)) return false;
+                if (dirStatusFilters.length > 0) {
+                  const statusMatch = dirStatusFilters.includes(d._status) || (dirStatusFilters.includes('Pre-Release') && d._isPreRelease);
+                  if (!statusMatch) return false;
+                }
+                if (dirHideTracked && d._isTrk) return false;
+                if (dirSearch.trim() && !`${d.Set_Name} ${d.Year} ${d.SID} ${d.Release_Date || ''} ${d._catNorm} ${d.Manufacturer}`.toLowerCase().includes(dirSearch.toLowerCase())) return false;
                 return true;
               });
 
@@ -10160,7 +10325,19 @@ export default function App() {
               });
               const sortedEraKeys = Object.keys(eraCountsMap).sort((a, b) => eraSortWeight(b) - eraSortWeight(a));
               const activeEraTab = dirEraFilter !== 'All Eras' && eraCountsMap[dirEraFilter] ? dirEraFilter : 'All Eras';
-              const finalDirRows = activeEraTab === 'All Eras' ? baseFilteredDir : baseFilteredDir.filter((d) => d._dynEra === activeEraTab);
+              const finalDirRows = (activeEraTab === 'All Eras' ? baseFilteredDir : baseFilteredDir.filter((d) => d._dynEra === activeEraTab))
+                .slice()
+                .sort((a, b) => {
+                  if (dirSortBy === 'Release_Date') {
+                    return compareReleaseDateDescThenAlpha(a, b, (x) => x.Set_Name, dirSortDir);
+                  }
+                  const dir = dirSortDir === 'asc' ? 1 : -1;
+                  if (dirSortBy === 'SID') return (parseInt(a.SID || '0', 10) - parseInt(b.SID || '0', 10)) * dir;
+                  const va = String(a[dirSortBy] || '').toLowerCase();
+                  const vb = String(b[dirSortBy] || '').toLowerCase();
+                  const cmp = va.localeCompare(vb, undefined, { numeric: true }) * dir;
+                  return cmp !== 0 ? cmp : compareReleaseDateDescThenAlpha(a, b, (x) => x.Set_Name, 'desc');
+                });
               const totPages = Math.max(1, Math.ceil(finalDirRows.length / dirPageSize));
               const safeDirPage = Math.min(dirPage, totPages);
               const pageSliceDir = finalDirRows.slice((safeDirPage - 1) * dirPageSize, safeDirPage * dirPageSize);
@@ -10333,23 +10510,30 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* FILTER ROW: SPORT, MANUFACTURER, CATEGORY (REPLACES ERA), SEARCH, HIDE TRACKED, CLEAR */}
-                    <div className="grid grid-cols-2 md:grid-cols-6 gap-2 shrink-0">
-                      <select value={dirSportFilter} onChange={(e) => setDirSportFilter(e.target.value)} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
-                        <option>All Sports</option>
-                        {Array.from(new Set(directoryRows.map((d) => d.Sport).filter(Boolean))).sort().map((sp) => <option key={sp}>{sp}</option>)}
-                      </select>
-                      <select value={dirMfgFilter} onChange={(e) => setDirMfgFilter(e.target.value)} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
-                        <option>All Manufacturers</option>
-                        {Array.from(new Set(directoryRows.map((d) => d.Manufacturer).filter(Boolean))).sort().map((m) => <option key={m}>{m}</option>)}
-                      </select>
-                      <select value={dirCategoryFilter} onChange={(e) => setDirCategoryFilter(e.target.value)} className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs">
-                        <option>All Categories</option>
-                        {Array.from(new Set(directoryRows.map((d) => d.Category || 'Major Release').filter(Boolean))).sort().map((cat) => <option key={cat}>{cat}</option>)}
-                      </select>
+                    {/* MULTI-SELECT FILTER ROW: SPORT, YEAR, BRAND/MFG, CATEGORY, STATUS, SEARCH, HIDE TRACKED, CLEAR */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 shrink-0 items-center">
+                      <MultiSelectFilter label="Sports" options={dirSportOptions} selected={dirSportFilters} onChange={setDirSportFilters} />
+                      <MultiSelectFilter label="Years" options={dirYearOptions} selected={dirYearFilters} onChange={setDirYearFilters} searchable />
+                      <MultiSelectFilter label="Brands / Mfg" options={dirMfgOptions} selected={dirMfgFilters} onChange={setDirMfgFilters} searchable />
+                      <MultiSelectFilter label="Categories" options={dirCategoryOptions} selected={dirCategoryFilters} onChange={setDirCategoryFilters} />
+                      <MultiSelectFilter label="Statuses" options={dirStatusOptions} selected={dirStatusFilters} onChange={setDirStatusFilters} />
                       <input value={dirSearch} onChange={(e) => setDirSearch(e.target.value)} placeholder="Search Set Name, Year, SID..." className="bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs" />
                       <label className="flex items-center gap-1.5 text-xs text-slate-300 px-2"><input type="checkbox" checked={dirHideTracked} onChange={(e) => setDirHideTracked(e.target.checked)} /> Hide Tracked</label>
-                      <button onClick={() => { setDirSportFilter('All Sports'); setDirMfgFilter('All Manufacturers'); setDirCategoryFilter('All Categories'); setDirEraFilter('All Eras'); setDirSearch(''); setDirHideTracked(false); }} className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300">🧹 Clear Filters</button>
+                      <button
+                        onClick={() => {
+                          setDirSportFilters([]);
+                          setDirYearFilters([]);
+                          setDirMfgFilters([]);
+                          setDirCategoryFilters(['Major Releases', 'On-Demand']);
+                          setDirStatusFilters([]);
+                          setDirEraFilter('All Eras');
+                          setDirSearch('');
+                          setDirHideTracked(false);
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300"
+                      >
+                        🧹 Reset Filters
+                      </button>
                     </div>
 
                     {/* AUTO-UPDATING ERA TABS BAR */}
@@ -10373,24 +10557,48 @@ export default function App() {
 
                     <div className="flex-1 min-h-0 overflow-auto border border-slate-800 rounded-xl">
                       <table className="w-full text-left text-xs whitespace-nowrap">
-                        <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10">
-                          <tr><th className="p-2">Stage</th><th className="p-2">Status</th><th className="p-2">Year</th><th className="p-2">Sport</th><th className="p-2">Set Name</th><th className="p-2">Manufacturer</th><th className="p-2">Category</th><th className="p-2">Img %</th><th className="p-2">Folder Name</th><th className="p-2">SID</th><th className="p-2">TCDB</th></tr>
+                        <thead className="bg-slate-950 text-slate-400 sticky top-0 z-10 select-none">
+                          <tr>
+                            <th className="p-2">Stage</th>
+                            <th className="p-2">Status</th>
+                            <th onClick={() => toggleDirSort('Year')} className="p-2 cursor-pointer hover:text-white">Year{dirSortInd('Year')}</th>
+                            <th onClick={() => toggleDirSort('Release_Date')} className="p-2 cursor-pointer hover:text-white">Release Date{dirSortInd('Release_Date')}</th>
+                            <th onClick={() => toggleDirSort('Sport')} className="p-2 cursor-pointer hover:text-white">Sport{dirSortInd('Sport')}</th>
+                            <th onClick={() => toggleDirSort('Set_Name')} className="p-2 cursor-pointer hover:text-white">Set Name{dirSortInd('Set_Name')}</th>
+                            <th onClick={() => toggleDirSort('Manufacturer')} className="p-2 cursor-pointer hover:text-white">Brand / Mfg{dirSortInd('Manufacturer')}</th>
+                            <th onClick={() => toggleDirSort('Category')} className="p-2 cursor-pointer hover:text-white">Category{dirSortInd('Category')}</th>
+                            <th className="p-2">Img %</th>
+                            <th onClick={() => toggleDirSort('SID')} className="p-2 cursor-pointer hover:text-white">SID{dirSortInd('SID')}</th>
+                            <th className="p-2">TCDB</th>
+                          </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800">
                           {pageSliceDir.map((d, i) => {
-                            const isTrk = trkUrls.has(d.TCDB_URL);
-                            const isInCart = cartUrls.has(d.TCDB_URL);
+                            const relDisplay = d.Release_Date_Display || formatIsoDateDisplay(d.Release_Date);
                             return (
                               <tr key={d.SID || i} className="hover:bg-slate-800/40">
-                                <td className="p-2"><button onClick={() => stageSetIntoCart({ Set_Name: d.Set_Name, Folder_Name: d.Folder_Name || sanitizeFolderName(d.Set_Name), Sport: d.Sport, Year: d.Year, Manufacturer: d.Manufacturer, TCDB_URL: d.TCDB_URL })} className="px-2 py-0.5 rounded-lg bg-sky-900/70 hover:bg-sky-700 text-sky-200 text-[10px] font-bold">+ Stage</button></td>
-                                <td className="p-2">{isTrk ? <span className="text-emerald-400 font-bold">✅ Tracked</span> : isInCart ? <span className="text-amber-300 font-bold">🛒 In Cart</span> : <span className="text-slate-400">Available</span>}</td>
+                                <td className="p-2"><button onClick={() => stageSetIntoCart({ Set_Name: d.Set_Name, Folder_Name: d.Folder_Name || sanitizeFolderName(d.Set_Name), Sport: d.Sport, Year: d.Year, Manufacturer: d.Manufacturer, Release_Date: d.Release_Date || '', Release_Status: d.Release_Status || '', TCDB_URL: d.TCDB_URL })} className="px-2 py-0.5 rounded-lg bg-sky-900/70 hover:bg-sky-700 text-sky-200 text-[10px] font-bold">+ Stage</button></td>
+                                <td className="p-2">
+                                  {d._isTrk ? (
+                                    <span className="text-emerald-400 font-bold">✅ Tracked</span>
+                                  ) : d._isInCart ? (
+                                    <span className="text-amber-300 font-bold">🛒 In Cart</span>
+                                  ) : d._isPreRelease ? (
+                                    <span className="px-2 py-0.5 rounded-full bg-violet-950/90 border border-violet-500/60 text-violet-200 text-[10.5px] font-bold">🕒 Pre-Release</span>
+                                  ) : (
+                                    <span className="text-slate-400">Available</span>
+                                  )}
+                                  {(d._isTrk || d._isInCart) && d._isPreRelease && (
+                                    <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-violet-950/90 border border-violet-500/60 text-violet-200 text-[9.5px] font-bold">Pre-Release</span>
+                                  )}
+                                </td>
                                 <td className="p-2 font-mono">{d.Year}</td>
+                                <td className="p-2 font-mono text-slate-200">{relDisplay || <span className="text-slate-500">—</span>}</td>
                                 <td className="p-2">{d.Sport}</td>
                                 <td className="p-2 font-semibold text-white">{d.Set_Name}</td>
                                 <td className="p-2">{d.Manufacturer}</td>
-                                <td className="p-2 text-slate-300">{d.Category || 'Major Release'}</td>
+                                <td className="p-2 text-slate-300">{d._catNorm}</td>
                                 <td className="p-2 font-mono text-sky-300">{d.Image_Pct || '—'}</td>
-                                <td className="p-2 font-mono text-slate-300">{d.Folder_Name}</td>
                                 <td className="p-2 font-mono text-slate-400">{d.SID}</td>
                                 <td className="p-2"><a href={d.TCDB_URL} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">Open ↗</a></td>
                               </tr>
@@ -12692,9 +12900,38 @@ export default function App() {
                           title="Developer & Debugging Tools"
                           subtitle="System diagnostics, Python AST audit, cache purge & maintenance triggers"
                           accentCls="text-fuchsia-300"
+                          extra={
+                            !settingsLayout.devtools?.collapsed && (
+                              <button
+                                type="button"
+                                onClick={() => setShowMaintenanceWidget(!showMaintenanceWidget)}
+                                className={`px-3 py-1 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition ${showMaintenanceWidget ? skin.accentActive : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'}`}
+                              >
+                                🔧 Maintenance {showMaintenanceWidget ? '⌄' : '›'}
+                              </button>
+                            )
+                          }
                         />
                         {!settingsLayout.devtools?.collapsed && (
                           <div className="space-y-3">
+                            {showMaintenanceWidget && (
+                              <div className="p-3.5 bg-slate-950/85 border border-amber-500/30 rounded-xl space-y-2.5">
+                                <div className="text-xs font-bold text-amber-300">🛠️ Checklist &amp; Reference Library Maintenance Tools</div>
+                                <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-2">
+                                  <button
+                                    onClick={() => triggerJob('set_scraper', 'Clean & Dedupe Tracked Sets & Directory', 'deduplicate_tracked_sets', { estimated_total: Math.max(1, trackedSets.length) })}
+                                    className="py-2 px-3 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs shadow"
+                                  >
+                                    🧹 Clean &amp; Dedupe Tracked Sets
+                                  </button>
+                                  <button onClick={() => triggerJob('set_scraper', 'Clean Reference Library Folders & Filenames', 'clean_reference_library', { estimated_total: Math.max(1, trackedSets.length) })} className={`py-2 px-3 rounded-xl font-bold text-xs ${skin.accentBtn}`}>🗂️ Clean Ref Library Folders &amp; Names</button>
+                                  <button onClick={() => triggerJob('set_scraper', 'Repair Existing Checklist CSVs', 'repair_checklists', { estimated_total: Math.max(1, trackedSets.length) })} className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 font-bold text-xs">🔧 Repair LL / CPC / Var CSVs</button>
+                                  <button onClick={() => triggerJob('set_scraper', 'Sync Set Library Download Status', 'sync_set_library_status', { estimated_total: Math.max(1, trackedSets.length) })} className="py-2 px-3 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs">🔄 Sync Download Status</button>
+                                  <button onClick={() => triggerJob('set_scraper', 'Rebuild Visual Feature Cache (.pkl)', 'rebuild_feature_cache', { estimated_total: 1 })} className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 font-bold text-xs">🧠 Rebuild Feature Cache</button>
+                                  <button onClick={() => triggerJob('system', 'Build / Update DINOv2 Neural Index (GPU)', 'build_neural_index', { batch_size: 32, force_rebuild: false, estimated_total: 1000 })} className="py-2 px-3 rounded-xl bg-indigo-950/90 hover:bg-indigo-800 border border-indigo-600/70 text-indigo-200 font-bold text-xs">🧬 Update Neural Index</button>
+                                </div>
+                              </div>
+                            )}
                             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
                               <button onClick={() => fetch(`${NODE_API_BASE}/devtools/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'ast_audit' }) }).then((r) => r.json()).then((res) => { if (res.success) { setDevAuditResults(res.results || []); pushNotification('AST Audit Complete', `Checked ${(res.results || []).length} Python modules.`, 'DevTools', 'info'); } })} className="py-2 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold text-sky-300">🔍 Python AST Audit</button>
                               <button onClick={() => fetch(`${NODE_API_BASE}/devtools/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'clear_cache' }) }).then((r) => r.json()).then((res) => pushNotification('Caches Cleared', res.message || 'Done', 'DevTools', 'warning'))} className="py-2 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold text-amber-300">🧹 Purge .pkl Caches</button>

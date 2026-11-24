@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Optional, Union
 from urllib.parse import quote, urljoin
@@ -53,6 +53,7 @@ from Core.config import (
     ARCHIVE_DIR,
     BASE_DIR,
     BN_TRACKING_FILE,
+    BRAND_NORMALIZATION_RULES,
     CACHE_CATALOGS_DIR,
     CACHE_CHECKPOINTS_DIR,
     CHECKLIST_BACKUP_PATH,
@@ -84,11 +85,13 @@ from Core.config import (
     canonical_set_key,
     canonical_subset_key,
     ensure_directories,
+    format_display_set_name,
     format_print_run,
     format_proxy_host_port,
     interprocess_file_lock,
     load_scraper_settings,
     norm,
+    normalize_brand_name,
     normalize_numeric_tcdb_cid,
     normalize_proxy_pool,
     parse_unified_card_filename,
@@ -161,6 +164,8 @@ MASTER_DIRECTORY_COLUMNS = [
     "Set_Name",
     "Manufacturer",
     "Category",
+    "Release_Date",
+    "Release_Status",
     "Image_Pct",
     "Folder_Name",
     "TCDB_URL",
@@ -1683,23 +1688,239 @@ _SUBBRAND_MANUFACTURER_PATTERNS: list[tuple[str, str]] = [
 
 
 def _infer_manufacturer(set_title: str, url: str = "", existing_mfg: str = "", category: str = "") -> str:
-    """Accurately infers card manufacturer from set title & URL without falsely defaulting unknown brands to Topps."""
-    combined = f"{set_title} {url}".replace("_", " ").replace("-", " ")
-    for pat, mfg_name in _EXPLICIT_MANUFACTURER_PATTERNS:
-        if re.search(pat, combined, re.IGNORECASE):
-            return mfg_name
-    for pat, mfg_name in _SUBBRAND_MANUFACTURER_PATTERNS:
-        if re.search(pat, combined, re.IGNORECASE):
-            return mfg_name
-    ex_clean = str(existing_mfg or "").strip()
-    if ex_clean and ex_clean.lower() not in ("topps", "unknown", "none", "nan"):
-        return ex_clean
-    cat_low = str(category or "").lower()
-    if any(k in cat_low for k in ("college", "team issue", "stadium giveaway", "sga", "promo")) or any(
-        k in combined.lower() for k in ("sga", "juco", "world series", "community college")
-    ):
-        return "Team / School Issue"
-    return "Other"
+    """Accurately infers card brand/manufacturer using config-driven BRAND_NORMALIZATION_RULES."""
+    return normalize_brand_name(set_title, url=url, existing_mfg=existing_mfg, category=category)
+
+
+_RELEASE_DATE_IGNORED_TOKENS = {"", "tbd", "tba", "unknown", "n/a", "na", "none", "null", "nan", "-"}
+_MONTH_ABBREV_MAP = {
+    "jan": "Jan", "january": "Jan",
+    "feb": "Feb", "february": "Feb",
+    "mar": "Mar", "march": "Mar",
+    "apr": "Apr", "april": "Apr",
+    "may": "May",
+    "jun": "Jun", "june": "Jun",
+    "jul": "Jul", "july": "Jul",
+    "aug": "Aug", "august": "Aug",
+    "sep": "Sep", "sept": "Sep", "september": "Sep",
+    "oct": "Oct", "october": "Oct",
+    "nov": "Nov", "november": "Nov",
+    "dec": "Dec", "december": "Dec",
+}
+
+
+def normalize_release_date(raw_val: str) -> str:
+    """Normalizes a TCDB release date string into canonical ISO `YYYY-MM-DD`, or `""` if unknown."""
+    s = trim_clean(raw_val)
+    if not s or s.lower() in _RELEASE_DATE_IGNORED_TOKENS:
+        return ""
+    s = re.sub(r"\b(st|nd|rd|th)\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" ,.;:-")
+    if not s or s.lower() in _RELEASE_DATE_IGNORED_TOKENS:
+        return ""
+
+    # Already ISO YYYY-MM-DD (or YYYY/MM/DD)
+    m_iso = re.search(r"\b((?:18|19|20)\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", s)
+    if m_iso:
+        try:
+            return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))).isoformat()
+        except ValueError:
+            pass
+
+    # US numeric MM/DD/YYYY or M-D-YYYY
+    m_us = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/]((?:18|19|20)\d{2})\b", s)
+    if m_us:
+        try:
+            return date(int(m_us.group(3)), int(m_us.group(1)), int(m_us.group(2))).isoformat()
+        except ValueError:
+            pass
+
+    # Month DD, YYYY or Mon. DD, YYYY
+    m_mdy = re.search(r"\b([A-Za-z]+)\.?\s+(\d{1,2}),?\s+((?:18|19|20)\d{2})\b", s)
+    if m_mdy:
+        mon_abbr = _MONTH_ABBREV_MAP.get(m_mdy.group(1).lower())
+        if mon_abbr:
+            try:
+                return datetime.strptime(f"{mon_abbr} {int(m_mdy.group(2))} {m_mdy.group(3)}", "%b %d %Y").date().isoformat()
+            except ValueError:
+                pass
+
+    # DD Month YYYY
+    m_dmy = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\.?,?\s+((?:18|19|20)\d{2})\b", s)
+    if m_dmy:
+        mon_abbr = _MONTH_ABBREV_MAP.get(m_dmy.group(2).lower())
+        if mon_abbr:
+            try:
+                return datetime.strptime(f"{mon_abbr} {int(m_dmy.group(1))} {m_dmy.group(3)}", "%b %d %Y").date().isoformat()
+            except ValueError:
+                pass
+
+    # Month YYYY -> YYYY-MM-01
+    m_my = re.search(r"\b([A-Za-z]+)\.?\s+((?:18|19|20)\d{2})\b", s)
+    if m_my:
+        mon_abbr = _MONTH_ABBREV_MAP.get(m_my.group(1).lower())
+        if mon_abbr:
+            try:
+                return datetime.strptime(f"{mon_abbr} 1 {m_my.group(2)}", "%b %d %Y").date().isoformat()
+            except ValueError:
+                pass
+
+    return ""
+
+
+def format_release_date_display(iso_date: str) -> str:
+    """Formats ISO `YYYY-MM-DD` as `'Mon D, YYYY'` (e.g. `'Feb 12, 2025'`), or `''` if blank/invalid."""
+    norm_iso = normalize_release_date(iso_date)
+    if not norm_iso:
+        return ""
+    try:
+        dt = datetime.strptime(norm_iso, "%Y-%m-%d").date()
+        return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    except Exception:
+        return ""
+
+
+def is_pre_release_set(
+    release_date_iso: str = "",
+    is_unreleased_flag: bool = False,
+    reference_date: Optional[date] = None,
+) -> bool:
+    """Returns True if a set is explicitly unreleased or has a Release Date strictly in the future."""
+    if is_unreleased_flag:
+        return True
+    norm_iso = normalize_release_date(release_date_iso)
+    if not norm_iso:
+        return False
+    try:
+        rel_dt = datetime.strptime(norm_iso, "%Y-%m-%d").date()
+        ref_dt = reference_date or date.today()
+        return rel_dt > ref_dt
+    except Exception:
+        return False
+
+
+def compute_set_release_status(
+    release_date_iso: str = "",
+    is_unreleased_flag: bool = False,
+    reference_date: Optional[date] = None,
+) -> str:
+    """Returns `'Pre-Release'` for future/unreleased sets, `'Released'` for dated past/today sets, else `''`."""
+    if is_pre_release_set(release_date_iso, is_unreleased_flag=is_unreleased_flag, reference_date=reference_date):
+        return "Pre-Release"
+    if normalize_release_date(release_date_iso):
+        return "Released"
+    return ""
+
+
+_UNRELEASED_TEXT_RE = re.compile(
+    r"\b(not\s+yet\s+released|unreleased|pre[-\s]?release|coming\s+soon|tbd|tba)\b",
+    re.IGNORECASE,
+)
+_RELEASE_LABEL_RE = re.compile(
+    r"(?:expected\s+release(?:\s+date)?|scheduled\s+release(?:\s+date)?|release\s+date|released)\s*[:\-]?\s*(.*)",
+    re.IGNORECASE,
+)
+
+
+def extract_release_date_from_viewset_html(html_or_soup) -> tuple[str, bool]:
+    """
+    Extracts `(release_date_iso, is_unreleased)` from a TCDB `ViewSet.cfm` page.
+    Supports `<dt>/<dd>`, `<th>/<td>`, `<strong>/<b>`, `<p>/<li>/<div>` labeled rows,
+    and JSON-LD/meta `releaseDate`.
+    """
+    if not html_or_soup:
+        return "", False
+    if isinstance(html_or_soup, str):
+        if BeautifulSoup is None:
+            m_lbl = _RELEASE_LABEL_RE.search(html_or_soup)
+            if m_lbl:
+                cand = trim_clean(re.sub(r"<[^>]+>", " ", m_lbl.group(1)))
+                iso = normalize_release_date(cand)
+                return iso, bool(_UNRELEASED_TEXT_RE.search(cand))
+            return "", False
+        soup = BeautifulSoup(html_or_soup, "html.parser")
+    else:
+        soup = html_or_soup
+
+    candidates: list[str] = []
+
+    # 1. Definition lists: <dt>Release Date</dt><dd>Feb 12, 2025</dd>
+    for dt in soup.find_all("dt"):
+        dt_txt = trim_clean(dt.get_text(" ", strip=True))
+        if re.search(r"release", dt_txt, re.IGNORECASE):
+            dd = dt.find_next_sibling("dd")
+            if dd is not None:
+                candidates.append(trim_clean(dd.get_text(" ", strip=True)))
+
+    # 2. Table rows: <th>/<td>Release Date:</td><td>Feb 12, 2025</td>
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["th", "td"])
+        if len(cells) >= 2:
+            k_txt = trim_clean(cells[0].get_text(" ", strip=True))
+            if re.search(r"release", k_txt, re.IGNORECASE):
+                candidates.append(trim_clean(cells[1].get_text(" ", strip=True)))
+
+    # 3. Bold/strong labels or inline paragraphs/list items
+    for tag in soup.find_all(["strong", "b", "label", "span"]):
+        t_txt = trim_clean(tag.get_text(" ", strip=True))
+        if re.search(r"^(?:expected\s+|scheduled\s+)?release(?:\s+date)?\s*:?$", t_txt, re.IGNORECASE):
+            parent_txt = trim_clean(tag.parent.get_text(" ", strip=True)) if tag.parent else ""
+            m_p = _RELEASE_LABEL_RE.search(parent_txt)
+            if m_p and m_p.group(1).strip():
+                candidates.append(m_p.group(1).strip())
+            elif tag.next_sibling:
+                candidates.append(trim_clean(str(tag.next_sibling)))
+
+    for block in soup.find_all(["p", "li", "div"]):
+        b_txt = trim_clean(block.get_text(" ", strip=True))
+        if len(b_txt) <= 160:
+            m_b = _RELEASE_LABEL_RE.search(b_txt)
+            if m_b and m_b.group(1).strip():
+                candidates.append(m_b.group(1).strip())
+
+    # 4. Meta / JSON-LD releaseDate
+    for meta in soup.find_all("meta"):
+        m_name = str(meta.get("name") or meta.get("property") or meta.get("itemprop") or "").lower()
+        if "releasedate" in m_name or "release_date" in m_name:
+            candidates.append(trim_clean(meta.get("content") or ""))
+
+    full_txt = trim_clean(soup.get_text(" ", strip=True))
+    is_unreleased = bool(
+        re.search(r"\b(?:not\s+yet\s+released|unreleased\s+set|coming\s+soon)\b", full_txt, re.IGNORECASE)
+    )
+
+    for cand in candidates:
+        if _UNRELEASED_TEXT_RE.search(cand):
+            is_unreleased = True
+        iso = normalize_release_date(cand)
+        if iso:
+            return iso, is_unreleased
+
+    return "", is_unreleased
+
+
+def sort_sets_by_release_date(
+    items: list[dict],
+    date_key: str = "Release_Date",
+    name_key: str = "Set_Name",
+) -> list[dict]:
+    """
+    Sorts sets Newest to Oldest by normalized ISO `Release_Date` (blank/unknown dates
+    always placed at the bottom), tie-broken alphabetically (case-insensitive) by name.
+    """
+    def _sort_key(item: dict) -> tuple[int, str, str]:
+        raw_d = str(item.get(date_key) or item.get("release_date") or "").strip()
+        iso = normalize_release_date(raw_d)
+        disp_name = format_display_set_name(
+            str(item.get(name_key) or item.get("Display_Name") or item.get("Folder_Name") or "")
+        ).lower()
+        if not iso:
+            return (1, "", disp_name)
+        # Negate YYYYMMDD integer so newest dates sort first while name stays ascending
+        ymd_int = int(iso.replace("-", ""))
+        return (0, f"{99999999 - ymd_int:08d}", disp_name)
+
+    return sorted(list(items or []), key=_sort_key)
 
 
 _CANONICAL_TCDB_SECTIONS = {
@@ -1798,6 +2019,37 @@ def _infer_sport_year_mfg(folder_or_title: str, url: str = "") -> tuple[str, str
     return sport, yr, mfg
 
 
+_DIR_RELEASE_DATE_CACHE = {"mtime": -1.0, "by_sid": {}, "by_key": {}}
+
+
+def _get_directory_release_date_lookup() -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    """Fast mtime-cached lookup of `(Release_Date, Release_Status)` from `TCDB_Set_Directory.csv`."""
+    if not MASTER_DIRECTORY_FILE.exists():
+        return {}, {}
+    try:
+        mt = MASTER_DIRECTORY_FILE.stat().st_mtime
+        if _DIR_RELEASE_DATE_CACHE["mtime"] != mt:
+            by_sid: dict[str, tuple[str, str]] = {}
+            by_key: dict[str, tuple[str, str]] = {}
+            df_d = pd.read_csv(MASTER_DIRECTORY_FILE, dtype=str, keep_default_na=False)
+            for _, r in df_d.iterrows():
+                rel_d = normalize_release_date(str(r.get("Release_Date") or ""))
+                rel_s = str(r.get("Release_Status") or "").strip()
+                if not rel_d and rel_s.lower() != "pre-release":
+                    continue
+                val = (rel_d, rel_s)
+                sid_s = str(r.get("SID") or "").strip() or extract_tcdb_sid(str(r.get("TCDB_URL") or ""))
+                if sid_s:
+                    by_sid[sid_s] = val
+                s_n = str(r.get("Set_Name") or "").strip()
+                if s_n:
+                    by_key[canonical_set_key(s_n)] = val
+            _DIR_RELEASE_DATE_CACHE.update({"mtime": mt, "by_sid": by_sid, "by_key": by_key})
+        return _DIR_RELEASE_DATE_CACHE["by_sid"], _DIR_RELEASE_DATE_CACHE["by_key"]
+    except Exception:
+        return {}, {}
+
+
 def load_tracked_sets_meta(prioritize: bool = True) -> dict[str, dict]:
     ensure_directories()
     raw_data = {}
@@ -1818,40 +2070,68 @@ def load_tracked_sets_meta(prioritize: bool = True) -> dict[str, dict]:
                             "year": str(item.get("Year") or item.get("year") or ""),
                             "manufacturer": str(item.get("Manufacturer") or item.get("manufacturer") or "Topps"),
                             "last_scraped": str(item.get("Last_Scraped") or item.get("last_scraped") or ""),
+                            "release_date": str(item.get("Release_Date") or item.get("release_date") or ""),
+                            "release_status": str(item.get("Release_Status") or item.get("release_status") or ""),
                         }
         except Exception:
             raw_data = {}
 
+    dir_by_sid, dir_by_key = _get_directory_release_date_lookup()
     normalized: dict[str, dict] = {}
     for url_k, val in raw_data.items():
         u = str(url_k).strip()
         if not u:
             continue
+        sid_u = extract_tcdb_sid(u)
         if isinstance(val, str):
             fn = val.strip().replace(" ", "_")
             sp, yr, mfg = _infer_sport_year_mfg(fn, u)
+            chk_title = canonicalize_checklist_set_title(fn)
+            dir_rel = dir_by_sid.get(sid_u) or dir_by_key.get(canonical_set_key(chk_title)) or ("", "")
+            rel_iso = normalize_release_date(dir_rel[0])
+            rel_unrel = dir_rel[1].lower() == "pre-release"
+            rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else ""
             normalized[u] = {
                 "folder_name": fn,
                 "sport": sp,
                 "year": yr,
                 "manufacturer": mfg,
                 "checklist_source": "Auto",
-                "checklist_set_name": canonicalize_checklist_set_title(fn),
+                "checklist_set_name": chk_title,
                 "last_scraped": "",
                 "last_upgraded": "",
+                "release_date": rel_iso,
+                "release_date_display": format_release_date_display(rel_iso),
+                "release_status": rel_status,
             }
         elif isinstance(val, dict):
             fn = str(val.get("folder_name") or val.get("Folder_Name") or "Tracked_Set").strip().replace(" ", "_")
             sp_def, yr_def, mfg_def = _infer_sport_year_mfg(fn, u)
+            chk_title = str(val.get("checklist_set_name") or canonicalize_checklist_set_title(fn)).strip()
+            mfg_raw = str(val.get("manufacturer") or mfg_def).strip()
+            mfg_norm = _infer_manufacturer(chk_title or fn, url=u, existing_mfg=mfg_raw)
+            rel_iso = normalize_release_date(str(val.get("release_date") or val.get("Release_Date") or ""))
+            raw_rel_status = str(val.get("release_status") or val.get("Release_Status") or "").strip()
+            if not rel_iso:
+                dir_rel = dir_by_sid.get(sid_u) or dir_by_key.get(canonical_set_key(chk_title)) or ("", "")
+                if dir_rel[0]:
+                    rel_iso = normalize_release_date(dir_rel[0])
+                if not raw_rel_status and dir_rel[1]:
+                    raw_rel_status = dir_rel[1]
+            rel_unrel = raw_rel_status.lower() == "pre-release"
+            rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else ""
             normalized[u] = {
                 "folder_name": fn,
                 "sport": str(val.get("sport") or sp_def).strip(),
                 "year": str(val.get("year") or yr_def).strip(),
-                "manufacturer": str(val.get("manufacturer") or mfg_def).strip(),
+                "manufacturer": mfg_norm,
                 "checklist_source": str(val.get("checklist_source") or "Auto").strip(),
-                "checklist_set_name": str(val.get("checklist_set_name") or canonicalize_checklist_set_title(fn)).strip(),
+                "checklist_set_name": chk_title,
                 "last_scraped": str(val.get("last_scraped") or "").strip(),
                 "last_upgraded": str(val.get("last_upgraded") or "").strip(),
+                "release_date": rel_iso,
+                "release_date_display": format_release_date_display(rel_iso),
+                "release_status": rel_status,
             }
 
     if not prioritize:
@@ -1883,28 +2163,41 @@ def save_all_tracked_sets(tracked_dict: dict[str, dict]) -> dict[str, dict]:
         if isinstance(m, str):
             fn = m.strip().replace(" ", "_")
             sp, yr, mfg = _infer_sport_year_mfg(fn, u_clean)
+            rel_iso = normalize_release_date(prev.get("release_date", ""))
+            rel_unrel = str(prev.get("release_status") or "").strip().lower() == "pre-release"
             merged[u_clean] = {
                 "folder_name": fn,
                 "sport": prev.get("sport", sp),
                 "year": prev.get("year", yr),
-                "manufacturer": prev.get("manufacturer", mfg),
+                "manufacturer": _infer_manufacturer(fn, url=u_clean, existing_mfg=prev.get("manufacturer", mfg)),
                 "checklist_source": prev.get("checklist_source", "Auto"),
                 "checklist_set_name": canonicalize_checklist_set_title(fn),
                 "last_scraped": prev.get("last_scraped", ""),
                 "last_upgraded": prev.get("last_upgraded", ""),
+                "release_date": rel_iso,
+                "release_date_display": format_release_date_display(rel_iso),
+                "release_status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
             }
         else:
             fn = str(m.get("folder_name") or prev.get("folder_name") or "Set").strip().replace(" ", "_")
             sp, yr, mfg = _infer_sport_year_mfg(fn, u_clean)
+            chk_title = str(m.get("checklist_set_name") or canonicalize_checklist_set_title(fn)).strip()
+            rel_raw = m.get("release_date") if "release_date" in m else prev.get("release_date", "")
+            rel_iso = normalize_release_date(str(rel_raw or ""))
+            raw_rel_st = str(m.get("release_status") if "release_status" in m else prev.get("release_status", "")).strip()
+            rel_unrel = raw_rel_st.lower() == "pre-release"
             merged[u_clean] = {
                 "folder_name": fn,
                 "sport": str(m.get("sport") or prev.get("sport") or sp).strip(),
                 "year": str(m.get("year") or prev.get("year") or yr).strip(),
-                "manufacturer": str(m.get("manufacturer") or prev.get("manufacturer") or mfg).strip(),
+                "manufacturer": _infer_manufacturer(chk_title or fn, url=u_clean, existing_mfg=str(m.get("manufacturer") or prev.get("manufacturer") or mfg).strip()),
                 "checklist_source": str(m.get("checklist_source") or prev.get("checklist_source") or "Auto").strip(),
-                "checklist_set_name": str(m.get("checklist_set_name") or canonicalize_checklist_set_title(fn)).strip(),
+                "checklist_set_name": chk_title,
                 "last_scraped": str(m.get("last_scraped") if "last_scraped" in m else prev.get("last_scraped", "")).strip(),
                 "last_upgraded": str(m.get("last_upgraded") if "last_upgraded" in m else prev.get("last_upgraded", "")).strip(),
+                "release_date": rel_iso,
+                "release_date_display": format_release_date_display(rel_iso),
+                "release_status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
             }
     with open(TRACKING_FILE, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2)
@@ -1935,12 +2228,17 @@ def save_set_cart(cart_items: list[dict]) -> list[dict]:
             continue
         seen_urls.add(u)
         fn = str(item.get("Folder_Name") or item.get("Set_Name") or "Tracked_Set").strip().replace(" ", "_")
+        set_nm = str(item.get("Set_Name") or fn.replace("_", " ")).strip()
+        rel_iso = normalize_release_date(str(item.get("Release_Date") or ""))
+        rel_unrel = str(item.get("Release_Status") or "").strip().lower() == "pre-release"
         cleaned.append({
-            "Set_Name": str(item.get("Set_Name") or fn.replace("_", " ")).strip(),
+            "Set_Name": set_nm,
             "Folder_Name": fn,
             "Sport": str(item.get("Sport") or "Baseball").strip(),
             "Year": str(item.get("Year") or "").strip(),
-            "Manufacturer": str(item.get("Manufacturer") or "Topps").strip(),
+            "Manufacturer": _infer_manufacturer(set_nm or fn, url=u, existing_mfg=str(item.get("Manufacturer") or "").strip()),
+            "Release_Date": rel_iso,
+            "Release_Status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
             "TCDB_URL": u,
         })
     with open(SET_CART_FILE, "w", encoding="utf-8") as f:
@@ -1967,15 +2265,21 @@ def commit_set_cart_to_tracked(auto_search_breakninja: bool = False) -> dict:
         fn = str(item.get("Folder_Name") or "").strip().replace(" ", "_")
         if not u or not fn:
             continue
+        prev = trk.get(u, {})
+        rel_iso = normalize_release_date(str(item.get("Release_Date") or prev.get("release_date") or ""))
+        rel_unrel = str(item.get("Release_Status") or prev.get("release_status") or "").strip().lower() == "pre-release"
         trk[u] = {
             "folder_name": fn,
             "sport": str(item.get("Sport") or "Baseball").strip(),
             "year": str(item.get("Year") or "").strip(),
-            "manufacturer": str(item.get("Manufacturer") or "Topps").strip(),
+            "manufacturer": _infer_manufacturer(fn, url=u, existing_mfg=str(item.get("Manufacturer") or "").strip()),
             "checklist_source": "Auto",
             "checklist_set_name": canonicalize_checklist_set_title(fn),
-            "last_scraped": trk.get(u, {}).get("last_scraped", ""),
-            "last_upgraded": trk.get(u, {}).get("last_upgraded", ""),
+            "last_scraped": prev.get("last_scraped", ""),
+            "last_upgraded": prev.get("last_upgraded", ""),
+            "release_date": rel_iso,
+            "release_date_display": format_release_date_display(rel_iso),
+            "release_status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
         }
         added += 1
     save_all_tracked_sets(trk)
@@ -2108,6 +2412,10 @@ def _normalize_and_deduplicate_directory_df(df: pd.DataFrame) -> tuple[pd.DataFr
 
         cat_fixed = _infer_set_category(canon_name, sport=sp_s, existing_cat=str(r.get("Category") or ""))
         mfg_fixed = _infer_manufacturer(canon_name, url=u, existing_mfg=str(r.get("Manufacturer") or ""), category=cat_fixed)
+        rel_iso = normalize_release_date(str(r.get("Release_Date") or ""))
+        raw_rel_st = str(r.get("Release_Status") or "").strip()
+        rel_unrel = raw_rel_st.lower() == "pre-release"
+        rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else ""
         img_pct = _format_image_pct(r.get("Image_Pct")) or local_pct_map.get(c_set_key, "") or local_pct_map.get(canonical_set_key(canon_folder), "")
 
         cleaned_rows.append({
@@ -2118,15 +2426,16 @@ def _normalize_and_deduplicate_directory_df(df: pd.DataFrame) -> tuple[pd.DataFr
             "Set_Name": canon_name,
             "Manufacturer": mfg_fixed,
             "Category": cat_fixed,
+            "Release_Date": rel_iso,
+            "Release_Status": rel_status,
             "Image_Pct": img_pct,
             "Folder_Name": canon_folder,
             "TCDB_URL": u,
             "Last_Crawled": str(r.get("Last_Crawled") or datetime.now().strftime("%Y-%m-%d")).strip(),
         })
 
-    out_df = pd.DataFrame(cleaned_rows, columns=MASTER_DIRECTORY_COLUMNS)
-    if not out_df.empty:
-        out_df = out_df.sort_values(by=["Year", "Sport", "Set_Name"], ascending=[False, True, True]).reset_index(drop=True)
+    sorted_rows = sort_sets_by_release_date(cleaned_rows, date_key="Release_Date", name_key="Set_Name")
+    out_df = pd.DataFrame(sorted_rows, columns=MASTER_DIRECTORY_COLUMNS)
     removed = max(0, before_cnt - len(out_df))
     return out_df, removed
 
@@ -2141,14 +2450,18 @@ def load_tcdb_master_directory() -> pd.DataFrame:
             yr_s = str(m.get("year") or "2026")
             sp_s = m.get("sport", "Baseball")
             s_name = canonicalize_checklist_set_title(m.get("folder_name", "").replace("_", " "))
+            rel_iso = normalize_release_date(str(m.get("release_date") or ""))
+            rel_unrel = str(m.get("release_status") or "").strip().lower() == "pre-release"
             rows.append({
                 "SID": sid_s,
                 "Year": yr_s,
                 "Era": _year_to_era_bucket(yr_s),
                 "Sport": sp_s,
                 "Set_Name": s_name,
-                "Manufacturer": m.get("manufacturer", "Topps"),
-                "Category": "Main Set",
+                "Manufacturer": _infer_manufacturer(s_name, url=u, existing_mfg=m.get("manufacturer", "")),
+                "Category": "Major Releases",
+                "Release_Date": rel_iso,
+                "Release_Status": "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=rel_unrel) else "",
                 "Image_Pct": "100%",
                 "Folder_Name": canonicalize_set_folder_name(s_name, sport=sp_s, year=yr_s),
                 "TCDB_URL": u,
@@ -2235,16 +2548,22 @@ def deduplicate_tracked_sets_and_directory() -> dict:
 
         best_scraped = max([str(x[1].get("last_scraped") or "") for x in grp])
         best_upgraded = max([str(x[1].get("last_upgraded") or "") for x in grp])
+        best_rel_date = max([normalize_release_date(str(x[1].get("release_date") or "")) for x in grp])
+        any_pre_rel = any(str(x[1].get("release_status") or "").strip().lower() == "pre-release" for x in grp)
+        rel_status = "Pre-Release" if is_pre_release_set(best_rel_date, is_unreleased_flag=any_pre_rel) else ""
 
         final_tracked[win_u] = {
             "folder_name": new_fn,
             "sport": sp,
             "year": yr or _infer_sport_year_mfg(new_fn, win_u)[1],
-            "manufacturer": str(win_m.get("manufacturer") or _infer_sport_year_mfg(new_fn, win_u)[2]).strip(),
+            "manufacturer": _infer_manufacturer(new_chk_title or new_fn, url=win_u, existing_mfg=str(win_m.get("manufacturer") or "").strip()),
             "checklist_source": str(win_m.get("checklist_source") or "Auto").strip(),
             "checklist_set_name": new_chk_title,
             "last_scraped": best_scraped,
             "last_upgraded": best_upgraded,
+            "release_date": best_rel_date,
+            "release_date_display": format_release_date_display(best_rel_date),
+            "release_status": rel_status,
         }
 
     with open(TRACKING_FILE, "w", encoding="utf-8") as f:
@@ -2345,18 +2664,81 @@ def _extract_image_pct_from_soup_or_node(el) -> str:
     return ""
 
 
-def _fetch_live_set_image_pct(req_session, viewset_url: str) -> str:
-    """Fetches a set's TCDB `ViewSet.cfm` page and extracts its live Image_Pct ('0%'..'100%')."""
+def _fetch_live_set_viewset_meta(req_session, viewset_url: str) -> dict:
+    """Fetches a set's TCDB `ViewSet.cfm` page and extracts Image_Pct, Release_Date, and Release_Status."""
     if not viewset_url or BeautifulSoup is None:
-        return ""
+        return {"image_pct": "", "release_date": "", "release_date_display": "", "is_unreleased": False, "release_status": ""}
     resp = safe_get(req_session, viewset_url, silent_404=True, max_403_retries=1)
     if not resp:
-        return ""
+        return {"image_pct": "", "release_date": "", "release_date_display": "", "is_unreleased": False, "release_status": ""}
     html = decode_html_response(resp)
     if not html:
-        return ""
+        return {"image_pct": "", "release_date": "", "release_date_display": "", "is_unreleased": False, "release_status": ""}
     soup = BeautifulSoup(html, "html.parser")
-    return _extract_image_pct_from_soup_or_node(soup)
+    img_pct = _extract_image_pct_from_soup_or_node(soup)
+    rel_iso, is_unrel = extract_release_date_from_viewset_html(soup)
+    rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=is_unrel) else ""
+    return {
+        "image_pct": img_pct,
+        "release_date": rel_iso,
+        "release_date_display": format_release_date_display(rel_iso),
+        "is_unreleased": is_unrel,
+        "release_status": rel_status,
+    }
+
+
+def _fetch_live_set_image_pct(req_session, viewset_url: str) -> str:
+    """Fetches a set's TCDB `ViewSet.cfm` page and extracts its live Image_Pct ('0%'..'100%')."""
+    return _fetch_live_set_viewset_meta(req_session, viewset_url).get("image_pct", "")
+
+
+def persist_set_release_date(set_url: str, release_date_iso: str, is_unreleased: bool = False) -> None:
+    """Persists normalized Release_Date and Release_Status into both `tracked_sets.json` and `TCDB_Set_Directory.csv`."""
+    ensure_directories()
+    rel_iso = normalize_release_date(release_date_iso)
+    rel_status = "Pre-Release" if is_pre_release_set(rel_iso, is_unreleased_flag=is_unreleased) else ""
+    if not rel_iso and not rel_status:
+        return
+    u_clean = str(set_url or "").strip()
+    sid_target = extract_tcdb_sid(u_clean)
+
+    # 1. Update tracked_sets.json if matching URL or SID exists
+    try:
+        trk = load_tracked_sets_meta(prioritize=False)
+        changed_trk = False
+        for k_url, meta in trk.items():
+            if k_url == u_clean or (sid_target and extract_tcdb_sid(k_url) == sid_target):
+                if rel_iso:
+                    meta["release_date"] = rel_iso
+                    meta["release_date_display"] = format_release_date_display(rel_iso)
+                if rel_status or not meta.get("release_status"):
+                    meta["release_status"] = rel_status
+                changed_trk = True
+        if changed_trk:
+            save_all_tracked_sets(trk)
+    except Exception:
+        pass
+
+    # 2. Update TCDB_Set_Directory.csv if matching SID or URL exists
+    try:
+        if MASTER_DIRECTORY_FILE.exists():
+            df_dir = pd.read_csv(MASTER_DIRECTORY_FILE, dtype=str, keep_default_na=False)
+            for col in ("Release_Date", "Release_Status"):
+                if col not in df_dir.columns:
+                    df_dir[col] = ""
+            mask = pd.Series(False, index=df_dir.index)
+            if sid_target:
+                mask = mask | (df_dir["SID"].astype(str).str.strip() == sid_target)
+            if u_clean:
+                mask = mask | (df_dir["TCDB_URL"].astype(str).str.strip() == u_clean)
+            if mask.any():
+                if rel_iso:
+                    df_dir.loc[mask, "Release_Date"] = rel_iso
+                df_dir.loc[mask, "Release_Status"] = rel_status
+                clean_df, _ = _normalize_and_deduplicate_directory_df(df_dir)
+                clean_df.to_csv(MASTER_DIRECTORY_FILE, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
 
 
 _DIR_IMG_PCT_CACHE = {"mtime": -1.0, "by_sid": {}, "by_key": {}}
@@ -2475,6 +2857,8 @@ def _parse_tcdb_viewall_page(html: str, sport: str, year_str: str) -> list[dict]
                 "Set_Name": canon_title,
                 "Manufacturer": mfg_inf,
                 "Category": cat_inf,
+                "Release_Date": "",
+                "Release_Status": "",
                 "Image_Pct": img_pct,
                 "Folder_Name": fn,
                 "TCDB_URL": full_url,
@@ -2541,6 +2925,10 @@ def repair_tcdb_set_directory(fetch_missing_image_pct: bool = False, max_live_fe
                             existing_by_sid[sid_k]["Category"] = rec["Category"]
                         if rec["Manufacturer"]:
                             existing_by_sid[sid_k]["Manufacturer"] = rec["Manufacturer"]
+                        if rec.get("Release_Date"):
+                            existing_by_sid[sid_k]["Release_Date"] = rec["Release_Date"]
+                        if rec.get("Release_Status"):
+                            existing_by_sid[sid_k]["Release_Status"] = rec["Release_Status"]
                         existing_by_sid[sid_k]["Last_Crawled"] = rec["Last_Crawled"]
                     else:
                         existing_by_sid[sid_k] = rec
@@ -2645,9 +3033,14 @@ def crawl_tcdb_master_set_directory(
                 parsed_recs = _parse_tcdb_viewall_page(html, sport=sp, year_str=str(yr))
                 for rec in parsed_recs:
                     sid_str = rec["SID"]
+                    prev_rec = existing_by_sid.get(sid_str) or {}
                     if not rec["Image_Pct"]:
-                        prev_pct = str((existing_by_sid.get(sid_str) or {}).get("Image_Pct") or "").strip()
+                        prev_pct = str(prev_rec.get("Image_Pct") or "").strip()
                         rec["Image_Pct"] = prev_pct or local_pct_map.get(canonical_set_key(rec["Set_Name"]), "")
+                    if not rec.get("Release_Date") and prev_rec.get("Release_Date"):
+                        rec["Release_Date"] = prev_rec["Release_Date"]
+                    if not rec.get("Release_Status") and prev_rec.get("Release_Status"):
+                        rec["Release_Status"] = prev_rec["Release_Status"]
                     existing_by_sid[sid_str] = rec
 
                 pct_100 = sum(1 for r in parsed_recs if r["Image_Pct"] == "100%")
@@ -7242,6 +7635,34 @@ def _compute_set_plan_metrics_cached(
             _PLAN_SET_STATS_CACHE.clear()
         _PLAN_SET_STATS_CACHE[cache_key] = res_obj
     return res_obj
+
+
+def get_tracked_set_queue_metrics(
+    set_url: str,
+    folder_name: str,
+    chk_title: str = "",
+    dead_backs_mtime: float = -1.0,
+    dead_fronts_mtime: float = -1.0,
+) -> dict:
+    """
+    Returns cached per-set queue metrics (`subset_updates_needed`, `missing_fronts`, `missing_backs`)
+    using `_compute_set_plan_stats` with zero HTTP requests.
+    """
+    resolved_title = chk_title or canonicalize_checklist_set_title(str(folder_name or "").replace("_", " "))
+    stats = _compute_set_plan_stats(
+        set_url=set_url,
+        folder_name=folder_name,
+        chk_title=resolved_title,
+        dead_backs_mtime=dead_backs_mtime,
+        dead_fronts_mtime=dead_fronts_mtime,
+        force_refresh=False,
+    )
+    ci = (stats.get("per_mode") or {}).get("checklist_and_images") or {}
+    return {
+        "subset_updates_needed": int(ci.get("subsets_to_update", 0) or 0),
+        "missing_fronts": int(ci.get("missing_fronts", 0) or 0),
+        "missing_backs": int(ci.get("missing_backs", 0) or 0),
+    }
 
 
 def build_scraper_execution_plan(
