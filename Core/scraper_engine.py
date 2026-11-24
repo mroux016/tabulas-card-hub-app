@@ -85,9 +85,12 @@ from Core.config import (
     canonical_subset_key,
     ensure_directories,
     format_print_run,
+    format_proxy_host_port,
     interprocess_file_lock,
+    load_scraper_settings,
     norm,
     normalize_numeric_tcdb_cid,
+    normalize_proxy_pool,
     parse_unified_card_filename,
     sanitize_filename_part,
     strip_accents,
@@ -171,13 +174,142 @@ RUN_METRICS: dict = {
     "sets": {},
 }
 
-IMAGE_CARD_JITTER_MIN_S = 3.5
-IMAGE_CARD_JITTER_MAX_S = 7.5
-IMAGE_BREATHER_EVERY_CARDS = 500
-IMAGE_BREATHER_MIN_S = 180.0
-IMAGE_BREATHER_MAX_S = 300.0
+IMAGE_CARD_JITTER_MIN_S = 0.5
+IMAGE_CARD_JITTER_MAX_S = 1.4
+IMAGE_BREATHER_EVERY_CARDS = 75
+IMAGE_BREATHER_MIN_S = 5.0
+IMAGE_BREATHER_MAX_S = 10.0
 DEFAULT_MAX_CARDS_PER_RUN = 4000
 CLOUDFLARE_COOLDOWN_SCHEDULE_S = (900.0, 1800.0, 3600.0)
+
+TCDB_IMAGE_FETCH_HEADERS: dict[str, str] = {
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_ACTIVE_PROXY_INDEX: int = 0
+
+
+def reset_proxy_pool_state():
+    """Resets the pinned proxy-pool index back to 0."""
+    global _ACTIVE_PROXY_INDEX
+    _ACTIVE_PROXY_INDEX = 0
+
+
+def _apply_proxy_to_session(sess, proxy_url: str = ""):
+    """Configures `sess.proxies` for HTTP/HTTPS when `proxy_url` is provided."""
+    if sess is None:
+        return sess
+    px = str(proxy_url or "").strip()
+    try:
+        if px:
+            sess.proxies = {"http": px, "https": px}
+        elif hasattr(sess, "proxies") and isinstance(sess.proxies, dict):
+            sess.proxies = {}
+    except Exception:
+        pass
+    try:
+        setattr(sess, "_active_proxy", px)
+    except Exception:
+        pass
+    return sess
+
+
+def _create_http_session(proxy_url: str = ""):
+    """
+    Creates a `curl_cffi.requests.Session` using dynamic `impersonate="chrome"`
+    (with clean fallback to `"chrome120"` only if an older `curl_cffi` raises
+    `ValueError`), falling back to `requests.Session` if `curl_cffi` is absent.
+    """
+    if cffi_requests is not None:
+        try:
+            sess = cffi_requests.Session(impersonate="chrome")
+        except ValueError:
+            sess = cffi_requests.Session(impersonate="chrome120")
+    else:
+        sess = requests.Session()
+    return _apply_proxy_to_session(sess, proxy_url)
+
+
+def _build_tcdb_image_headers(referer: str = "", user_agent: str = "") -> dict[str, str]:
+    """Returns browser-standard `<img>` fetch headers for `/Images/Large/` requests."""
+    hdrs = dict(TCDB_IMAGE_FETCH_HEADERS)
+    hdrs["Referer"] = str(referer or (BASE_URL + "/")).strip()
+    ua = str(user_agent or "").strip()
+    if ua:
+        hdrs["User-Agent"] = ua
+    return hdrs
+
+
+class _ImageDownloadPacer:
+    """Sequential per-card jitter and periodic breather pacer for image downloads."""
+
+    def __init__(
+        self,
+        card_delay_range: Optional[tuple[float, float]] = None,
+        breather_every_cards: Optional[int] = None,
+        breather_duration_range: Optional[tuple[float, float]] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        circuit_breaker: Optional["CloudflareImageCircuitBreaker"] = None,
+    ):
+        self.card_delay_range = (
+            (float(card_delay_range[0]), float(card_delay_range[1]))
+            if card_delay_range is not None
+            else (IMAGE_CARD_JITTER_MIN_S, IMAGE_CARD_JITTER_MAX_S)
+        )
+        self.breather_every_cards = (
+            int(breather_every_cards)
+            if breather_every_cards is not None
+            else IMAGE_BREATHER_EVERY_CARDS
+        )
+        self.breather_duration_range = (
+            (float(breather_duration_range[0]), float(breather_duration_range[1]))
+            if breather_duration_range is not None
+            else (IMAGE_BREATHER_MIN_S, IMAGE_BREATHER_MAX_S)
+        )
+        self.sleep_fn = sleep_fn
+        self.circuit_breaker = circuit_breaker
+        self.need_card_jitter = False
+        self.downloaded_cards = 0
+
+    def _sleep(self, seconds: float, reason: str) -> bool:
+        sec = max(0.0, float(seconds))
+        if sec <= 0.0:
+            return True
+        if self.sleep_fn is not None:
+            self.sleep_fn(sec)
+            return not is_stop_requested()
+        if self.circuit_breaker is not None:
+            return self.circuit_breaker.interruptible_sleep(sec, reason=reason)
+        time.sleep(sec)
+        return not is_stop_requested()
+
+    def before_network_card(self) -> bool:
+        if self.need_card_jitter and self.card_delay_range[1] > 0:
+            jitter_s = random.uniform(self.card_delay_range[0], self.card_delay_range[1])
+            self.need_card_jitter = False
+            return self._sleep(jitter_s, reason="card pacing")
+        return True
+
+    def mark_network_attempted(self):
+        self.need_card_jitter = True
+
+    def after_card_downloaded(self) -> bool:
+        self.downloaded_cards += 1
+        if (
+            self.breather_every_cards > 0
+            and self.downloaded_cards % self.breather_every_cards == 0
+            and self.breather_duration_range[1] > 0
+        ):
+            breather_s = random.uniform(self.breather_duration_range[0], self.breather_duration_range[1])
+            b_disp = f"{breather_s:.1f}s" if breather_s < 60.0 else f"{breather_s / 60.0:.1f}m"
+            log_msg(f"☕ Image pacing breather: {b_disp} after {self.downloaded_cards:,} downloaded card(s)...")
+            self.need_card_jitter = False
+            return self._sleep(breather_s, reason="pacing breather")
+        return True
 
 _LOG_CALLBACK: Optional[Callable[[str], None]] = None
 _PROGRESS_CALLBACK: Optional[Callable[[dict], None]] = None
@@ -590,9 +722,7 @@ def preflight_probe_tcdb_images(
     except Exception:
         ua = str(user_agent or "").strip()
 
-    probe_headers: dict[str, str] = {"Referer": BASE_URL + "/"}
-    if ua:
-        probe_headers["User-Agent"] = ua
+    probe_headers = _build_tcdb_image_headers(referer=BASE_URL + "/", user_agent=ua)
 
     accepts_cookies = False
     try:
@@ -713,24 +843,32 @@ def connect_session(
     rotate_profile: bool = False,
     max_clearance_failures: int = DEFAULT_MAX_CLEARANCE_FAILURES,
     require_image_probe: Optional[bool] = None,
+    proxy_pool: Optional[list[str]] = None,
 ):
     """
     Launches SeleniumBase UC mode to clear Cloudflare on `target_domain`, extracts
     `cf_clearance` cookies and User-Agent, and injects them into `curl_cffi.requests.Session`.
     Waits explicitly up to `clearance_timeout_s` (default 20s) for real TCDB page readiness
     (stopping early as soon as ready), preserves healthy cookies/profile unless recovering
-    from failure, runs a `/Images/Large/` pre-flight probe, and auto-pauses after
-    `max_clearance_failures` consecutive clearance/preflight failures.
+    from failure, runs a `/Images/Large/` pre-flight probe, rotates through `scraper_proxy_pool`
+    on 403/clearance failure when configured, and auto-pauses after exhausting proxies or
+    hitting `max_clearance_failures`.
     """
+    global _ACTIVE_PROXY_INDEX
     log_msg(f"🚀 Launching Stealth Browser to clear Cloudflare ({target_domain})...")
+
+    effective_pool = normalize_proxy_pool(
+        proxy_pool if proxy_pool is not None else load_scraper_settings().get("scraper_proxy_pool", [])
+    )
+    cur_proxy_idx = (_ACTIVE_PROXY_INDEX % len(effective_pool)) if effective_pool else 0
+    proxies_tried = 0
 
     if SB is None:
         log_msg("  [!] SeleniumBase (SB) not installed — using curl_cffi TLS session.")
+        active_proxy = effective_pool[cur_proxy_idx] if effective_pool else ""
         if existing_session is not None:
-            return existing_session
-        if cffi_requests is not None:
-            return cffi_requests.Session(impersonate="chrome120")
-        return requests.Session()
+            return _apply_proxy_to_session(existing_session, active_proxy)
+        return _create_http_session(proxy_url=active_proxy)
 
     if require_image_probe is not None:
         effective_require_image_probe = bool(require_image_probe)
@@ -739,15 +877,21 @@ def connect_session(
     else:
         effective_require_image_probe = True
 
+    effective_max_attempts = (
+        max(int(max_attempts or 1), len(effective_pool))
+        if effective_pool
+        else max(1, int(max_attempts or 1))
+    )
     consecutive_clearance_failures = 0
     attempt = 0
-    while attempt < max_attempts:
+    while attempt < effective_max_attempts:
         attempt += 1
         if is_stop_requested():
             raise CloudflareEdgeBlockPaused("Cancelled during stealth browser launch")
         if not wait_if_paused(reason="Paused before stealth browser launch"):
             raise CloudflareEdgeBlockPaused("Stopped while paused during stealth browser launch")
 
+        active_proxy = effective_pool[cur_proxy_idx] if effective_pool else ""
         use_fresh_profile = bool(rotate_profile or attempt > 1)
         temp_profile_dir: Optional[str] = None
         try:
@@ -756,6 +900,8 @@ def connect_session(
 
             session_pids: list[int] = []
             sb_kwargs: dict = {"uc": True, "window_size": "800,1000"}
+            if active_proxy:
+                sb_kwargs["chromium_arg"] = f"--proxy-server={active_proxy}"
             if use_fresh_profile:
                 temp_profile_dir = tempfile.mkdtemp(prefix="tcdb_uc_prof_")
                 with _TRACKED_TEMP_PROFILE_DIRS_LOCK:
@@ -836,9 +982,9 @@ def connect_session(
                     existing_session.cookies.clear()
                 existing_session.headers.update({"User-Agent": ua})
                 existing_session.cookies.update(cookies)
-                target_sess = existing_session
+                target_sess = _apply_proxy_to_session(existing_session, active_proxy)
             else:
-                target_sess = cffi_requests.Session(impersonate="chrome120") if cffi_requests is not None else requests.Session()
+                target_sess = _create_http_session(proxy_url=active_proxy)
                 target_sess.headers.update({"User-Agent": ua})
                 target_sess.cookies.update(cookies)
 
@@ -872,6 +1018,37 @@ def connect_session(
             consecutive_clearance_failures += 1
             err_line = str(e).splitlines()[0] if str(e) else "Unknown Error"
             cleanup_orphaned_drivers()
+
+            if effective_pool:
+                proxies_tried += 1
+                if proxies_tried < len(effective_pool):
+                    cur_proxy_idx = (cur_proxy_idx + 1) % len(effective_pool)
+                    _ACTIVE_PROXY_INDEX = cur_proxy_idx
+                    rotate_profile = True
+                    log_msg(
+                        f"  🔄 [PROXY ROTATE] Switching to proxy {cur_proxy_idx + 1}/{len(effective_pool)} "
+                        f"({format_proxy_host_port(effective_pool[cur_proxy_idx])})"
+                    )
+                    wait_s = min(4, 2 * attempt)
+                    time.sleep(wait_s)
+                    continue
+                pause_msg = (
+                    f"Auto-paused after exhausting all {len(effective_pool)} configured proxies "
+                    f"(last error: {err_line}) — switch VPN/proxy pool or clear CAPTCHA, then click Resume"
+                )
+                request_auto_pause(pause_msg)
+                if _PAUSE_CHECK_CALLBACK is not None and is_pause_requested():
+                    resumed = wait_if_paused(reason=pause_msg)
+                    if resumed:
+                        consecutive_clearance_failures = 0
+                        proxies_tried = 0
+                        cur_proxy_idx = (cur_proxy_idx + 1) % len(effective_pool)
+                        _ACTIVE_PROXY_INDEX = cur_proxy_idx
+                        rotate_profile = True
+                        attempt = 0
+                        continue
+                raise CloudflareEdgeBlockPaused(pause_msg)
+
             if consecutive_clearance_failures >= max(1, int(max_clearance_failures or DEFAULT_MAX_CLEARANCE_FAILURES)):
                 pause_msg = (
                     f"Auto-paused after {consecutive_clearance_failures} clearance failures — "
@@ -888,7 +1065,7 @@ def connect_session(
                 raise CloudflareEdgeBlockPaused(pause_msg)
 
             wait_s = 4 * attempt
-            log_msg(f"  ⚠️ Stealth browser handshake failed ({err_line}). Retrying in {wait_s}s ({attempt}/{max_attempts})...")
+            log_msg(f"  ⚠️ Stealth browser handshake failed ({err_line}). Retrying in {wait_s}s ({attempt}/{effective_max_attempts})...")
             time.sleep(wait_s)
 
     raise StealthBrowserError("Failed to establish Stealth Browser session after maximum retries.")
@@ -1058,7 +1235,14 @@ def safe_get(
         for Cloudflare /Images/ 403/429 edge-block protection.
     """
     clean_url = quote(str(url), safe=":/?=&%-")
-    clean_headers = {k: sanitize_header_value(v) for k, v in (headers or {}).items()}
+    clean_headers = {}
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "referer":
+            clean_headers[k] = sanitize_header_value(v)
+        elif isinstance(v, str):
+            clean_headers[k] = strip_accents(v).encode("latin-1", "ignore").decode("latin-1")
+        else:
+            clean_headers[k] = v
     learner = get_rate_learner()
     ep_key = learner.classify_tcdb_endpoint(clean_url)
 
@@ -4437,9 +4621,34 @@ def _scrape_tcdb_subset_checklist_pages(
     return all_rows
 
 
+def _is_header_or_total_row(tag) -> bool:
+    """Returns True when `tag` is inside `<thead>`/`<tfoot>`/`<th>` or represents a summary/total row."""
+    try:
+        if tag is None:
+            return False
+        if tag.find_parent(["thead", "tfoot", "th"]) is not None:
+            return True
+        tr = tag.find_parent("tr")
+        if tr is not None:
+            if tr.find_parent(["thead", "tfoot"]) is not None:
+                return True
+            if tr.find("th") is not None and tr.find("td") is None:
+                return True
+            first_cell = tr.find(["td", "th"])
+            if first_cell is not None:
+                first_txt = trim_clean(first_cell.get_text(" ", strip=True)).lower()
+                if re.match(r"^(?:total|grand\s+total|summary)\b", first_txt):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _extract_insert_card_count_from_anchor(a_tag) -> int:
     """Extracts the exact card count displayed next to an insert/parallel link on TCDB's Inserts.cfm."""
     try:
+        if _is_header_or_total_row(a_tag):
+            return 0
         container = a_tag.find_parent("tr") or a_tag.find_parent("li") or a_tag.parent
         if container is None:
             return 0
@@ -4499,7 +4708,7 @@ def _fetch_inserts_index_with_counts(
         found_on_p = 0
         for a in soup.find_all("a", href=True):
             href_str = str(a.get("href", ""))
-            if _is_college_section_heading(a):
+            if _is_college_section_heading(a) or _is_header_or_total_row(a):
                 continue
             m = re.search(r"/(?:ViewSet|Checklist)\.cfm/sid/(\d+)(?:/([^/?#]+))?", href_str, re.IGNORECASE)
             if m:
@@ -4684,7 +4893,9 @@ def prescan_queue_card_metrics(
 
         ins_map, ins_counts = _fetch_inserts_index_with_counts(req_session, urls["inserts"], chk_title)
         prefetched_inserts[set_url] = ins_map
-        prefetched_insert_counts[set_url] = ins_counts
+        # Keep prefetched_insert_counts strictly limited to exact TCDB-parsed counts;
+        # synthetic median estimates below are for progress-bar ETA totals only.
+        prefetched_insert_counts[set_url] = dict(ins_counts)
 
         known_sub_counts = dict(local_info["subset_card_counts"])
         if base_c > 0:
@@ -4698,7 +4909,6 @@ def prescan_queue_card_metrics(
         for sid_k, (_, sub_lbl) in ins_map.items():
             clean_lbl = clean_tcdb_subset_title(sub_lbl, checklist_set_name=chk_title) or f"Subset_{sid_k}"
             cnt_i = ins_counts.get(sid_k) or known_sub_counts.get(clean_lbl) or median_ins
-            ins_counts[sid_k] = int(cnt_i)
             known_sub_counts[clean_lbl] = int(cnt_i)
             inserts_card_sum += int(cnt_i)
 
@@ -4793,6 +5003,10 @@ def scrape_tcdb_checklist_set(
     progress_ctx: Optional[dict] = None,
     incremental: bool = True,
     force_refresh: bool = False,
+    card_delay_range: Optional[tuple[float, float]] = None,
+    breather_every_cards: Optional[int] = None,
+    breather_duration_range: Optional[tuple[float, float]] = None,
+    pacer_sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Single-Pass Unified Crawler:
@@ -4817,6 +5031,17 @@ def scrape_tcdb_checklist_set(
     dead_backs_dirty = False
     dead_fronts_dirty = False
     img_circuit_breaker = CloudflareImageCircuitBreaker(stop_check=is_stop_requested) if download_images_card_by_card else None
+    img_pacer = (
+        _ImageDownloadPacer(
+            card_delay_range=card_delay_range,
+            breather_every_cards=breather_every_cards,
+            breather_duration_range=breather_duration_range,
+            sleep_fn=pacer_sleep_fn,
+            circuit_breaker=img_circuit_breaker,
+        )
+        if download_images_card_by_card
+        else None
+    )
     img_stats = {"front_dl": 0, "back_dl": 0, "front_skip": 0, "back_skip": 0, "no_back": 0, "back_only_skip": 0, "no_img": 0, "cards_seen": 0}
     overload_state = {"consecutive": 0}
 
@@ -4908,6 +5133,20 @@ def scrape_tcdb_checklist_set(
         f_out: dict = {}
         b_out: dict = {}
         existing_f_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "F", f_path)
+        existing_b_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
+        need_net_f = (not existing_f_note) and (cid not in dead_fronts)
+        need_net_b = (
+            (not existing_b_note)
+            and bool(existing_f_note or need_net_f)
+            and bool(b_thumb)
+            and (cid not in dead_backs)
+        )
+        will_hit_network = need_net_f or need_net_b
+        if will_hit_network and img_pacer is not None:
+            if not img_pacer.before_network_card():
+                raise CloudflareEdgeBlockPaused("Cancelled during image pacing")
+
+        card_downloaded = False
         if existing_f_note:
             has_front = True
             img_stats["front_skip"] += 1
@@ -4933,6 +5172,7 @@ def scrape_tcdb_checklist_set(
             )
             if q_f:
                 has_front = True
+                card_downloaded = True
                 q_f_winner = q_f
                 img_stats["front_dl"] += 1
                 c_row["Front_Downloaded"] = "Yes"
@@ -4948,7 +5188,6 @@ def scrape_tcdb_checklist_set(
                 err_c = int(f_out.get("status_code", 0) or 0)
                 f_note = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
 
-        existing_b_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path)
         if existing_b_note:
             img_stats["back_skip"] += 1
             c_row["Back_Downloaded"] = "Yes"
@@ -4978,6 +5217,7 @@ def scrape_tcdb_checklist_set(
                 circuit_breaker=img_circuit_breaker,
             )
             if q_b:
+                card_downloaded = True
                 img_stats["back_dl"] += 1
                 c_row["Back_Downloaded"] = "Yes"
                 disk_cid_index[(cid, "B")] = b_path
@@ -4991,6 +5231,12 @@ def scrape_tcdb_checklist_set(
             else:
                 err_c = int(b_out.get("status_code", 0) or 0)
                 b_note = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
+
+        if will_hit_network and img_pacer is not None:
+            img_pacer.mark_network_attempted()
+        if card_downloaded and img_pacer is not None:
+            if not img_pacer.after_card_downloaded():
+                raise CloudflareEdgeBlockPaused("Cancelled during image pacing breather")
 
         if f_out.get("transient_overload") or b_out.get("transient_overload"):
             overload_state["consecutive"] += 1
@@ -5046,7 +5292,22 @@ def scrape_tcdb_checklist_set(
 
                 q_f_winner = ""
                 has_front = False
-                if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "F", f_path):
+                existing_f = _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "F", f_path)
+                existing_b = _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "B", b_path)
+                need_net_f = (not existing_f) and (cid_s not in dead_fronts)
+                need_net_b = (
+                    (not existing_b)
+                    and bool(existing_f or need_net_f)
+                    and bool(url_rep_b or url_std_b)
+                    and (cid_s not in dead_backs)
+                )
+                will_hit_network = need_net_f or need_net_b
+                if will_hit_network and img_pacer is not None:
+                    if not img_pacer.before_network_card():
+                        raise CloudflareEdgeBlockPaused("Cancelled during image pacing")
+
+                card_downloaded = False
+                if existing_f:
                     has_front = True
                     img_stats["front_skip"] += 1
                     if isinstance(entry.get("front"), dict):
@@ -5066,6 +5327,7 @@ def scrape_tcdb_checklist_set(
                     )
                     if q_f:
                         has_front = True
+                        card_downloaded = True
                         q_f_winner = q_f
                         img_stats["front_dl"] += 1
                         disk_cid_index[(cid_s, "F")] = f_path
@@ -5076,7 +5338,7 @@ def scrape_tcdb_checklist_set(
                         dead_fronts[cid_s] = time.time()
                         dead_fronts_dirty = True
 
-                if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "B", b_path):
+                if existing_b:
                     img_stats["back_skip"] += 1
                 elif has_front and (url_rep_b or url_std_b) and cid_s not in dead_backs:
                     pending_attempted += 1
@@ -5090,12 +5352,19 @@ def scrape_tcdb_checklist_set(
                         circuit_breaker=img_circuit_breaker,
                     )
                     if q_b:
+                        card_downloaded = True
                         img_stats["back_dl"] += 1
                         disk_cid_index[(cid_s, "B")] = b_path
                         entry["back"] = {"quality": q_b, "file": b_fname}
                     elif b_out.get("confirmed_404"):
                         dead_backs[cid_s] = time.time()
                         dead_backs_dirty = True
+
+                if will_hit_network and img_pacer is not None:
+                    img_pacer.mark_network_attempted()
+                if card_downloaded and img_pacer is not None:
+                    if not img_pacer.after_card_downloaded():
+                        raise CloudflareEdgeBlockPaused("Cancelled during image pacing breather")
         return pending_attempted
 
     set_t0 = time.time()
@@ -5670,6 +5939,14 @@ def _download_single_template_side(
         preferred_tier=preferred_tier,
     )
 
+    session_hdrs = getattr(req_session, "headers", None) or {}
+    session_ua = ""
+    try:
+        session_ua = str(session_hdrs.get("User-Agent") or session_hdrs.get("user-agent") or "").strip()
+    except Exception:
+        session_ua = ""
+    img_headers = _build_tcdb_image_headers(referer=referer or (BASE_URL + "/"), user_agent=session_ua)
+
     probed_codes: list[int] = []
     order = [("R", url_rep), ("S", url_std)] if try_rep_first else [("S", url_std), ("R", url_rep)]
     for tier_code, cand_url in order:
@@ -5679,7 +5956,7 @@ def _download_single_template_side(
         res = safe_get(
             req_session,
             cand_url,
-            headers={"Referer": referer},
+            headers=img_headers,
             retries=2,
             silent_404=True,
             status_out=st,
@@ -6094,7 +6371,8 @@ def mode_download_all_catalog_images(
                                 break
                             if breather_every_cards > 0 and downloaded_cards_this_run % breather_every_cards == 0:
                                 breather_s = random.uniform(float(breather_duration_range[0]), float(breather_duration_range[1]))
-                                b_msg = f"☕ Human-like breather: {breather_s / 60.0:.1f}m after {downloaded_cards_this_run:,} downloaded cards..."
+                                b_disp = f"{breather_s:.1f}s" if breather_s < 60.0 else f"{breather_s / 60.0:.1f}m"
+                                b_msg = f"☕ Human-like breather: {b_disp} after {downloaded_cards_this_run:,} downloaded cards..."
                                 log_msg(b_msg)
                                 emit_progress(current_item=b_msg)
                                 need_card_jitter = False

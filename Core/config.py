@@ -3,6 +3,7 @@ from __future__ import annotations
 # Core/config.py - CENTRALIZED PATHS, CONSTANTS, PSA/BGS MATRICES & VERSION REGISTRY
 # ==============================================================================
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 __version__ = "0.24.0-beta.45"
 __last_updated__ = "2026-11-21 15:05:00"
@@ -334,6 +336,8 @@ NEURAL_MODELS_DIR = (CACHE_LIBRARY_DIR if IS_REORGANIZED_V24 else SET_LIBRARY_CA
 NEURAL_EMBEDDINGS_CACHE_FILE = (CACHE_LIBRARY_DIR if IS_REORGANIZED_V24 else SET_LIBRARY_CACHE_DIR) / "neural_embeddings_v1.pkl"
 COMPUTE_SETTINGS_FILE = LOGS_DIR / "compute_settings.json"
 GPU_WORKER_CLAIMS_FILE = LOGS_DIR / "gpu_worker_claims.json"
+SCRAPER_SETTINGS_FILE = LOGS_DIR / "scraper_settings.json"
+DEFAULT_SCRAPER_SETTINGS = {"scraper_proxy_pool": []}
 
 # Standard TCDB Glossary & Card Attribute Definitions
 TCDB_STANDARD_GLOSSARY = {
@@ -1291,3 +1295,75 @@ def interprocess_file_lock(
             except Exception:
                 pass
         local_rlock.release()
+
+
+_ALLOWED_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+
+
+def normalize_proxy_pool(raw) -> list[str]:
+    """
+    Normalizes a list/tuple or newline-separated string of proxy URLs into a
+    deduplicated list of valid `http://`, `https://`, or `socks*://` URLs.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = raw.splitlines()
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        return []
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in items:
+        s = str(item or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        if "://" not in s:
+            s = f"http://{s}"
+        parsed = urlparse(s)
+        if parsed.scheme.lower() not in _ALLOWED_PROXY_SCHEMES or not parsed.hostname:
+            continue
+        if s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+    return cleaned
+
+
+def format_proxy_host_port(proxy_url: str) -> str:
+    """Returns `host:port` (or `host`) from a proxy URL without exposing credentials."""
+    s = str(proxy_url or "").strip()
+    if not s:
+        return ""
+    parsed = urlparse(s if "://" in s else f"http://{s}")
+    host = parsed.hostname or s
+    if parsed.port:
+        return f"{host}:{parsed.port}"
+    return host
+
+
+def load_scraper_settings(settings_file: Optional[Path] = None) -> dict:
+    """Loads persisted scraper settings (`scraper_proxy_pool`) with safe defaults."""
+    target = Path(settings_file) if settings_file is not None else SCRAPER_SETTINGS_FILE
+    out = dict(DEFAULT_SCRAPER_SETTINGS)
+    out["scraper_proxy_pool"] = []
+    if target.exists():
+        try:
+            raw = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                out.update(raw)
+        except Exception:
+            pass
+    out["scraper_proxy_pool"] = normalize_proxy_pool(out.get("scraper_proxy_pool"))
+    return out
+
+
+def save_scraper_settings(payload: dict, settings_file: Optional[Path] = None) -> dict:
+    """Normalizes and atomically persists scraper settings to JSON."""
+    target = Path(settings_file) if settings_file is not None else SCRAPER_SETTINGS_FILE
+    current = load_scraper_settings(settings_file=target)
+    if isinstance(payload, dict) and "scraper_proxy_pool" in payload:
+        current["scraper_proxy_pool"] = normalize_proxy_pool(payload.get("scraper_proxy_pool"))
+    atomic_write_text(target, json.dumps(current, indent=2))
+    return current

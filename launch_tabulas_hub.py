@@ -188,6 +188,8 @@ from Core.config import (
     TRACKING_FILE,
     atomic_write_bytes,
     atomic_write_text,
+    load_scraper_settings,
+    save_scraper_settings,
     get_daily_log_dir,
     interprocess_file_lock,
 )
@@ -1247,6 +1249,10 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             from Core.compute_backend import probe_system_hardware
             force_p = (query.get("refresh") or ["false"])[0].lower() == "true"
             self._send_json(probe_system_hardware(force_refresh=force_p))
+            return
+
+        if route == "/api/scraper/settings":
+            self._send_json({"success": True, "settings": load_scraper_settings()})
             return
 
         if route == "/api/rate-learner":
@@ -3429,6 +3435,16 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 f"ocr_gpu={saved_cs['enable_ocr_gpu']}, opencl={saved_cs['enable_opencl_cv']}, max_gpu_workers={saved_cs['max_concurrent_gpu_workers']}",
             )
             self._send_json({"success": True, "settings": saved_cs, "status": probe_system_hardware(force_refresh=True)})
+            return
+
+        if route == "/api/scraper/settings" and isinstance(payload, dict):
+            saved_sc = save_scraper_settings(payload)
+            _log_ui_action_to_file(
+                "Settings",
+                "Saved Scraper Proxy Pool",
+                f"proxies={len(saved_sc.get('scraper_proxy_pool') or [])}",
+            )
+            self._send_json({"success": True, "settings": saved_sc})
             return
 
         if route == "/api/compute/benchmark":

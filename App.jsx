@@ -4282,6 +4282,7 @@ export default function App() {
     scheduler: { collapsed: false, wide: false },
     maintenance: { collapsed: false, wide: true },
     storage: { collapsed: false, wide: false },
+    scraper: { collapsed: false, wide: false },
     hardware: { collapsed: false, wide: true },
     devtools: { collapsed: false, wide: true },
     telemetry: { collapsed: false, wide: true },
@@ -4293,6 +4294,9 @@ export default function App() {
   const [computeStatus, setComputeStatus] = useState(null);
   const [computeBench, setComputeBench] = useState(null);
   const [runningComputeBench, setRunningComputeBench] = useState(false);
+  const [scraperSettings, setScraperSettings] = useState({ scraper_proxy_pool: [] });
+  const [proxyPoolText, setProxyPoolText] = useState('');
+  const [savingScraperSettings, setSavingScraperSettings] = useState(false);
   const toggleSettingsMod = (modKey, prop) => {
     setSettingsLayout((prev) => ({
       ...prev,
@@ -4313,6 +4317,7 @@ export default function App() {
       scheduler: { collapsed: false, wide: false },
       maintenance: { collapsed: false, wide: true },
       storage: { collapsed: false, wide: false },
+      scraper: { collapsed: false, wide: false },
       hardware: { collapsed: false, wide: true },
       devtools: { collapsed: false, wide: true },
       telemetry: { collapsed: false, wide: true },
@@ -4613,6 +4618,15 @@ export default function App() {
       if (ds && typeof ds === 'object') setDashboardSummary(ds);
     }).catch(() => {});
     refreshComputeStatus(false);
+    fetch(`${NODE_API_BASE}/scraper/settings`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.settings) {
+          setScraperSettings(d.settings);
+          setProxyPoolText(Array.isArray(d.settings.scraper_proxy_pool) ? d.settings.scraper_proxy_pool.join('\n') : '');
+        }
+      })
+      .catch(() => {});
     fetch(`${NODE_API_BASE}/inventory/card-level`).then((r) => r.json()).then((cl) => {
       if (cl && Array.isArray(cl.rows)) {
         setCardLevelRows(cl.rows);
@@ -12190,6 +12204,96 @@ export default function App() {
                             <button onClick={openLogsFolder} className="py-1.5 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-sky-300">📂 Open Logs Folder</button>
                             <button onClick={() => openHiddenPage('notification_history')} className="py-1.5 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200">🔔 Notification Log</button>
                             <button onClick={() => setActivePage('about')} className="col-span-2 py-1.5 px-2.5 rounded-xl bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-700 text-xs font-bold text-emerald-200">🔄 Open Check for Updates (v{updaterInfo.current_version || APP_VERSION})</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* MODULE 4A: SCRAPER NETWORK & LOCAL PROXY POOL */}
+                    <div className={`${modSpan('scraper', 'lg:col-span-6')} ${skin.cardBg} border ${skin.border} rounded-2xl p-4 space-y-3 transition-all duration-200`}>
+                      <ModHeader
+                        modKey="scraper"
+                        icon="🌐"
+                        title="Scraper Network & Proxy Pool"
+                        subtitle={
+                          (scraperSettings?.scraper_proxy_pool || []).length > 0
+                            ? `${scraperSettings.scraper_proxy_pool.length} Local Proxy/Proxies Configured (Auto-Rotate on 403)`
+                            : 'Direct Connection (No Proxies Configured)'
+                        }
+                        accentCls="text-sky-300"
+                      />
+                      {!settingsLayout.scraper?.collapsed && (
+                        <div className="space-y-2.5 text-xs">
+                          <div className="text-[11px] text-slate-400">
+                            Optional local HTTP/SOCKS proxies (one per line, e.g. <span className="font-mono text-slate-300">http://127.0.0.1:8881</span>). Both Stealth Browser and image downloads share the active proxy and rotate on 403 blocks.
+                          </div>
+                          <textarea
+                            rows={3}
+                            value={proxyPoolText}
+                            onChange={(e) => setProxyPoolText(e.target.value)}
+                            placeholder={'http://127.0.0.1:8881\nhttp://127.0.0.1:8882'}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 font-mono text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+                          />
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              disabled={savingScraperSettings}
+                              onClick={() => {
+                                setSavingScraperSettings(true);
+                                fetch(`${NODE_API_BASE}/scraper/settings`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ scraper_proxy_pool: proxyPoolText }),
+                                })
+                                  .then((r) => r.json())
+                                  .then((res) => {
+                                    if (res && res.success && res.settings) {
+                                      setScraperSettings(res.settings);
+                                      setProxyPoolText((res.settings.scraper_proxy_pool || []).join('\n'));
+                                      pushNotification(
+                                        'Scraper Settings Saved',
+                                        (res.settings.scraper_proxy_pool || []).length > 0
+                                          ? `Configured ${res.settings.scraper_proxy_pool.length} proxy URL(s).`
+                                          : 'Reset to direct connection (0 proxies).',
+                                        'Settings',
+                                        'success'
+                                      );
+                                    } else {
+                                      pushNotification('Save Failed', res?.error || 'Could not save scraper settings.', 'Settings', 'error');
+                                    }
+                                  })
+                                  .catch((e) => pushNotification('Save Error', e.message, 'Settings', 'error'))
+                                  .finally(() => setSavingScraperSettings(false));
+                              }}
+                              className={`px-3 py-1.5 rounded-xl font-bold text-xs disabled:opacity-50 ${skin.accentBtn}`}
+                            >
+                              {savingScraperSettings ? '⏳ Saving...' : '💾 Save Proxy Pool'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={savingScraperSettings}
+                              onClick={() => {
+                                setProxyPoolText('');
+                                setSavingScraperSettings(true);
+                                fetch(`${NODE_API_BASE}/scraper/settings`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ scraper_proxy_pool: [] }),
+                                })
+                                  .then((r) => r.json())
+                                  .then((res) => {
+                                    if (res && res.success && res.settings) {
+                                      setScraperSettings(res.settings);
+                                      pushNotification('Proxy Pool Cleared', 'Scraper switched back to direct connection.', 'Settings', 'info');
+                                    }
+                                  })
+                                  .catch(() => {})
+                                  .finally(() => setSavingScraperSettings(false));
+                              }}
+                              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-300 disabled:opacity-50"
+                            >
+                              Clear (Direct)
+                            </button>
                           </div>
                         </div>
                       )}
