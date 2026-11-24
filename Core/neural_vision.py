@@ -787,6 +787,30 @@ def _norm_path_key(p: Path | str) -> str:
         return str(p).strip().lower()
 
 
+def invalidate_neural_image_cache(img_path: Path | str) -> bool:
+    """Removes a single image path from the in-memory neural embedding & matrix caches."""
+    removed = False
+    p_str = str(img_path or "").strip()
+    if not p_str:
+        return False
+    keys_to_drop = {_norm_path_key(p_str), p_str.lower()}
+    try:
+        keys_to_drop.add(str(Path(p_str)).lower())
+    except Exception:
+        pass
+    with _INDEX_LOCK:
+        if isinstance(_MEM_EMBED_CACHE, dict):
+            embs = _MEM_EMBED_CACHE.get("embeddings")
+            if isinstance(embs, dict):
+                for k in keys_to_drop:
+                    if k in embs:
+                        embs.pop(k, None)
+                        removed = True
+        _SET_MATRIX_CACHE.clear()
+        _PAR_GROUP_MATRIX_CACHE.clear()
+    return removed
+
+
 def load_neural_embeddings_cache(force_reload: bool = False) -> dict:
     global _MEM_EMBED_CACHE, _MEM_EMBED_MTIME
     with _INDEX_LOCK:

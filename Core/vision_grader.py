@@ -27,6 +27,7 @@ from Core.neural_vision import (
     get_neural_embedding_engine,
     get_or_compute_image_descriptor,
     get_or_compute_image_embedding,
+    invalidate_neural_image_cache,
     is_neural_embeddings_enabled,
     precompute_batch_image_descriptors,
     score_multiregion_parallel_pair,
@@ -1662,6 +1663,7 @@ def build_corners_inspection_sheet(
 _FOOTER_ANCHOR_TOKENS = (
     "THETOPPSCOMPANY",
     "TOPPSCOMPANY",
+    "TOPPSBASEBALL",
     "BOWMAN",
     "PANINIAMERICA",
     "UPPERDECK",
@@ -1670,6 +1672,10 @@ _FOOTER_ANCHOR_TOKENS = (
     "PRINTEDIN",
     "MLBPA",
     "MLBP",
+    "MLBPLAYERS",
+    "NBAPROPERTIES",
+    "NFLPA",
+    "NHLPA",
     "CMP",
     "ALLRIGHTSRESERVED",
     "TRADEMARKS",
@@ -1690,7 +1696,44 @@ _HEADER_ANCHOR_TOKENS = (
     "ACQUIRED",
     "WORLDSCHAMPIONS",
     "COMMEMORATING",
+    "CERTIFIEDAUTOGRAPH",
 )
+
+_EXPECTED_CARD_OCR_TOKENS = (
+    "TOPPS",
+    "BOWMAN",
+    "PANINI",
+    "UPPERDECK",
+    "MLB",
+    "NBA",
+    "NFL",
+    "NHL",
+    "BASEBALL",
+    "BASKETBALL",
+    "FOOTBALL",
+    "HOCKEY",
+    "BORN",
+    "BATS",
+    "THROWS",
+    "SERIESONE",
+    "SERIESTWO",
+    "AUTOGRAPH",
+    "MAJORLEAGUE",
+    "OFFICIALLYLICENSED",
+)
+
+
+def _has_expected_card_tokens(lines: list[str]) -> bool:
+    """Returns True when OCR lines contain expected card brand/league/bio/autograph or card-number tokens."""
+    if not lines:
+        return False
+    blob = norm(" ".join(str(x or "") for x in lines))
+    if any(tok in blob for tok in _EXPECTED_CARD_OCR_TOKENS):
+        return True
+    raw_up = " ".join(str(x or "").upper() for x in lines)
+    if re.search(r"\b[A-Z0-9]{1,6}-[A-Z0-9]{1,5}\b", raw_up) or re.search(r"#\s*\d{1,4}[A-Z]?\b", raw_up):
+        return True
+    return False
 
 
 def _score_upright_ocr_orientation(items: list[dict]) -> float:
@@ -1768,7 +1811,7 @@ def extract_back_ocr_and_orient(
     unless `force_all_angles=True` (used by the Rotation Fixer to evaluate all 4 angles cleanly).
     """
     early_exit_thresh = float(RUNTIME_CONFIG.get("back_ocr_early_exit_score", 110.0))
-    angle_order = [0, 90, 270, 180]
+    angle_order = [0, 180, 90, 270]
     if preferred_angle in (0, 90, 180, 270):
         angle_order = [int(preferred_angle)] + [a for a in angle_order if a != int(preferred_angle)]
 
@@ -1798,8 +1841,8 @@ def extract_back_ocr_and_orient(
             best_text_img = rot_im
             best_text_lines = lines
 
-        # Fast early-exit on clear upright reading orientation (skipped when force_all_angles=True)
-        if not force_all_angles and readability_score >= early_exit_thresh and len(lines) >= 4:
+        # Fast early-exit only on clear upright lock with expected card tokens (skipped when force_all_angles=True)
+        if not force_all_angles and readability_score >= early_exit_thresh and len(lines) >= 4 and _has_expected_card_tokens(lines):
             break
 
     tw, th = best_text_img.size
@@ -1826,6 +1869,79 @@ def extract_back_ocr_and_orient(
         "back_score_0": score_0,
         "back_best_score": best_text_score,
         "back_is_landscape": bool(best_text_img.width > best_text_img.height),
+    }
+
+
+def normalize_card_orientation_for_id(
+    img: Image.Image,
+    side: str = "front",
+    preferred_angle: Optional[int] = None,
+    force_all_angles: bool = False,
+) -> tuple[Image.Image, int, dict]:
+    """
+    Auto-normalizes card orientation (0° / 180° / 90° / 270°) before OCR and visual matching
+    without distorting intentional landscape aspect ratios.
+    """
+    if str(side or "front").strip().lower() == "back":
+        oriented_img, bundle = extract_back_ocr_and_orient(
+            img,
+            preferred_angle=preferred_angle,
+            force_all_angles=force_all_angles,
+        )
+        return oriented_img, int(bundle.get("back_rotation_angle", 0) or 0), bundle
+
+    early_exit_thresh = float(RUNTIME_CONFIG.get("front_ocr_early_exit_score", 70.0))
+
+    def _eval_angle(ang: int) -> tuple[Image.Image, list[str], float, int, int]:
+        rot_im = img if ang == 0 else img.rotate(ang, expand=True)
+        w, h = rot_im.size
+        sc = min(1.0, 950.0 / max(1, max(w, h)))
+        sm = rot_im.resize((max(80, int(w * sc)), max(80, int(h * sc))), Image.Resampling.BILINEAR)
+        items = _run_rapidocr_detailed(np.array(sm))
+        lines = [it["text"] for it in items]
+        ocr_sc = _score_upright_ocr_orientation(items)
+        horiz_cnt = sum(1 for it in items if it["bw"] >= it["bh"] * 1.15 and len(it["text"]) >= 3)
+        vert_cnt = sum(1 for it in items if it["bh"] >= it["bw"] * 1.15 and len(it["text"]) >= 3)
+        return rot_im, lines, ocr_sc, horiz_cnt, vert_cnt
+
+    im_0, lines_0, score_0, horiz_0, vert_0 = _eval_angle(0)
+    best_angle = 0
+    best_img = im_0
+    best_lines = lines_0
+    best_score = score_0
+
+    need_rot_check = (
+        force_all_angles
+        or score_0 < early_exit_thresh
+        or len(lines_0) < 2
+        or not _has_expected_card_tokens(lines_0)
+        or (vert_0 >= 2 and vert_0 > horiz_0)
+    )
+    if need_rot_check:
+        cand_angles = [180, 90, 270]
+        if preferred_angle in (90, 180, 270):
+            cand_angles = [int(preferred_angle)] + [a for a in cand_angles if a != int(preferred_angle)]
+        for idx_a, ang in enumerate(cand_angles):
+            rot_im, lines_r, sc_r, _, _ = _eval_angle(ang)
+            if sc_r > best_score:
+                best_score = sc_r
+                best_angle = ang
+                best_img = rot_im
+                best_lines = lines_r
+            if not force_all_angles and ang == 180 and sc_r >= early_exit_thresh and len(lines_r) >= 2 and _has_expected_card_tokens(lines_r):
+                break
+
+    if best_angle != 0 and not (best_score >= score_0 + 10.0 or (score_0 <= 0.0 and best_score > 0.0)):
+        best_angle = 0
+        best_img = im_0
+        best_lines = lines_0
+        best_score = score_0
+
+    return best_img, best_angle, {
+        "lines": best_lines,
+        "score_0": score_0,
+        "best_score": best_score,
+        "rotation_angle": best_angle,
     }
 
 
@@ -2001,14 +2117,30 @@ def orient_front_card_image(
             if best_ang in (90, 270):
                 return front_img.rotate(best_ang, expand=True), best_ang, f"FrontOCR_Landscape({best_ang}deg)"
 
-        # Check 180° flip when back was inverted OR 0° has weak/upside-down front OCR
-        if back_rotation_angle == 180 or horiz_0 == 0:
+        # Check 180° flip when back was inverted, 0° has weak/low OCR confidence, or expected card tokens are missing
+        lines_0_text = [it["text"] for it in items_0]
+        if back_rotation_angle == 180 or horiz_0 == 0 or sc_0 < 45.0 or not _has_expected_card_tokens(lines_0_text):
             rot_180 = front_img.rotate(180, expand=True)
             s_180 = rot_180.resize((max(80, int(fw * f_scale)), max(80, int(fh * f_scale))), Image.Resampling.BILINEAR)
             sc_180 = _score_upright_ocr_orientation(_run_rapidocr_detailed(np.array(s_180)))
-            req_gain = -5.0 if back_rotation_angle == 180 else 20.0
+            req_gain = -5.0 if back_rotation_angle == 180 else 15.0
             if sc_180 >= sc_0 + req_gain:
                 return rot_180, 180, "BackInvertedFlip(180deg)" if back_rotation_angle == 180 else "FrontOCR_Flip(180deg)"
+            # If still weak after 0° and 180°, also test 90°/270°
+            if sc_0 < 30.0 and sc_180 < 30.0:
+                best_ang_s = 0
+                best_sc_s = max(sc_0, sc_180)
+                for ang in (90, 270):
+                    rot_f = front_img.rotate(ang, expand=True)
+                    rw, rh = rot_f.size
+                    r_sc = min(1.0, 900.0 / max(rw, rh))
+                    s_rot = rot_f.resize((max(80, int(rw * r_sc)), max(80, int(rh * r_sc))), Image.Resampling.BILINEAR)
+                    sc_rot = _score_upright_ocr_orientation(_run_rapidocr_detailed(np.array(s_rot)))
+                    if sc_rot > best_sc_s + 18.0:
+                        best_sc_s = sc_rot
+                        best_ang_s = ang
+                if best_ang_s in (90, 270):
+                    return front_img.rotate(best_ang_s, expand=True), best_ang_s, f"FrontOCR_Sideways({best_ang_s}deg)"
     except Exception:
         pass
 
@@ -2022,6 +2154,18 @@ _COMMON_PRINT_RUN_DENOMS = {
 }
 
 
+def _extract_subset_print_run_denom(subset_name: str, expected_pr: str = "") -> str:
+    """Extracts numeric print-run denominator from `expected_pr` or inline subset text (e.g. 'Green Foil /399')."""
+    pr_clean = format_print_run(expected_pr)
+    if pr_clean:
+        return pr_clean
+    s_up = str(subset_name or "").upper()
+    m = re.search(r"#?\s*/\s*(\d{1,4})\b", s_up)
+    if m:
+        return format_print_run(m.group(1))
+    return ""
+
+
 def _parse_serial_denominator_from_lines(lines: list[str]) -> Optional[str]:
     joined = " ".join(str(x or "") for x in (lines or []))
     if not joined:
@@ -2033,20 +2177,32 @@ def _parse_serial_denominator_from_lines(lines: list[str]) -> Optional[str]:
         num, den = int(raw_num), int(raw_den)
         if not (1 <= num <= den <= 2050):
             continue
+        ctx_around = cleaned[max(0, m.start() - 22) : min(len(cleaned), m.end() + 22)].upper()
+        # Reject dates, heights (e.g. 6/2), and batting/pitching stat lines in context
+        if any(
+            k in ctx_around
+            for k in (
+                "BORN", "DATE", "DOB", "HT", "HEIGHT", "FT", "WT", "WEIGHT",
+                "BATTING", "AT THE PLATE", "H/AB", "AVG", "RBI", "HR", "SB", "BB", "SO", "IP", "ER", "W-L",
+                "CLUB", "SEASON", "STEAL", "HOMER", "GAME",
+            )
+        ):
+            continue
+        # Reject heights like 5/10, 5/11, 6/0..6/9, 7/0..7/3 unless zero-padded (e.g. 006/010)
+        if num in (5, 6, 7) and 0 <= den <= 11 and len(raw_num) == 1 and not raw_den.startswith("0"):
+            continue
         # Reject baseball milestone ratios like 20/20, 30/30, 40/40, 50/50 unless zero-padded or 1/1
         if num == den and den in (10, 15, 20, 25, 30, 40, 50) and not raw_num.startswith("0"):
-            ctx_around = cleaned[max(0, m.start() - 18) : min(len(cleaned), m.end() + 18)].upper()
-            if any(k in ctx_around for k in ("CLUB", "SEASON", "HR", "SB", "STEAL", "HOMER", "GAME", "AVG", "RBI")):
-                continue
-        # Reject month/day pairs (e.g. 5/14) unless denominator is a known hobby print run and numerator is zero-padded or >= 13
-        if 1 <= num <= 12 and 1 <= den <= 31 and len(raw_num) == 1 and den not in (1, 5, 10, 15, 25):
+            continue
+        # Reject month/day pairs (e.g. 3/11, 03/11, 5/14) regardless of zero-padding unless denominator is a known hobby print run
+        if 1 <= num <= 12 and 1 <= den <= 31 and den not in (1, 5, 10, 15, 25):
             continue
         # Allow Gold year-numbered stamps (e.g. 0412/2026, 1845/2026) while rejecting 4/2026 date fragments
         if den in (2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027):
             if len(raw_num) >= 3 or (len(raw_num) == 4 and raw_num.startswith("0")):
                 return str(den)
             continue
-        if den in _COMMON_PRINT_RUN_DENOMS or (len(raw_num) == len(raw_den) and raw_num.startswith("0")):
+        if den in _COMMON_PRINT_RUN_DENOMS or (den >= 32 and len(raw_num) == len(raw_den) and raw_num.startswith("0")):
             return str(den)
     return None
 
@@ -2138,9 +2294,128 @@ def is_base_family_root(subset_name: str, set_name: str = "") -> bool:
     return s in ("", "BASE", "BASE SET") or s.startswith("BASE ")
 
 
+_SPORT_OCR_SIGNALS: dict[str, tuple[tuple[str, int], ...]] = {
+    "BASEBALL": (
+        ("MAJORLEAGUEBASEBALL", 5),
+        ("TOPPSBASEBALL", 5),
+        ("MLBPLAYERS", 4),
+        ("MLBPA", 4),
+        ("MLBP", 3),
+        ("BASEBALL", 3),
+        ("MLB", 3),
+        ("BATTINGRECORD", 3),
+        ("PITCHINGRECORD", 3),
+        ("ALLSTARROOKIE", 2),
+        ("YANKEES", 2), ("RED SOX", 2), ("REDSOX", 2), ("DODGERS", 2), ("CUBS", 2),
+        ("BRAVES", 2), ("PHILLIES", 2), ("ASTROS", 2), ("METS", 2), ("PADRES", 2),
+        ("ORIOLES", 2), ("MARINERS", 2), ("TWINS", 2), ("GUARDIANS", 2), ("BREWERS", 2),
+        ("ATHLETICS", 2), ("ANGELS", 2), ("MARLINS", 2), ("NATIONALS", 2), ("REDS", 2),
+        ("PIRATES", 2), ("ROCKIES", 2), ("RAYS", 2), ("ROYALS", 2), ("TIGERS", 2),
+        ("WHITESOX", 2), ("BLUEJAYS", 2), ("DIAMONDBACKS", 2),
+    ),
+    "BASKETBALL": (
+        ("NBAPROPERTIES", 5),
+        ("BASKETBALL", 4),
+        ("NBAPA", 4),
+        ("NBA", 3),
+        ("WNBA", 3),
+        ("LAKERS", 2), ("CELTICS", 2), ("WARRIORS", 2), ("KNICKS", 2), ("BULLS", 2),
+        ("SPURS", 2), ("MAVERICKS", 2), ("BUCKS", 2), ("NUGGETS", 2), ("SUNS", 2),
+        ("SIXERS", 2), ("76ERS", 2), ("TIMBERWOLVES", 2), ("CAVALIERS", 2), ("THUNDER", 2),
+        ("CLIPPERS", 2), ("BLAZERS", 2), ("PISTONS", 2), ("PACERS", 2), ("HORNETS", 2),
+        ("MAGIC", 2), ("HAWKS", 2), ("WIZARDS", 2), ("GRIZZLIES", 2), ("PELICANS", 2),
+        ("RAPTORS", 2), ("HEAT", 2), ("JAZZ", 2), ("NETS", 2), ("ROCKETS", 2),
+    ),
+    "FOOTBALL": (
+        ("NFLPA", 4),
+        ("FOOTBALL", 4),
+        ("NFL", 3),
+        ("TOUCHDOWNS", 2),
+        ("QUARTERBACK", 2),
+        ("CHIEFS", 2), ("EAGLES", 2), ("COWBOYS", 2), ("PACKERS", 2), ("49ERS", 2),
+        ("RAVENS", 2), ("BILLS", 2), ("BENGALS", 2), ("LIONS", 2), ("STEELERS", 2),
+        ("SEAHAWKS", 2), ("PATRIOTS", 2), ("DOLPHINS", 2), ("VIKINGS", 2), ("BRONCOS", 2),
+    ),
+    "HOCKEY": (
+        ("NHLPA", 4),
+        ("HOCKEY", 4),
+        ("NHL", 3),
+        ("POWERPLAY", 2),
+        ("STANLEYCUP", 3),
+        ("BRUINS", 2), ("MAPLELEAFS", 2), ("CANADIENS", 2), ("OILERS", 2), ("BLACKHAWKS", 2),
+        ("REDWINGS", 2), ("PENGUINS", 2), ("FLYERS", 2), ("AVALANCHE", 2), ("LIGHTNING", 2),
+    ),
+}
+
+
+def _detect_sport_from_ocr(text_or_lines) -> Optional[str]:
+    """Detects explicit sport/league signal from OCR text/lines when unambiguous."""
+    if isinstance(text_or_lines, (list, tuple)):
+        raw = " ".join(str(x or "") for x in text_or_lines)
+    else:
+        raw = str(text_or_lines or "")
+    blob = norm(raw)
+    if not blob:
+        return None
+    raw_up = f" {raw.upper()} "
+    scores: dict[str, int] = {}
+    for sport, tokens in _SPORT_OCR_SIGNALS.items():
+        sc = 0
+        for tok, wt in tokens:
+            if len(tok) <= 3:
+                if re.search(rf"\b{re.escape(tok)}\b", raw_up):
+                    sc += wt
+            else:
+                if tok in blob:
+                    sc += wt
+        scores[sport] = sc
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if ranked and ranked[0][1] >= 3 and (len(ranked) == 1 or ranked[0][1] > ranked[1][1]):
+        return ranked[0][0]
+    return None
+
+
+def _infer_set_sport(set_name: str) -> Optional[str]:
+    s_up = str(set_name or "").upper()
+    if any(k in s_up for k in ("BASEBALL", "MLB", "BOWMAN", "HERITAGE", "ALLEN & GINTER", "ALLEN AND GINTER", "STADIUM CLUB", "GYPSY QUEEN", "TOPPS CHROME UPDATE", "FINEST BASEBALL")):
+        if not any(other in s_up for other in ("BASKETBALL", "NBA", "FOOTBALL", "NFL", "HOCKEY", "NHL")):
+            return "BASEBALL"
+    if any(k in s_up for k in ("BASKETBALL", "NBA", "WNBA", "HOOPS", "PRIZM BASKETBALL")):
+        return "BASKETBALL"
+    if any(k in s_up for k in ("FOOTBALL", "NFL")):
+        return "FOOTBALL"
+    if any(k in s_up for k in ("HOCKEY", "NHL", "UPPER DECK SERIES")):
+        return "HOCKEY"
+    return None
+
+
+def _ocr_has_autograph_signal(full_blob: str) -> bool:
+    b = norm(str(full_blob or ""))
+    return any(
+        tok in b
+        for tok in (
+            "AUTOGRAPH",
+            "AUTOGRAPHCARD",
+            "TOPPSCERTIFIEDAUTOGRAPH",
+            "TOPPSCERTIFIEDAUTOGRAPHISSUE",
+            "CERTIFIEDAUTOGRAPH",
+            "AUTHENTICAUTOGRAPH",
+        )
+    )
+
+
+def _is_autograph_subset(subset_name: str, card_attributes: str = "") -> bool:
+    u = f" {str(subset_name or '').upper()} "
+    if any(k in u for k in ("AUTOGRAPH", "AUTO ", "AUTOS", "SIGNATURE", "SIGNED", "INK")):
+        return True
+    attrs_up = f" {str(card_attributes or '').upper()} "
+    return bool(re.search(r"\bAU\b", attrs_up))
+
+
 def _dynamic_filter_candidate_sets(
     full_blob: str,
     root_df: pd.DataFrame,
+    detected_sport: Optional[str] = None,
 ) -> tuple[pd.DataFrame, Optional[str], Optional[str]]:
     if root_df is None or root_df.empty:
         return root_df, None, None
@@ -2159,6 +2434,12 @@ def _dynamic_filter_candidate_sets(
             return sub_df, cmp_set, cmp_subset
 
     cand = root_df
+    if detected_sport:
+        sport_mask = cand["Set"].apply(lambda s: (_infer_set_sport(str(s)) in (None, detected_sport)))
+        sport_df = cand[sport_mask]
+        if not sport_df.empty:
+            cand = sport_df
+
     if "ALLENGINTER" in full_blob or "ALLENANDGINTER" in full_blob:
         ag_df = cand[cand["Set"].str.contains("Allen", case=False, na=False)]
         if not ag_df.empty:
@@ -2190,6 +2471,7 @@ def _score_candidates(
     is_series_one: bool,
     is_series_two: bool,
     is_leaders_card: bool = False,
+    detected_sport: Optional[str] = None,
 ):
     best_row = None
     best_score = -1
@@ -2198,8 +2480,15 @@ def _score_candidates(
     has_strong_cnum_signal = bool(series_badge_cnums or header_corner_cnums)
     has_asr_ocr = "ALLSTARROOKIE" in full_blob or "ALLSTARROOKIES" in full_blob
     has_fs_ocr = "FUTURESTARS" in full_blob or "FUTURESTAR" in full_blob
+    has_auto_ocr = _ocr_has_autograph_signal(full_blob)
+    if detected_sport is None:
+        detected_sport = _detect_sport_from_ocr(full_blob)
 
     for _, row in cand_df.iterrows():
+        set_sport = _infer_set_sport(str(row.get("Set", "")))
+        if detected_sport and set_sport and set_sport != detected_sport:
+            continue
+
         score = 0
         reasons = []
         cnum = row["norm_cnum"]
@@ -2329,8 +2618,14 @@ def _score_candidates(
         # Prevent OCR alone from picking Golden Mirror / Variations / Relics over Base without visual proof
         if "GOLDEN MIRROR" in sub_up_sc or ("VARIATION" in sub_up_sc and "-" not in cnum_raw_sc):
             score -= 32
+        elif has_auto_ocr and _is_autograph_subset(row["Subset"], card_attributes=str(row.get("Attributes", ""))):
+            score += 45
+            reasons.append("AutoOCRBoost")
+        elif has_auto_ocr and is_base_root_sc:
+            score -= 20
+            reasons.append("AutoOpposesBase")
         elif _is_relic_or_auto_subset(row["Subset"]) and "-" not in cnum_raw_sc:
-            if not _back_ocr_has_relic_or_auto_text(full_blob):
+            if not _back_ocr_has_relic_or_auto_text(full_blob) and not has_auto_ocr:
                 score -= 40
 
         if score > best_score:
@@ -2361,9 +2656,13 @@ def _extract_cnum_tokens_from_line(raw_line: str) -> tuple[set[str], set[str]]:
             cnums.add(tok)
             badge_cnums.add(tok)
 
-    for m_ins in re.finditer(r"\b([A-Z0-9]{1,5}-\d{1,4}[A-Z]?)\b", clean):
-        tok = norm(m_ins.group(1))
-        if tok and not re.match(r"^(19|20)\d{2}", tok):
+    for m_ins in re.finditer(r"\b([A-Z0-9]{1,6}-[A-Z0-9]{1,5})\b", clean):
+        raw_ins = m_ins.group(1)
+        tok = norm(raw_ins)
+        if not tok or re.match(r"^(19|20)\d{2}-", raw_ins):
+            continue
+        left_p, right_p = raw_ins.split("-", 1)
+        if any(ch.isdigit() for ch in raw_ins) or (len(left_p) <= 3 and len(right_p) <= 3):
             cnums.add(tok)
             badge_cnums.add(tok)
 
@@ -2408,6 +2707,11 @@ def match_card_identity(ocr_bundle: dict, root_df: pd.DataFrame):
                 n_next = norm(next_line)
                 combined_pair = n_line + n_next
                 cnum_candidates.add(combined_pair)
+                raw_cur_s = str(line or "").strip()
+                raw_nxt_s = str(next_line or "").strip()
+                if (raw_cur_s.endswith("-") or raw_nxt_s.startswith("-")) and n_line and n_next and len(combined_pair) <= 10:
+                    series_badge_cnums.add(combined_pair)
+                    header_corner_cnums.add(combined_pair)
                 if any(s_tag in n_next for s_tag in ("SERIESONE", "SERIESTWO", "UPDATESERIES")):
                     if n_line and len(n_line) <= 6:
                         series_badge_cnums.add(n_line)
@@ -2427,6 +2731,7 @@ def match_card_identity(ocr_bundle: dict, root_df: pd.DataFrame):
 
     header_blob = norm(" ".join(header_lines))
     full_blob = norm(" ".join(full_lines + ricoh_lines))
+    detected_sport = _detect_sport_from_ocr(full_lines + ricoh_lines)
 
     is_series_one = "SERIESONE" in full_blob
     is_series_two = "SERIESTWO" in full_blob or "ERIESTWO" in full_blob
@@ -2449,7 +2754,7 @@ def match_card_identity(ocr_bundle: dict, root_df: pd.DataFrame):
         )
     )
 
-    cand_df, _, cmp_hint_subset = _dynamic_filter_candidate_sets(full_blob, root_df)
+    cand_df, _, cmp_hint_subset = _dynamic_filter_candidate_sets(full_blob, root_df, detected_sport=detected_sport)
 
     best_row, best_score, best_reasons = _score_candidates(
         cand_df,
@@ -2462,6 +2767,7 @@ def match_card_identity(ocr_bundle: dict, root_df: pd.DataFrame):
         is_series_one,
         is_series_two,
         is_leaders_card=is_leaders_card,
+        detected_sport=detected_sport,
     )
 
     if best_score < 60 and len(cand_df) < len(root_df):
@@ -2476,6 +2782,7 @@ def match_card_identity(ocr_bundle: dict, root_df: pd.DataFrame):
             is_series_one,
             is_series_two,
             is_leaders_card=is_leaders_card,
+            detected_sport=detected_sport,
         )
         if fb_score > best_score:
             best_row, best_score, best_reasons = fb_row, fb_score, fb_reasons
@@ -2512,12 +2819,16 @@ def get_top_card_identity_candidates(
 
     full_blob = norm(" ".join(full_lines + ricoh_lines))
     header_blob = norm(" ".join(header_lines))
-    cand_df, _, _ = _dynamic_filter_candidate_sets(full_blob, root_df)
+    detected_sport_top = _detect_sport_from_ocr(full_lines + ricoh_lines)
+    cand_df, _, _ = _dynamic_filter_candidate_sets(full_blob, root_df, detected_sport=detected_sport_top)
 
     seen_keys = {(primary_row["Set"], primary_row["norm_cnum"], primary_row["norm_player"])}
     extra_scored: list[tuple[int, pd.Series, str]] = []
 
     for _, row in cand_df.iterrows():
+        set_sp_top = _infer_set_sport(str(row.get("Set", "")))
+        if detected_sport_top and set_sp_top and set_sp_top != detected_sport_top:
+            continue
         k = (row["Set"], row["norm_cnum"], row["norm_player"])
         if k in seen_keys:
             continue
@@ -2641,20 +2952,20 @@ def _compute_rarity_and_sn_prior_adjustment(
     base_prior = min(0.020, cfg_base_prior * 0.35) if parallel_heavy_mode else cfg_base_prior
     ord_prior = min(0.015, cfg_ord_prior * 0.35) if parallel_heavy_mode else cfg_ord_prior
 
-    pr_clean = format_print_run(expected_print_run)
+    pr_clean = _extract_subset_print_run_denom(subset_name, expected_print_run)
     det_sn = format_print_run(detected_serial_denom or "")
     sub_up = str(subset_name or "").upper()
 
     if is_base:
         if det_sn:
             # A genuine stamped serial number on the card strongly opposes plain unnumbered Base
-            return -0.04, f"SN_OpposesBase(#/{det_sn})"
+            return -0.25, f"SN_OpposesBase(#/{det_sn})"
         return base_prior, ""
 
     if pr_clean:
         if det_sn:
             if det_sn == pr_clean:
-                return float(RUNTIME_CONFIG.get("sn_exact_match_bonus", 0.12)), f"SN_Match(#/{det_sn})"
+                return float(RUNTIME_CONFIG.get("sn_exact_match_bonus", 0.25)), f"SN_Match(#/{det_sn})"
             return float(RUNTIME_CONFIG.get("sn_mismatch_penalty", -0.25)), f"SN_Mismatch(got#{det_sn}!=#{pr_clean})"
         pr_int = int(pr_clean) if pr_clean.isdigit() else 999
         if pr_int <= 1:
@@ -3177,14 +3488,280 @@ _LEGACY_TMPL_FILENAME_RE = re.compile(
 )
 
 
-def _compute_visual_feature_vector(img: Image.Image, card_box: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
-    if card_box is not None:
-        x1, y1, x2, y2 = card_box
-        crop = img.crop((x1, y1, max(x1 + 20, x2), max(y1 + 20, y2)))
+def _crop_inner_card_for_id(
+    img: Image.Image | np.ndarray,
+    card_box: Optional[tuple[int, int, int, int]] = None,
+) -> np.ndarray:
+    """
+    Fast, purely in-memory physical-card cropper for visual matching and border-color analysis.
+    Strips dark scanner-mat / toploader margins around the card without ever modifying disk files.
+    """
+    if isinstance(img, Image.Image):
+        arr = np.array(img.convert("RGB"))
     else:
-        crop = img
+        arr = np.asarray(img)
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+        elif arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
 
-    small_rgb = np.array(crop.resize((128, 176), Image.Resampling.BILINEAR))
+    if arr.size == 0 or arr.ndim != 3:
+        return arr
+
+    h0, w0 = arr.shape[:2]
+    if card_box is not None:
+        x1, y1, x2, y2 = [int(v) for v in card_box]
+        x1 = max(0, min(w0 - 1, x1))
+        y1 = max(0, min(h0 - 1, y1))
+        x2 = max(x1 + 1, min(w0, x2))
+        y2 = max(y1 + 1, min(h0, y2))
+        if (x2 - x1) >= 40 and (y2 - y1) >= 40:
+            arr = arr[y1:y2, x1:x2]
+
+    h, w = arr.shape[:2]
+    if h < 48 or w < 48:
+        return arr
+
+    scale = min(1.0, 400.0 / float(max(w, h)))
+    sw = max(32, int(round(w * scale)))
+    sh = max(32, int(round(h * scale)))
+    small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA) if scale < 1.0 else arr
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+
+    strip_x = max(2, int(round(sw * 0.03)))
+    strip_y = max(2, int(round(sh * 0.03)))
+    perim_mask = np.zeros((sh, sw), dtype=bool)
+    perim_mask[:strip_y, :] = True
+    perim_mask[-strip_y:, :] = True
+    perim_mask[:, :strip_x] = True
+    perim_mask[:, -strip_x:] = True
+
+    bg_gray_med = float(np.median(gray[perim_mask]))
+    bg_v_med = float(np.median(hsv[:, :, 2][perim_mask]))
+
+    if bg_v_med >= 78.0 and bg_gray_med >= 72.0:
+        return arr
+
+    fg_thresh = max(45.0, bg_gray_med + 22.0)
+    fg = ((gray.astype(np.float32) > fg_thresh) | (hsv[:, :, 1] > 40)).astype(np.uint8) * 255
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k_close, iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k_open, iterations=1)
+
+    fg_bool = fg > 0
+    col_occ = fg_bool.mean(axis=0)
+    row_occ = fg_bool.mean(axis=1)
+    valid_cols = np.where(col_occ >= 0.35)[0]
+    valid_rows = np.where(row_occ >= 0.35)[0]
+    if valid_cols.size < 10 or valid_rows.size < 10:
+        return arr
+
+    ix1_s = int(valid_cols[0])
+    ix2_s = int(valid_cols[-1]) + 1
+    iy1_s = int(valid_rows[0])
+    iy2_s = int(valid_rows[-1]) + 1
+
+    w_ratio = (ix2_s - ix1_s) / float(sw)
+    h_ratio = (iy2_s - iy1_s) / float(sh)
+    area_ratio = w_ratio * h_ratio
+    trimmed_any = (ix1_s >= max(2, int(sw * 0.02))) or ((sw - ix2_s) >= max(2, int(sw * 0.02))) or (iy1_s >= max(2, int(sh * 0.02))) or ((sh - iy2_s) >= max(2, int(sh * 0.02)))
+
+    if not trimmed_any or w_ratio < 0.45 or h_ratio < 0.45 or area_ratio < 0.25:
+        return arr
+
+    ox1 = max(0, int(round(ix1_s / scale)))
+    oy1 = max(0, int(round(iy1_s / scale)))
+    ox2 = min(w, int(round(ix2_s / scale)))
+    oy2 = min(h, int(round(iy2_s / scale)))
+    if (ox2 - ox1) < 32 or (oy2 - oy1) < 32:
+        return arr
+    return arr[oy1:oy2, ox1:ox2]
+
+
+def _extract_border_ring_color_stats(
+    img: Image.Image | np.ndarray,
+    card_box: Optional[tuple[int, int, int, int]] = None,
+) -> dict:
+    """
+    Samples the outer 5%-14% perimeter ring of the inner-cropped card in HSV & Lab color space
+    to characterize border color/chroma independently of the center player photo.
+    """
+    crop_rgb = _crop_inner_card_for_id(img, card_box=card_box)
+    if crop_rgb is None or crop_rgb.size == 0:
+        return {
+            "mean_h": 0.0, "mean_s": 0.0, "p75_s": 0.0, "mean_v": 0.0,
+            "mean_l": 225.0, "mean_a": 128.0, "mean_b": 128.0,
+            "mean_chroma": 0.0, "lab_vec": np.array([225.0, 128.0, 128.0], dtype=np.float32),
+            "dominant_color": "neutral",
+        }
+
+    h_c, w_c = crop_rgb.shape[:2]
+    target_wh = (280, 200) if w_c > h_c else (200, 280)
+    sm = cv2.resize(crop_rgb, target_wh, interpolation=cv2.INTER_AREA)
+    sh, sw = sm.shape[:2]
+
+    o_y = max(2, int(round(sh * 0.05)))
+    o_x = max(2, int(round(sw * 0.05)))
+    i_y = max(o_y + 2, int(round(sh * 0.14)))
+    i_x = max(o_x + 2, int(round(sw * 0.14)))
+
+    ring_mask = np.zeros((sh, sw), dtype=bool)
+    ring_mask[o_y : sh - o_y, o_x : sw - o_x] = True
+    ring_mask[i_y : sh - i_y, i_x : sw - i_x] = False
+
+    hsv = cv2.cvtColor(sm, cv2.COLOR_RGB2HSV).astype(np.float32)
+    lab = cv2.cvtColor(sm, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    h_vals = hsv[:, :, 0][ring_mask]
+    s_vals = hsv[:, :, 1][ring_mask]
+    v_vals = hsv[:, :, 2][ring_mask]
+    l_vals = lab[:, :, 0][ring_mask]
+    a_vals = lab[:, :, 1][ring_mask]
+    b_vals = lab[:, :, 2][ring_mask]
+
+    mean_s = float(np.mean(s_vals))
+    p75_s = float(np.percentile(s_vals, 75))
+    mean_v = float(np.mean(v_vals))
+    mean_l = float(np.mean(l_vals))
+    mean_a = float(np.mean(a_vals))
+    mean_b = float(np.mean(b_vals))
+    chroma_vals = np.sqrt((a_vals - 128.0) ** 2 + (b_vals - 128.0) ** 2)
+    mean_chroma = float(np.mean(chroma_vals))
+
+    # Circular-safe hue mean weighted by saturation so low-sat pixels don't skew hue
+    sat_w = np.maximum(s_vals, 1.0)
+    angles_rad = (h_vals * 2.0) * (np.pi / 180.0)
+    mean_ang = float(np.arctan2(np.sum(sat_w * np.sin(angles_rad)), np.sum(sat_w * np.cos(angles_rad))))
+    if mean_ang < 0:
+        mean_ang += 2.0 * np.pi
+    mean_h = (mean_ang * 180.0 / np.pi) * 0.5
+
+    dom_color = "neutral"
+    if mean_v < 58.0 and mean_s < 85.0:
+        dom_color = "black"
+    elif mean_s >= 42.0 and mean_chroma >= 18.0:
+        if 17.0 <= mean_h <= 38.0 and mean_b >= 145.0:
+            dom_color = "yellow_gold"
+        elif 8.0 <= mean_h < 17.0:
+            dom_color = "orange"
+        elif 85.0 <= mean_h <= 128.0:
+            dom_color = "blue"
+        elif 40.0 <= mean_h < 85.0:
+            dom_color = "green"
+        elif 128.0 < mean_h <= 155.0:
+            dom_color = "purple"
+        elif mean_h <= 8.0 or mean_h > 155.0:
+            dom_color = "red_pink"
+
+    return {
+        "mean_h": round(mean_h, 2),
+        "mean_s": round(mean_s, 2),
+        "p75_s": round(p75_s, 2),
+        "mean_v": round(mean_v, 2),
+        "mean_l": round(mean_l, 2),
+        "mean_a": round(mean_a, 2),
+        "mean_b": round(mean_b, 2),
+        "mean_chroma": round(mean_chroma, 2),
+        "lab_vec": np.array([mean_l, mean_a, mean_b], dtype=np.float32),
+        "dominant_color": dom_color,
+    }
+
+
+_BORDER_COLOR_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "yellow_gold": ("YELLOW", "GOLD", "CANARY", "AMBER", "CHAMPAGNE", "SPARKLE"),
+    "blue": ("BLUE", "AQUA", "CYAN", "SAPPHIRE", "SKY", "ROYAL", "NAVY", "TEAL", "ICE", "POWDER"),
+    "red_pink": ("RED", "PINK", "ROSE", "MAGENTA", "CRIMSON", "RUBY", "CORAL", "FUCHSIA"),
+    "green": ("GREEN", "EMERALD", "LIME", "KELLY", "MINT", "FOREST"),
+    "orange": ("ORANGE", "TANGERINE", "COPPER", "BRONZE"),
+    "purple": ("PURPLE", "VIOLET", "LAVENDER", "PLUM", "AMETHYST"),
+    "black": ("BLACK", "ONYX", "CHARCOAL", "NEGATIVE"),
+}
+
+
+def score_border_ring_parallel(
+    scan_front: Image.Image | np.ndarray,
+    subset_name: str,
+    base_ref: Optional[Image.Image | np.ndarray] = None,
+    candidate_ref: Optional[Image.Image | np.ndarray] = None,
+    card_box: Optional[tuple[int, int, int, int]] = None,
+) -> dict:
+    """
+    Compares the outer 5%-14% perimeter ring of the inner-cropped front card against
+    Base (or neutral paper baseline) and an optional candidate reference in HSV/Lab space.
+    """
+    scan_st = _extract_border_ring_color_stats(scan_front, card_box=card_box)
+    if base_ref is not None:
+        base_st = _extract_border_ring_color_stats(base_ref)
+    else:
+        base_st = {
+            "mean_h": 0.0, "mean_s": 12.0, "p75_s": 18.0, "mean_v": 230.0,
+            "mean_l": 225.0, "mean_a": 128.0, "mean_b": 128.0,
+            "mean_chroma": 6.0, "lab_vec": np.array([225.0, 128.0, 128.0], dtype=np.float32),
+            "dominant_color": "neutral",
+        }
+
+    delta_e_vs_base = float(np.linalg.norm(scan_st["lab_vec"] - base_st["lab_vec"]))
+    chroma_delta = float(scan_st["mean_chroma"] - base_st["mean_chroma"])
+    is_colored_border = bool(scan_st["mean_s"] >= 42.0 and scan_st["mean_chroma"] >= 18.0 and delta_e_vs_base >= 16.0)
+
+    ring_sim: Optional[float] = None
+    if candidate_ref is not None:
+        cand_st = _extract_border_ring_color_stats(candidate_ref)
+        de_cand = float(np.linalg.norm(scan_st["lab_vec"] - cand_st["lab_vec"]))
+        sat_diff = abs(scan_st["mean_s"] - cand_st["mean_s"]) / 255.0
+        ring_sim = float(np.clip(1.0 - (de_cand / 95.0) - 0.25 * sat_diff, 0.0, 1.0))
+
+    sub_up = str(subset_name or "Base").strip().upper()
+    is_base = sub_up in ("", "BASE", "BASE SET") or sub_up.startswith("BASE ")
+    dom_col = scan_st["dominant_color"]
+
+    matched_color_kw = False
+    contradict_color_kw = False
+    for col_key, kws in _BORDER_COLOR_KEYWORDS.items():
+        if any(kw in sub_up for kw in kws):
+            if dom_col == col_key:
+                matched_color_kw = True
+            elif is_colored_border and dom_col not in ("neutral", col_key):
+                contradict_color_kw = True
+
+    score_delta = 0.0
+    reason = ""
+    if is_base:
+        if is_colored_border and base_st["dominant_color"] == "neutral":
+            score_delta = -min(0.14, 0.06 + (delta_e_vs_base - 16.0) * 0.002)
+            reason = f"BdrRingOpposeBase({dom_col},dE={delta_e_vs_base:.1f})"
+    else:
+        if matched_color_kw and is_colored_border:
+            score_delta += 0.13
+            reason = f"BdrRingMatch({dom_col})"
+        elif contradict_color_kw:
+            score_delta -= 0.11
+            reason = f"BdrRingMismatch(got={dom_col})"
+
+        if ring_sim is not None:
+            if ring_sim >= 0.80 and is_colored_border:
+                score_delta += 0.04
+                reason = f"{reason}+RefRing({ring_sim:.2f})".strip("+")
+            elif ring_sim < 0.50:
+                score_delta -= 0.08
+                reason = f"{reason}+RefRingLow({ring_sim:.2f})".strip("+")
+
+    return {
+        "score_delta": round(float(score_delta), 4),
+        "is_colored_border": is_colored_border,
+        "dominant_color": dom_col,
+        "delta_e_vs_base": round(delta_e_vs_base, 2),
+        "chroma_delta": round(chroma_delta, 2),
+        "ring_sim": round(ring_sim, 4) if ring_sim is not None else None,
+        "reason": reason,
+    }
+
+
+def _compute_visual_feature_vector(img: Image.Image, card_box: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
+    crop_rgb = _crop_inner_card_for_id(img, card_box=card_box)
+    small_rgb = cv2.resize(crop_rgb, (128, 176), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2HSV)
     lab = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
     gray = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2GRAY)
@@ -3432,6 +4009,31 @@ def _get_lazy_border_foil_signature(img_path_str: str) -> Optional[np.ndarray]:
         return None
 
 
+def invalidate_image_caches(img_path: Path | str) -> None:
+    """Invalidates in-memory lazy visual vector, border-sig, and neural embedding caches for `img_path`."""
+    p_raw = str(img_path or "").strip()
+    if not p_raw:
+        return
+    candidates = {p_raw, p_raw.lower()}
+    try:
+        p_obj = Path(p_raw)
+        candidates.add(str(p_obj))
+        candidates.add(str(p_obj).lower())
+        p_res = str(p_obj.resolve())
+        candidates.add(p_res)
+        candidates.add(p_res.lower())
+    except Exception:
+        pass
+    for cache_dict in (_LAZY_VEC_CACHE, _LAZY_BORDER_SIG_CACHE):
+        for k in list(cache_dict.keys()):
+            if k in candidates or k.lower() in candidates:
+                cache_dict.pop(k, None)
+    try:
+        invalidate_neural_image_cache(p_raw)
+    except Exception:
+        pass
+
+
 def _extract_enhanced_back_and_front_ocr(
     front_img: Image.Image,
     back_oriented: Image.Image,
@@ -3658,7 +4260,7 @@ def _search_set_visually(
         return None
 
     fx1, fy1, fx2, fy2 = front_box
-    scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
+    scan_front_crop = _crop_inner_card_for_id(front_img, card_box=(fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2)))
     q_front_vec = _compute_visual_feature_vector(front_img, front_box)
 
     scan_back_crop = None
@@ -3666,9 +4268,9 @@ def _search_set_visually(
     if back_img is not None:
         if back_box is not None:
             bx1, by1, bx2, by2 = back_box
-            scan_back_crop = np.array(back_img.crop((bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2))))
+            scan_back_crop = _crop_inner_card_for_id(back_img, card_box=(bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2)))
         else:
-            scan_back_crop = np.array(back_img)
+            scan_back_crop = _crop_inner_card_for_id(back_img)
         q_back_vec = _compute_visual_feature_vector(back_img, back_box)
 
     s_key = canonical_set_key(set_name)
@@ -3937,7 +4539,7 @@ def verify_and_correct_parallel_match(
       6. Restored Base Prior Advantage (`base_prior_bonus = 0.065`, `0.020` in Parallel-Heavy mode).
     """
     fx1, fy1, fx2, fy2 = front_box
-    scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
+    scan_front_crop = _crop_inner_card_for_id(front_img, card_box=(fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2)))
     q_border_sig = _compute_border_foil_signature(scan_front_crop)
     q_par_desc = scan_front_desc
     if q_par_desc is None and is_neural_embeddings_enabled():
@@ -3960,9 +4562,9 @@ def verify_and_correct_parallel_match(
     if back_img is not None:
         if back_box is not None:
             bx1, by1, bx2, by2 = back_box
-            scan_back_crop = np.array(back_img.crop((bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2))))
+            scan_back_crop = _crop_inner_card_for_id(back_img, card_box=(bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2)))
         else:
-            scan_back_crop = np.array(back_img)
+            scan_back_crop = _crop_inner_card_for_id(back_img)
         gold_back_score = _measure_gold_back_score(scan_back_crop)
 
     s_key = canonical_set_key(set_name)
@@ -4010,6 +4612,34 @@ def verify_and_correct_parallel_match(
     pr_map = print_run_map or {}
     walk_this_way_checked: Optional[tuple[bool, str]] = None
 
+    # Locate a Base reference image (if available) for border-ring color comparison
+    base_ref_rgb: Optional[np.ndarray] = None
+    if has_base_valid:
+        for t_sub_b, t_bkt_b in set_tmpls.items():
+            if isinstance(t_bkt_b, dict) and canonical_subset_key(t_sub_b, set_name) == "BASE":
+                c_b_list = (t_bkt_b.get("cards") or {}).get(n_cnum, []) or (t_bkt_b.get("cards") or {}).get("_GENERIC", [])
+                for c_b in c_b_list[:2]:
+                    fp_b = c_b.get("front_path") or ""
+                    if fp_b and Path(fp_b).exists():
+                        try:
+                            with Image.open(fp_b) as im_b_ref:
+                                base_ref_rgb = np.array(im_b_ref.convert("RGB"))
+                            break
+                        except Exception:
+                            pass
+                if base_ref_rgb is not None:
+                    break
+        if base_ref_rgb is None:
+            for r_item_b in exact_card_revs:
+                if canonical_subset_key(r_item_b[0], set_name) == "BASE" and len(r_item_b) >= 4 and r_item_b[3]:
+                    if Path(r_item_b[3]).exists():
+                        try:
+                            with Image.open(r_item_b[3]) as im_b_ref:
+                                base_ref_rgb = np.array(im_b_ref.convert("RGB"))
+                            break
+                        except Exception:
+                            pass
+
     for sub_cand in candidates_to_check:
         sub_canon = canonical_subset_key(sub_cand, set_name)
         sub_fmt = _classify_subset_physical_format(sub_cand, set_name=set_name, template_catalog=template_catalog)
@@ -4040,6 +4670,9 @@ def verify_and_correct_parallel_match(
             or pr_map.get((set_name, sub_cand, str(card_number).lstrip("#")))
             or ""
         )
+        cand_pr_denom = _extract_subset_print_run_denom(sub_cand, expected_pr)
+        det_sn_clean = format_print_run(detected_serial_denom or "")
+        sn_matches_cand = bool(det_sn_clean and cand_pr_denom and det_sn_clean == cand_pr_denom)
 
         # Mandatory Front-OCR gate for "Walk This Way" variation
         if "WALK THIS WAY" in str(sub_cand).upper() or "WALKTHISWAY" in sub_canon:
@@ -4097,6 +4730,48 @@ def verify_and_correct_parallel_match(
                             break
 
         if not exact_pairs and not exemplar_front_paths:
+            if sn_matches_cand:
+                # Allow a serial-matched parallel into scoring even without reference imagery
+                prior_bonus_sn, sn_note_sn = _compute_rarity_and_sn_prior_adjustment(
+                    subset_name=sub_cand,
+                    set_name=set_name,
+                    expected_print_run=cand_pr_denom,
+                    detected_serial_denom=detected_serial_denom,
+                    is_base=is_base,
+                    is_ordinary_root=(sub_cand in ordinary_roots),
+                    parallel_heavy_mode=parallel_heavy_mode,
+                )
+                bdr_sn = score_border_ring_parallel(scan_front_crop, subset_name=sub_cand, base_ref=base_ref_rgb)
+                raw_sn = 0.78
+                adj_sn = raw_sn + prior_bonus_sn + float(bdr_sn["score_delta"])
+                detail_sn = f"SN_Only(#/{det_sn_clean})"
+                if bdr_sn["reason"]:
+                    detail_sn = f"{detail_sn}|{bdr_sn['reason']}"
+                scored.append({
+                    "subset": sub_cand,
+                    "sub_canon": sub_canon,
+                    "is_base": is_base,
+                    "is_ord_mini": is_ord_mini,
+                    "is_mini_sub": is_mini_sub,
+                    "is_gm": is_gm,
+                    "is_canvas": is_canvas,
+                    "is_black_bdr": is_black_bdr,
+                    "is_gold_bdr": is_gold_bdr,
+                    "is_var": is_var,
+                    "is_relic": is_relic,
+                    "cand_pr_denom": cand_pr_denom,
+                    "sn_matches_cand": True,
+                    "has_exact": False,
+                    "exact_whole": None,
+                    "exact_front": None,
+                    "back_sim": None,
+                    "raw_score": round(raw_sn, 4),
+                    "adj_score": round(adj_sn, 4),
+                    "detail": detail_sn,
+                    "src_kind": "SerialNumber",
+                    "front_rel": "",
+                    "back_rel": "",
+                })
             continue
 
         if q_par_desc is not None and is_neural_embeddings_enabled():
@@ -4264,6 +4939,29 @@ def verify_and_correct_parallel_match(
 
         if cmp_hint_subset and canonical_subset_key(cmp_hint_subset, set_name) == sub_canon:
             prior_bonus += float(RUNTIME_CONFIG.get("cmp_match_bonus", 0.035))
+
+        cand_ref_rgb: Optional[np.ndarray] = None
+        if best_fp and Path(best_fp).exists() and not is_base:
+            try:
+                with Image.open(best_fp) as im_c_ref:
+                    cand_ref_rgb = np.array(im_c_ref.convert("RGB"))
+            except Exception:
+                cand_ref_rgb = None
+        bdr_ring_res = score_border_ring_parallel(
+            scan_front_crop,
+            subset_name=sub_cand,
+            base_ref=base_ref_rgb,
+            candidate_ref=cand_ref_rgb,
+        )
+        if bdr_ring_res["score_delta"] != 0.0:
+            prior_bonus += float(bdr_ring_res["score_delta"])
+        if bdr_ring_res["reason"]:
+            detail = f"{detail}|{bdr_ring_res['reason']}"
+
+        if _ocr_has_autograph_signal(back_ocr_blob) and _is_autograph_subset(sub_cand, card_attributes=card_attributes):
+            prior_bonus += 0.12
+            detail = f"{detail}|AutoOCRBoost"
+
         if sn_note:
             detail = f"{detail}|{sn_note}"
 
@@ -4279,6 +4977,8 @@ def verify_and_correct_parallel_match(
             "is_gold_bdr": is_gold_bdr,
             "is_var": is_var,
             "is_relic": is_relic,
+            "cand_pr_denom": cand_pr_denom,
+            "sn_matches_cand": sn_matches_cand,
             "has_exact": best_exact_whole is not None,
             "exact_whole": best_exact_whole,
             "exact_front": best_exact_front,
@@ -4307,9 +5007,15 @@ def verify_and_correct_parallel_match(
     base_raw = base_entry["raw_score"] if base_entry else 0.0
     base_back_sim = base_entry["back_sim"] if (base_entry and base_entry["back_sim"] is not None) else 0.0
 
+    det_sn_val = format_print_run(detected_serial_denom or "")
+    has_numbered_in_scored = any(bool(x.get("cand_pr_denom")) for x in scored if not x["is_base"])
+
     validated: list[dict] = []
     for item in scored:
         if item["is_base"]:
+            if det_sn_val and has_numbered_in_scored:
+                rejected_notes.append(f"SN_BaseDisqualified(#/{det_sn_val})")
+                continue
             validated.append(item)
             continue
 
@@ -4349,14 +5055,14 @@ def verify_and_correct_parallel_match(
 
         elif item["is_relic"]:
             is_plain_num = str(card_number or "").strip().lstrip("#").isdigit()
-            has_ocr_cert = _back_ocr_has_relic_or_auto_text(back_ocr_blob)
+            has_ocr_cert = _back_ocr_has_relic_or_auto_text(back_ocr_blob) or _ocr_has_autograph_signal(back_ocr_blob)
             if is_plain_num and not has_ocr_cert:
                 if not item["has_exact"] or item["raw_score"] < 0.85 or (base_entry is not None and item["raw_score"] < base_raw + 0.07):
                     rejected_notes.append(f"RelicRejected({item['subset']}:NoBackCert)")
                     continue
 
         else:
-            req_conf = min_par_conf if item["has_exact"] else min_grp_conf
+            req_conf = 0.45 if item.get("sn_matches_cand") else (min_par_conf if item["has_exact"] else min_grp_conf)
             if item["raw_score"] < req_conf:
                 rejected_notes.append(f"ParLowConf({item['subset']}:{item['raw_score']:.2f})")
                 continue
@@ -4461,9 +5167,9 @@ def identify_and_verify_card_pipeline(
     vis_confirm_thresh = float(RUNTIME_CONFIG.get("visual_confirm_threshold", 0.75))
 
     fx1, fy1, fx2, fy2 = front_box
-    scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
+    scan_front_crop = _crop_inner_card_for_id(front_img, card_box=(fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2)))
     bx1, by1, bx2, by2 = back_box
-    scan_back_crop = np.array(back_oriented.crop((bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2))))
+    scan_back_crop = _crop_inner_card_for_id(back_oriented, card_box=(bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2)))
 
     scan_front_desc = precomputed_front_desc
     scan_back_desc = precomputed_back_desc
@@ -4765,30 +5471,45 @@ def identify_and_verify_card_pipeline(
             _is_unframed_mini_subset(s, set_name, template_catalog) or _is_ag_back_subset(s) or _is_brooklyn_back_subset(s)
             for s in (valid_subsets or [])
         )
-        # ALWAYS run the Parallel / Mini / Back Verification Tournament on physical Minis or A&G Back candidates!
+        bdr_probe = score_border_ring_parallel(scan_front_crop, subset_name="Base") if len(valid_subsets) > 1 else {"is_colored_border": False}
+
+        # Check Back & existing Front OCR for stamped serial numbers BEFORE deciding parallel tournament
+        pre_sn_denom = stamped_pr or extract_stamped_serial_print_run(
+            front_img,
+            ocr_bundle.get("full_lines", []),
+            front_ocr_lines=ocr_bundle.get("header_norm", []),
+            scan_front_for_stamp=False,
+        )
+        has_numbered_valid_sub = any(
+            bool(
+                _extract_subset_print_run_denom(
+                    s_chk,
+                    (print_run_map or {}).get((set_name, s_chk, norm(cnum_str)))
+                    or (print_run_map or {}).get((set_name, s_chk, cnum_str))
+                    or "",
+                )
+            )
+            for s_chk in (valid_subsets or [])
+        )
+
+        # ALWAYS run the Parallel / Mini / Back Verification Tournament on physical Minis, A&G Back, colored borders, or stamped serials!
         should_run_par_verify = (
             len(valid_subsets) >= 1
             and (
                 is_non_base_card
+                or bool(bdr_probe.get("is_colored_border") and len(valid_subsets) > 1)
+                or bool(pre_sn_denom and has_numbered_valid_sub)
                 or (card_geom["is_mini"] and has_mini_or_ag_subs)
                 or (has_mini_or_ag_subs and (ag_back_ocr["has_ag_ad_text"] or ag_back_ocr["has_brooklyn_text"]))
             )
         )
 
-        # ONLY look for a stamped serial number when the card is suspected to be a parallel WITH a checklist print run!
-        effective_stamped_pr = None
-        if should_run_par_verify and print_run_map:
-            cand_has_pr = any(
-                bool(
-                    print_run_map.get((set_name, s_chk, norm(cnum_str)))
-                    or print_run_map.get((set_name, s_chk, cnum_str))
-                )
-                for s_chk in ([chosen_sub] + (valid_subsets if card_geom["is_mini"] else []))
+        # Scan Front stamp zones too when a parallel with a checklist print run is in play
+        effective_stamped_pr = pre_sn_denom
+        if should_run_par_verify and not effective_stamped_pr and has_numbered_valid_sub:
+            effective_stamped_pr = extract_stamped_serial_print_run(
+                front_img, ocr_bundle.get("full_lines", []), scan_front_for_stamp=True
             )
-            if cand_has_pr:
-                effective_stamped_pr = stamped_pr or extract_stamped_serial_print_run(
-                    front_img, ocr_bundle.get("full_lines", []), scan_front_for_stamp=True
-                )
 
         if should_run_par_verify:
             par_res = verify_and_correct_parallel_match(
@@ -5179,7 +5900,7 @@ def match_front_to_templates(
         return cmp_hint_subset, 0.92, f"{cmp_hint_subset}(0.920)", False, 0.92, 0.15, "CMP_Hint", "", ""
 
     fx1, fy1, fx2, fy2 = front_box
-    scan_front_crop = np.array(front_img.crop((fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2))))
+    scan_front_crop = _crop_inner_card_for_id(front_img, card_box=(fx1, fy1, max(fx1 + 20, fx2), max(fy1 + 20, fy2)))
     q_front_vec = _compute_visual_feature_vector(front_img, front_box)
 
     scan_back_crop = None
@@ -5187,9 +5908,9 @@ def match_front_to_templates(
     if back_img is not None:
         if back_box is not None:
             bx1, by1, bx2, by2 = back_box
-            scan_back_crop = np.array(back_img.crop((bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2))))
+            scan_back_crop = _crop_inner_card_for_id(back_img, card_box=(bx1, by1, max(bx1 + 20, bx2), max(by1 + 20, by2)))
         else:
-            scan_back_crop = np.array(back_img)
+            scan_back_crop = _crop_inner_card_for_id(back_img)
         q_back_vec = _compute_visual_feature_vector(back_img, back_box)
 
     s_key = canonical_set_key(set_name)
@@ -5318,6 +6039,7 @@ def match_front_to_templates(
         front_whole_sim = item["stage1_sim"]
         back_whole_sim = None
         used_stage2 = False
+        t_f_arr = None
 
         is_base_cand = (item["sub_canon"] == "BASE")
         must_eval_s2 = (
@@ -5390,6 +6112,14 @@ def match_front_to_templates(
 
         if _is_canvas_subset(sub_cand) and canvas_weave_s1 < canvas_min_weave_s1:
             bonus -= 0.28
+
+        bdr_s1 = score_border_ring_parallel(
+            scan_front_crop,
+            subset_name=sub_cand,
+            candidate_ref=t_f_arr if (used_stage2 and 't_f_arr' in locals()) else None,
+        )
+        if bdr_s1["score_delta"] != 0.0:
+            bonus += float(bdr_s1["score_delta"])
 
         adj_score = raw_sim + bonus
         final_scored.append({
@@ -8009,17 +8739,19 @@ def reidentify_batch_cards(
                 b_oriented = b_img
                 back_rot_ang = 0
 
-            row_set_hint = clean_locked_set or str(row.get("Set", "")).strip()
+            row_set_hint = clean_locked_set
             row_root_df = (
                 active_root_df[active_root_df["Set"] == row_set_hint]
                 if (row_set_hint and not active_root_df[active_root_df["Set"] == row_set_hint].empty)
                 else active_root_df
             )
 
+            invalidate_image_caches(f_path)
+            invalidate_image_caches(b_path)
             pre_row, _, _ = match_card_identity(ocr_bundle, row_root_df)
             pre_set = row_set_hint or (str(pre_row["Set"]).strip() if pre_row is not None else "")
-            pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else str(row.get("Card_Number", "")).strip().lstrip("#")
-            pre_sub = clean_locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else str(row.get("Subset_Parallel", "Base")).strip())
+            pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else ""
+            pre_sub = clean_locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else "Base")
 
             f_img, front_rot_ang, _ = orient_front_card_image(
                 front_img=f_img,
@@ -8247,6 +8979,58 @@ def regrade_inventory_cards(
 
 
 
+def rotate_card_image_file(img_path: Path | str, degrees: int | float | str = 90) -> dict:
+    """
+    Atomically rotates a card image file on disk clockwise by +90, 180, or 270 (normalizing -90 -> 270),
+    and invalidates all cached visual/neural features for that image path.
+    """
+    p_obj = Path(img_path)
+    if not p_obj.exists():
+        raise FileNotFoundError(f"Image not found: {p_obj}")
+    try:
+        deg_f = float(degrees)
+    except Exception as exc:
+        raise ValueError(f"Invalid rotation angle: {degrees}") from exc
+    if abs(deg_f - round(deg_f)) > 1e-6:
+        raise ValueError(f"Rotation angle must be an integer multiple of 90: {degrees}")
+    norm_deg = int(round(deg_f)) % 360
+    if norm_deg not in (0, 90, 180, 270):
+        raise ValueError(f"Unsupported rotation angle {degrees}; expected 90, 180, -90, or 270.")
+
+    with Image.open(p_obj) as im:
+        rgb_im = im.convert("RGB")
+        if norm_deg == 90:
+            rot_im = rgb_im.transpose(Image.Transpose.ROTATE_270)
+        elif norm_deg == 180:
+            rot_im = rgb_im.transpose(Image.Transpose.ROTATE_180)
+        elif norm_deg == 270:
+            rot_im = rgb_im.transpose(Image.Transpose.ROTATE_90)
+        else:
+            rot_im = rgb_im
+        out_w, out_h = rot_im.size
+
+    if norm_deg != 0:
+        tmp_p = p_obj.with_name(f".{p_obj.name}.rot.{os.getpid()}.tmp")
+        try:
+            rot_im.save(tmp_p, format="JPEG", quality=94)
+            os.replace(tmp_p, p_obj)
+        except Exception:
+            if tmp_p.exists():
+                try:
+                    tmp_p.unlink()
+                except Exception:
+                    pass
+            raise
+    invalidate_image_caches(p_obj)
+    return {
+        "success": True,
+        "fileName": p_obj.name,
+        "rotatedDegrees": norm_deg,
+        "width": out_w,
+        "height": out_h,
+    }
+
+
 def reprocess_single_batch_card(
     batch_dir: Path,
     sku: str,
@@ -8257,6 +9041,7 @@ def reprocess_single_batch_card(
     """
     Re-runs OCR, 5-Tier Visual Confirmation, Parallel Self-Correction, and optional Pre-Grading
     on a single physical card SKU inside an uncommitted batch (for Guided Review's Reprocess button).
+    Always clears/ignores stale prior Set guesses unless `locked_set` is explicitly pinned.
     """
     batch_dir = Path(batch_dir)
     man_path = batch_dir / "Batch_Inventory_Manifest.csv"
@@ -8277,17 +9062,27 @@ def reprocess_single_batch_card(
         return {"success": False, "error": f"Card images missing on disk for SKU {sku_s}"}
 
     from Core.config import SET_CHECKLISTS_DIR
-    row_set = str(locked_set or row.get("Set", "")).strip()
+    explicit_locked_set = str(locked_set or "").strip()
+    if explicit_locked_set and ("MIXED" in explicit_locked_set.upper() or "AUTO-DETECT" in explicit_locked_set.upper()):
+        explicit_locked_set = ""
+    explicit_locked_subset = str(locked_subset or "").strip()
+    if explicit_locked_subset and ("AUTO-DETECT" in explicit_locked_subset.upper() or "MIXED" in explicit_locked_subset.upper()):
+        explicit_locked_subset = ""
+
     chk_p = CHECKLIST_PATH
-    if row_set:
-        cand_s = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(row_set)}.csv"
+    if explicit_locked_set:
+        cand_s = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(explicit_locked_set)}.csv"
         if cand_s.exists():
             chk_p = cand_s
 
     root_df, parallels_map, ordinary_roots, print_run_map = load_master_checklist(chk_p, force_reload=False)
     template_catalog, reviewed_by_card, reviewed_parallels = index_set_templates_and_reviewed_cards(
-        REFERENCE_TEMPLATES_DIR, REVIEWED_CARDS_DIR, locked_set=row_set or None, lazy_vectors=True
+        REFERENCE_TEMPLATES_DIR, REVIEWED_CARDS_DIR, locked_set=explicit_locked_set or None, lazy_vectors=True
     )
+
+    # Invalidate any stale in-memory visual/neural caches before reading freshly rotated images from disk
+    invalidate_image_caches(f_path)
+    invalidate_image_caches(b_path)
 
     with Image.open(f_path) as fim:
         f_img = fim.convert("RGB")
@@ -8302,11 +9097,15 @@ def reprocess_single_batch_card(
         b_oriented = b_img
         back_rot_ang = 0
 
-    active_root = root_df[root_df["Set"] == row_set] if (row_set and not root_df[root_df["Set"] == row_set].empty) else root_df
+    active_root = (
+        root_df[root_df["Set"] == explicit_locked_set]
+        if (explicit_locked_set and not root_df[root_df["Set"] == explicit_locked_set].empty)
+        else root_df
+    )
     pre_row, _, _ = match_card_identity(ocr_bundle, active_root)
-    pre_set = row_set or (str(pre_row["Set"]).strip() if pre_row is not None else "")
-    pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else str(row.get("Card_Number", "")).strip().lstrip("#")
-    pre_sub = str(locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else str(row.get("Subset_Parallel", "Base")).strip())).strip()
+    pre_set = explicit_locked_set or (str(pre_row["Set"]).strip() if pre_row is not None else "")
+    pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else ""
+    pre_sub = explicit_locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else "Base")
 
     f_img, front_rot_ang, _ = orient_front_card_image(
         front_img=f_img,
@@ -8334,8 +9133,8 @@ def reprocess_single_batch_card(
         template_catalog=template_catalog,
         reviewed_by_card=reviewed_by_card,
         reviewed_parallels=reviewed_parallels,
-        clean_locked_set=row_set,
-        clean_locked_subset=str(locked_subset or "").strip(),
+        clean_locked_set=explicit_locked_set,
+        clean_locked_subset=explicit_locked_subset,
         stamped_pr=None,
         print_run_map=print_run_map,
     )
@@ -8546,13 +9345,14 @@ def reprocess_inventory_skus(
     if not target_indices:
         return {"success": False, "error": f"None of the requested SKU(s) were found in Inventory.csv."}
 
-    # Determine whether all target SKUs share a single Set for fast single-set checklist loading
-    involved_sets = {
-        str(locked_set or inv_df.at[r_i, "Set"] or "").strip()
-        for _, r_i in target_indices
-        if str(locked_set or inv_df.at[r_i, "Set"] or "").strip()
-    }
-    single_set_hint = next(iter(involved_sets)) if len(involved_sets) == 1 else ""
+    explicit_locked_set = str(locked_set or "").strip()
+    if explicit_locked_set and ("MIXED" in explicit_locked_set.upper() or "AUTO-DETECT" in explicit_locked_set.upper()):
+        explicit_locked_set = ""
+    explicit_locked_subset = str(locked_subset or "").strip()
+    if explicit_locked_subset and ("AUTO-DETECT" in explicit_locked_subset.upper() or "MIXED" in explicit_locked_subset.upper()):
+        explicit_locked_subset = ""
+
+    single_set_hint = explicit_locked_set
     chk_path = CHECKLIST_PATH
     if single_set_hint:
         cand_s = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(single_set_hint)}.csv"
@@ -8576,6 +9376,13 @@ def reprocess_inventory_skus(
 
     total_targets = len(target_indices)
     processed_indices: list[int] = []
+
+    for sku_s_p, r_idx_p in target_indices:
+        fp_c, bp_c, _ = _locate_inventory_card_images(inv_df.loc[r_idx_p].to_dict(), sku_s_p)
+        if fp_c is not None:
+            invalidate_image_caches(fp_c)
+        if bp_c is not None:
+            invalidate_image_caches(bp_c)
 
     pre_inv_descs: dict[str, dict] = {}
     if target_indices and is_neural_embeddings_enabled():
@@ -8612,7 +9419,7 @@ def reprocess_inventory_skus(
                 b_oriented = b_img
                 back_rot_ang = 0
 
-            row_set_hint = str(locked_set or row_d.get("Set") or "").strip()
+            row_set_hint = explicit_locked_set
             active_root = (
                 root_df[root_df["Set"] == row_set_hint]
                 if (row_set_hint and not root_df[root_df["Set"] == row_set_hint].empty)
@@ -8621,8 +9428,8 @@ def reprocess_inventory_skus(
 
             pre_row, _, _ = match_card_identity(ocr_bundle, active_root)
             pre_set = row_set_hint or (str(pre_row["Set"]).strip() if pre_row is not None else "")
-            pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else str(row_d.get("Card Number") or "").strip().lstrip("#")
-            pre_sub = str(locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else str(row_d.get("Subset") or "Base").strip())).strip()
+            pre_cnum = str(pre_row["Card Number"]).strip().lstrip("#") if pre_row is not None else ""
+            pre_sub = explicit_locked_subset or (str(pre_row["Subset"]).strip() if pre_row is not None else "Base")
 
             f_img_oriented, front_rot_ang, front_rot_rsn = orient_front_card_image(
                 front_img=f_img,

@@ -2493,21 +2493,20 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/batches/rotate-image" and isinstance(payload, dict):
-            from PIL import Image
+            from Core.vision_grader import rotate_card_image_file
             b_name = str(payload.get("batchName") or "").strip()
             file_name = str(payload.get("fileName") or "").strip()
-            degrees = int(payload.get("degrees") or 90)
+            raw_deg = payload.get("degrees") if payload.get("degrees") is not None else payload.get("angle", 90)
             img_p = (BATCHES_DIR / b_name / file_name).resolve()
             if not b_name or not file_name or not str(img_p).startswith(str(BATCHES_DIR.resolve())) or not img_p.exists():
                 self._send_json({"success": False, "error": f"Image not found: {file_name}"}, status=404)
                 return
             try:
-                with Image.open(img_p) as im:
-                    # PIL rotate is counter-clockwise, so -degrees rotates clockwise
-                    rot_im = im.convert("RGB").rotate(-degrees, expand=True)
-                rot_im.save(img_p, format="JPEG", quality=94)
-                _log_ui_action_to_file("Batch", f"Rotated {file_name} {degrees}° CW", f"Batch: {b_name}")
-                self._send_json({"success": True, "fileName": file_name, "rotatedDegrees": degrees})
+                rot_res = rotate_card_image_file(img_p, raw_deg)
+                _log_ui_action_to_file("Batch", f"Rotated {file_name} {rot_res['rotatedDegrees']}° CW", f"Batch: {b_name}")
+                self._send_json(rot_res)
+            except ValueError as ve:
+                self._send_json({"success": False, "error": str(ve)}, status=400)
             except Exception as e:
                 self._send_json({"success": False, "error": str(e)}, status=500)
             return
@@ -2589,11 +2588,11 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/api/inventory/rotate-image" and isinstance(payload, dict):
-            from PIL import Image
             from Core.config import sanitize_filename_part
+            from Core.vision_grader import rotate_card_image_file
             set_name = str(payload.get("setName") or "").strip()
             file_name = str(payload.get("fileName") or "").strip()
-            degrees = int(payload.get("degrees") or 90)
+            raw_deg = payload.get("degrees") if payload.get("degrees") is not None else payload.get("angle", 90)
             if not file_name or ".." in file_name or "/" in file_name or "\\" in file_name:
                 self._send_json({"success": False, "error": f"Invalid fileName: {file_name}"}, status=400)
                 return
@@ -2607,11 +2606,11 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                with Image.open(img_p) as im:
-                    rot_im = im.convert("RGB").rotate(-degrees, expand=True)
-                rot_im.save(img_p, format="JPEG", quality=94)
-                _log_ui_action_to_file("Inventory", f"Rotated {file_name} {degrees}° CW", f"Set: {set_name}")
-                self._send_json({"success": True, "fileName": file_name, "rotatedDegrees": degrees})
+                rot_res = rotate_card_image_file(img_p, raw_deg)
+                _log_ui_action_to_file("Inventory", f"Rotated {file_name} {rot_res['rotatedDegrees']}° CW", f"Set: {set_name}")
+                self._send_json(rot_res)
+            except ValueError as ve:
+                self._send_json({"success": False, "error": str(ve)}, status=400)
             except Exception as e:
                 self._send_json({"success": False, "error": str(e)}, status=500)
             return
