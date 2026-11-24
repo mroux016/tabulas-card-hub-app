@@ -4,8 +4,10 @@ from __future__ import annotations
 # & TEMPLATE SCRAPER (WITH TCDB_CID, FULL FRONT/BACK DOWNLOAD & LIBRARY STATUS)
 # ==============================================================================
 import asyncio
+import atexit
 import csv
 import hashlib
+import inspect
 import json
 import os
 import random
@@ -14,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import defaultdict, deque
@@ -231,13 +234,13 @@ def is_pause_requested() -> bool:
 
 def request_auto_pause(reason: str):
     msg = str(reason or "Auto-paused by scraper").strip()
-    log_msg(f"⏸️ [AUTO-PAUSED] {msg}")
-    emit_progress(current_item=msg)
     if _PAUSE_STATE_CALLBACK is not None:
         try:
             _PAUSE_STATE_CALLBACK(True, msg)
         except Exception:
             pass
+    log_msg(f"⏸️ [AUTO-PAUSED] {msg}")
+    emit_progress(current_item=msg)
 
 
 def wait_if_paused(
@@ -472,6 +475,29 @@ def cleanup_stale_driver_locks(
 
 _TRACKED_DRIVER_PIDS: set[int] = set()
 _TRACKED_DRIVER_PIDS_LOCK = threading.Lock()
+_TRACKED_TEMP_PROFILE_DIRS: set[str] = set()
+_TRACKED_TEMP_PROFILE_DIRS_LOCK = threading.Lock()
+
+
+def cleanup_tracked_temp_profiles():
+    with _TRACKED_TEMP_PROFILE_DIRS_LOCK:
+        dirs_to_clean = list(_TRACKED_TEMP_PROFILE_DIRS)
+        _TRACKED_TEMP_PROFILE_DIRS.clear()
+    remaining: list[str] = []
+    for d in dirs_to_clean:
+        try:
+            if d and Path(d).exists():
+                shutil.rmtree(d, ignore_errors=True)
+                if Path(d).exists():
+                    remaining.append(d)
+        except Exception:
+            pass
+    if remaining:
+        with _TRACKED_TEMP_PROFILE_DIRS_LOCK:
+            _TRACKED_TEMP_PROFILE_DIRS.update(remaining)
+
+
+atexit.register(cleanup_tracked_temp_profiles)
 
 
 def register_driver_pid(pid: Optional[int]):
@@ -513,6 +539,7 @@ def cleanup_orphaned_drivers():
         except Exception:
             pass
     cleanup_stale_driver_locks()
+    cleanup_tracked_temp_profiles()
 
 
 def sanitize_header_value(val):
@@ -526,6 +553,8 @@ def preflight_probe_tcdb_images(
     test_image_url: str = "",
     timeout: float = 15.0,
     allow_404_as_ok: bool = False,
+    user_agent: str = "",
+    cookies: Optional[dict] = None,
 ) -> dict:
     """
     Lightweight Pre-Flight Probe verifying that the active session's `cf_clearance` cookie,
@@ -533,26 +562,54 @@ def preflight_probe_tcdb_images(
     Distinguishes: `200_ok`, `403_cf_block`, `503_origin_overload`, `404_not_found`, and `timeout`.
     """
     probe_url = str(test_image_url or DEFAULT_PREFLIGHT_IMAGE_URL).strip()
-    cookies_obj = getattr(req_session, "cookies", None)
-    has_cf_clearance = False
-    try:
-        if isinstance(cookies_obj, dict):
-            has_cf_clearance = bool(cookies_obj.get("cf_clearance"))
-        elif cookies_obj is not None:
-            has_cf_clearance = bool(cookies_obj.get("cf_clearance", None))
-    except Exception:
-        has_cf_clearance = False
+    active_cookies: dict[str, str] = {}
+    if isinstance(cookies, dict) and cookies:
+        active_cookies = {str(k): str(v) for k, v in cookies.items() if v is not None}
+    else:
+        cookies_obj = getattr(req_session, "cookies", None)
+        try:
+            if isinstance(cookies_obj, dict):
+                active_cookies = {str(k): str(v) for k, v in cookies_obj.items() if v is not None}
+            elif cookies_obj is not None:
+                if hasattr(cookies_obj, "get_dict"):
+                    active_cookies = {str(k): str(v) for k, v in cookies_obj.get_dict().items() if v is not None}
+                else:
+                    for c in cookies_obj:
+                        c_name = getattr(c, "name", None)
+                        c_val = getattr(c, "value", None)
+                        if c_name is not None and c_val is not None:
+                            active_cookies[str(c_name)] = str(c_val)
+        except Exception:
+            active_cookies = {}
+    has_cf_clearance = bool(active_cookies.get("cf_clearance"))
 
     headers_obj = getattr(req_session, "headers", None) or {}
     ua = ""
     try:
-        ua = str(headers_obj.get("User-Agent") or headers_obj.get("user-agent") or "")
+        ua = str(user_agent or headers_obj.get("User-Agent") or headers_obj.get("user-agent") or "").strip()
     except Exception:
-        ua = ""
+        ua = str(user_agent or "").strip()
+
+    probe_headers: dict[str, str] = {"Referer": BASE_URL + "/"}
+    if ua:
+        probe_headers["User-Agent"] = ua
+
+    accepts_cookies = False
+    try:
+        sig = inspect.signature(req_session.get)
+        params = sig.parameters
+        accepts_cookies = ("cookies" in params) or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except Exception:
+        accepts_cookies = False
 
     t0 = time.time()
     try:
-        res = req_session.get(probe_url, headers={"Referer": BASE_URL + "/"}, timeout=timeout)
+        get_kwargs: dict = {"headers": probe_headers, "timeout": timeout}
+        if accepts_cookies and active_cookies:
+            get_kwargs["cookies"] = active_cookies
+        res = req_session.get(probe_url, **get_kwargs)
         elapsed_ms = int((time.time() - t0) * 1000)
         code = int(getattr(res, "status_code", 0) or 0)
         ct = str((getattr(res, "headers", None) or {}).get("Content-Type", "")).lower()
@@ -655,6 +712,7 @@ def connect_session(
     preflight_image_url: str = "",
     rotate_profile: bool = False,
     max_clearance_failures: int = DEFAULT_MAX_CLEARANCE_FAILURES,
+    require_image_probe: Optional[bool] = None,
 ):
     """
     Launches SeleniumBase UC mode to clear Cloudflare on `target_domain`, extracts
@@ -673,6 +731,13 @@ def connect_session(
         if cffi_requests is not None:
             return cffi_requests.Session(impersonate="chrome120")
         return requests.Session()
+
+    if require_image_probe is not None:
+        effective_require_image_probe = bool(require_image_probe)
+    elif existing_session is not None and hasattr(existing_session, "_require_image_probe"):
+        effective_require_image_probe = bool(getattr(existing_session, "_require_image_probe"))
+    else:
+        effective_require_image_probe = True
 
     consecutive_clearance_failures = 0
     attempt = 0
@@ -693,6 +758,8 @@ def connect_session(
             sb_kwargs: dict = {"uc": True, "window_size": "800,1000"}
             if use_fresh_profile:
                 temp_profile_dir = tempfile.mkdtemp(prefix="tcdb_uc_prof_")
+                with _TRACKED_TEMP_PROFILE_DIRS_LOCK:
+                    _TRACKED_TEMP_PROFILE_DIRS.add(temp_profile_dir)
                 sb_kwargs["user_data_dir"] = temp_profile_dir
                 log_msg("  🔄 Rotating to fresh isolated Stealth Browser profile for recovery...")
 
@@ -757,6 +824,9 @@ def connect_session(
                     unregister_driver_pid(spid)
                 if temp_profile_dir:
                     shutil.rmtree(temp_profile_dir, ignore_errors=True)
+                    if not Path(temp_profile_dir).exists():
+                        with _TRACKED_TEMP_PROFILE_DIRS_LOCK:
+                            _TRACKED_TEMP_PROFILE_DIRS.discard(temp_profile_dir)
 
             if not clearance_ready and not cookies.get("cf_clearance"):
                 raise RuntimeError(f"Cloudflare clearance timed out after {int(round(max_wait))}s")
@@ -772,14 +842,23 @@ def connect_session(
                 target_sess.headers.update({"User-Agent": ua})
                 target_sess.cookies.update(cookies)
 
-            if run_preflight:
+            try:
+                setattr(target_sess, "_require_image_probe", effective_require_image_probe)
+            except Exception:
+                pass
+
+            if run_preflight and effective_require_image_probe:
                 probe = preflight_probe_tcdb_images(
                     target_sess,
                     test_image_url=preflight_image_url,
                     allow_404_as_ok=True,
+                    user_agent=ua,
+                    cookies=cookies,
                 )
                 if probe.get("classification") == "403_cf_block":
                     raise RuntimeError(probe.get("message") or "Pre-flight /Images/Large/ returned HTTP 403")
+            elif run_preflight and not effective_require_image_probe:
+                log_msg("  ℹ️ Skipping /Images/Large/ pre-flight gate (checklist/HTML-only mode; require_image_probe=False).")
 
             if existing_session is not None:
                 log_msg("✅ Cloudflare session refreshed in-place!")
@@ -1018,7 +1097,11 @@ def safe_get(
                             return None
                         net_attempt += 1
                         log_msg(f"  🛡️ [HTTP 200 CF-Challenge | {elapsed_ms}ms] {clean_url} — Refreshing session ({net_attempt}/{retries})")
-                        connect_session(existing_session=req_session, target_domain=BASE_URL)
+                        connect_session(
+                            existing_session=req_session,
+                            target_domain=BASE_URL,
+                            require_image_probe=bool(getattr(req_session, "_require_image_probe", "/Images/" in clean_url)),
+                        )
                         time.sleep(3)
                         continue
                 _record_status(200, "")
@@ -1048,7 +1131,11 @@ def safe_get(
                     log_msg(f"  ℹ️ [HTTP 403 Guard | {elapsed_ms}ms] {clean_url} still 403 after {max_403_retries} refresh(es) — skipping optional page.")
                     return None
                 log_msg(f"  🛡️ [HTTP 403 Forbidden | {elapsed_ms}ms] {clean_url} — Re-authenticating Cloudflare ({net_attempt}/{retries})")
-                connect_session(existing_session=req_session, target_domain=BASE_URL)
+                connect_session(
+                    existing_session=req_session,
+                    target_domain=BASE_URL,
+                    require_image_probe=bool(getattr(req_session, "_require_image_probe", "/Images/" in clean_url)),
+                )
                 time.sleep(3)
                 continue
             elif res.status_code == 429:
@@ -1093,7 +1180,11 @@ def safe_get(
             elapsed_ms = int((time.time() - t0) * 1000)
             log_msg(f"  🔌 [Conn Error | {elapsed_ms}ms] {clean_url} ({net_attempt}/{retries}): {err_line}")
             if net_attempt == 3:
-                connect_session(existing_session=req_session, target_domain=BASE_URL)
+                connect_session(
+                    existing_session=req_session,
+                    target_domain=BASE_URL,
+                    require_image_probe=bool(getattr(req_session, "_require_image_probe", "/Images/" in clean_url)),
+                )
             elif net_attempt < retries:
                 time.sleep(6 * net_attempt)
             else:
@@ -2102,7 +2193,7 @@ def repair_tcdb_set_directory(fetch_missing_image_pct: bool = False, max_live_fe
             f"📊 Fast ViewAll.cfm Img % & Category Backfill across {len(pairs_to_fetch)} (Sport, Year) pages "
             f"(100x faster than per-set ViewSet requests)..."
         )
-        sess = connect_session(target_domain=BASE_URL)
+        sess = connect_session(target_domain=BASE_URL, require_image_probe=False)
         try:
             tot_p = len(pairs_to_fetch)
             for p_idx, (sp, yr_s) in enumerate(pairs_to_fetch, 1):
@@ -2203,7 +2294,7 @@ def crawl_tcdb_master_set_directory(
         log_msg("⚠️ No valid (Sport, Year) pages fall within TCDB sport inception guardrails.")
         return curr_df
 
-    sess = connect_session(target_domain=BASE_URL)
+    sess = connect_session(target_domain=BASE_URL, require_image_probe=False)
     total_steps = max(1, total_valid_pages)
     step_i = 0
 
@@ -5483,7 +5574,7 @@ def run_tcdb_checklist_pipeline(
     if clean_slate_reset:
         archive_existing_checklists_for_clean_slate()
 
-    req_session = connect_session(target_domain=BASE_URL)
+    req_session = connect_session(target_domain=BASE_URL, require_image_probe=False)
     queue_items = list(selected_tcdb_sets.items())
     total = len(queue_items)
     try:
@@ -5719,7 +5810,7 @@ def mode_download_all_catalog_images(
 
     cap_note = f", cap={max_cards_per_run:,}/run" if (max_cards_per_run is not None and max_cards_per_run > 0) else ""
     log_msg(f"📥 Launching PURE Front & Back Image Download (Catalog-Only, {pend_f:,} fronts / {pend_b:,} backs pending{cap_note}) for {len(queue)} set(s)...")
-    req_session = connect_session(target_domain=BASE_URL)
+    req_session = connect_session(target_domain=BASE_URL, require_image_probe=True)
     total_sets = len(queue_items)
     learner = get_rate_learner()
     cb = circuit_breaker or CloudflareImageCircuitBreaker(stop_check=is_stop_requested)
@@ -6079,7 +6170,7 @@ def mode_checklist_and_images_card_by_card(
         archive_existing_checklists_for_clean_slate()
 
     log_msg(f"⚡ Launching Combined Card-by-Card Checklist + Front/Back Image Scraper for {len(queue)} set(s)...")
-    req_session = connect_session(target_domain=BASE_URL)
+    req_session = connect_session(target_domain=BASE_URL, require_image_probe=True)
     queue_items = list(queue.items())
     total_sets = len(queue_items)
 
@@ -6161,7 +6252,7 @@ def mode_image_update_pipeline(target_queue: Optional[dict[str, str]] = None):
         log_msg("[!] No sets in queue for High-Res R-Tier Upgrade.")
         return
 
-    req_session = connect_session(target_domain=BASE_URL)
+    req_session = connect_session(target_domain=BASE_URL, require_image_probe=True)
     total_sets = len(queue)
     try:
         for idx, (set_url, folder_name) in enumerate(queue.items(), 1):
@@ -6315,7 +6406,7 @@ def mode_missing_back_audit(target_queue: Optional[dict[str, str]] = None):
         log_msg(f"✅ [FAST-SKIP] Missing Back Audit: 0 eligible cards with known TCDB back URLs across {len(queue)} set(s).")
         return
 
-    req_session = connect_session(target_domain=BASE_URL)
+    req_session = connect_session(target_domain=BASE_URL, require_image_probe=True)
     cb = CloudflareImageCircuitBreaker(stop_check=is_stop_requested)
     try:
         for idx, (set_url, folder_name) in enumerate(queue.items(), 1):
@@ -6995,7 +7086,7 @@ def repair_corrupted_checklists_and_processed_cards() -> dict:
         )
         req_sess = None
         try:
-            req_sess = connect_session(target_domain=BASE_URL)
+            req_sess = connect_session(target_domain=BASE_URL, require_image_probe=False)
             resolved_cnt = 0
             lookup_idx = 0
             for csv_p, card_map in suspect_cards_by_csv.items():

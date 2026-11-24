@@ -4065,6 +4065,7 @@ export default function App() {
   const [activeBatchName, setActiveBatchName] = useState('');
   const activeBatchNameRef = useRef('');
   const prevLaneStatesRef = useRef({});
+  const notifiedPauseRef = useRef({});
   const [batchSelectedSkus, setBatchSelectedSkus] = useState([]);
   const [batchDraftEdits, setBatchDraftEdits] = useState({});
   const [batchReviewFilter, setBatchReviewFilter] = useState('all');
@@ -4631,16 +4632,32 @@ export default function App() {
         if (d && d.lanes) {
           const prevMap = prevLaneStatesRef.current || {};
           const finishedJobs = [];
+          const pausedJobs = [];
+          const isTerminalStatus = (s) => ['COMPLETED', 'FAILED', 'STOPPED', 'INTERRUPTED'].includes(s);
           Object.entries(d.lanes).forEach(([lk, st]) => {
             const prevSt = prevMap[lk];
             const curStatus = st?.status || 'IDLE';
             const curUpd = st?.updated_at || '';
             if (prevSt) {
-              const transitionedOutOfRun = prevSt.status === 'RUNNING' && curStatus !== 'RUNNING';
-              const completedQuickly = prevSt.status !== 'RUNNING' && curStatus === 'COMPLETED' && curUpd && curUpd !== prevSt.updated_at;
-              if (transitionedOutOfRun || completedQuickly) {
+              const wasActive = prevSt.status === 'RUNNING' || prevSt.status === 'PAUSED';
+              const transitionedToTerminal = wasActive && isTerminalStatus(curStatus);
+              const completedQuickly = !wasActive && curStatus === 'COMPLETED' && curUpd && curUpd !== prevSt.updated_at;
+              if (transitionedToTerminal || completedQuickly) {
                 finishedJobs.push({ lane: lk, status: curStatus, title: st?.title || lk, jobType: st?.job_type || '' });
               }
+            }
+            if (curStatus === 'PAUSED') {
+              const pauseKey = `${st?.job_type || ''}|${st?.start_epoch || ''}|${st?.pause_reason || ''}`;
+              if (prevSt && prevSt.status === 'RUNNING' && notifiedPauseRef.current[lk] !== pauseKey) {
+                notifiedPauseRef.current[lk] = pauseKey;
+                pausedJobs.push({
+                  lane: lk,
+                  title: st?.title || lk,
+                  reason: st?.pause_reason || st?.current_item || 'Job paused — click Resume in the Job Monitor when ready.',
+                });
+              }
+            } else {
+              delete notifiedPauseRef.current[lk];
             }
             prevMap[lk] = { status: curStatus, updated_at: curUpd, job_type: st?.job_type || '' };
           });
@@ -4648,6 +4665,18 @@ export default function App() {
 
           setLiveLanes(d.lanes);
           setLiveLogs(d.logs || {});
+
+          if (pausedJobs.length > 0) {
+            pausedJobs.forEach((pj) => {
+              const isAuto = String(pj.reason || '').toLowerCase().includes('auto-paused');
+              pushNotification(
+                isAuto ? `⏸️ Auto-Paused: ${pj.title}` : `⏸️ Paused: ${pj.title}`,
+                pj.reason,
+                PROCESS_LANES[pj.lane]?.shortName || 'Worker',
+                'warning'
+              );
+            });
+          }
 
           if (finishedJobs.length > 0) {
             const hasNewIngest = finishedJobs.some((fj) => fj.jobType === 'scan_ingest');
@@ -5673,7 +5702,13 @@ export default function App() {
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              fetch(`${NODE_API_BASE}/jobs/pause`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
+                              fetch(`${NODE_API_BASE}/jobs/pause`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) })
+                                .then((r) => r.json())
+                                .then((res) => {
+                                  if (res?.lanes?.lanes) setLiveLanes(res.lanes.lanes);
+                                  if (res?.lanes?.logs) setLiveLogs(res.lanes.logs);
+                                })
+                                .catch(() => {});
                             }}
                             className="px-2 py-0.5 rounded bg-amber-700/90 text-amber-50 hover:bg-amber-600 font-bold shrink-0"
                           >
@@ -5684,11 +5719,17 @@ export default function App() {
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              fetch(`${NODE_API_BASE}/jobs/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
+                              fetch(`${NODE_API_BASE}/jobs/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) })
+                                .then((r) => r.json())
+                                .then((res) => {
+                                  if (res?.lanes?.lanes) setLiveLanes(res.lanes.lanes);
+                                  if (res?.lanes?.logs) setLiveLogs(res.lanes.logs);
+                                })
+                                .catch(() => {});
                             }}
-                            className="px-2 py-0.5 rounded bg-emerald-700/90 text-emerald-50 hover:bg-emerald-600 font-bold shrink-0"
+                            className="px-2.5 py-0.5 rounded bg-emerald-600 text-white hover:bg-emerald-500 font-extrabold shadow-sm shrink-0"
                           >
-                            Resume
+                            ▶️ Resume
                           </button>
                         )}
                         <button
@@ -6080,7 +6121,7 @@ export default function App() {
                       <span className="text-xs">{bIcon}</span>
                       <div className="flex items-center gap-1.5 text-[10.5px]">
                         <span className="font-bold text-white max-w-[165px] truncate">{bTitle}</span>
-                        <span className="font-mono font-extrabold text-emerald-300">{st.percent || 0}%</span>
+                        <span className={`font-mono font-extrabold ${isPausedTop ? 'text-amber-300' : 'text-emerald-300'}`}>{isPausedTop ? 'PAUSED' : `${st.percent || 0}%`}</span>
                         <div className="w-10 h-1.5 bg-slate-900 rounded-full overflow-hidden hidden xl:block">
                           <div className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400" style={{ width: `${st.percent || 0}%` }} />
                         </div>

@@ -379,18 +379,32 @@ def is_lane_paused(lane: str) -> bool:
     return get_lane_pause_file(lane).exists()
 
 
+def _read_lane_pause_flag(lane: str) -> Optional[dict]:
+    pause_file = get_lane_pause_file(lane)
+    if not pause_file.exists():
+        return None
+    try:
+        data = json.loads(pause_file.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"reason": "Paused by user — click Resume to continue", "lane": str(lane)}
+
+
 def pause_active_job(lane: Optional[str] = None, reason: str = "") -> bool:
     ensure_directories()
     target_lane = str(lane or "slot_1").strip()
     pause_msg = str(reason or "Paused by user — click Resume to continue").strip()
     pause_file = get_lane_pause_file(target_lane)
+    prev_flag = _read_lane_pause_flag(target_lane)
     atomic_write_text(
         pause_file,
         json.dumps({"paused_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "reason": pause_msg, "lane": target_lane}),
         encoding="utf-8",
     )
     state = get_active_job_state(lane=target_lane)
-    if state.get("status") == "RUNNING":
+    if state.get("status") in ("RUNNING", "PAUSED"):
         state["status"] = "PAUSED"
         state["pause_reason"] = pause_msg
         state["current_item"] = pause_msg[:180]
@@ -398,7 +412,8 @@ def pause_active_job(lane: Optional[str] = None, reason: str = "") -> bool:
         state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         _atomic_write_json_file(get_lane_state_file(target_lane), state)
         _atomic_write_json_file(ACTIVE_JOB_STATE_FILE, state)
-    append_job_log(f"⏸️ Pause requested ({pause_msg}).", lane=target_lane)
+    if prev_flag is None:
+        append_job_log(f"⏸️ Pause requested ({pause_msg}).", lane=target_lane)
     return True
 
 
@@ -406,12 +421,14 @@ def resume_active_job(lane: Optional[str] = None) -> bool:
     ensure_directories()
     target_lane = str(lane or "slot_1").strip()
     pause_file = get_lane_pause_file(target_lane)
+    was_paused = pause_file.exists()
     try:
         pause_file.unlink(missing_ok=True)
     except Exception:
         pass
     state = get_active_job_state(lane=target_lane)
     if state.get("status") == "PAUSED":
+        was_paused = True
         pid = int(state.get("pid", 0) or 0)
         if pid == 0 or _is_pid_running(pid):
             state["status"] = "RUNNING"
@@ -421,7 +438,8 @@ def resume_active_job(lane: Optional[str] = None) -> bool:
             state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _atomic_write_json_file(get_lane_state_file(target_lane), state)
             _atomic_write_json_file(ACTIVE_JOB_STATE_FILE, state)
-    append_job_log("▶️ Resume requested.", lane=target_lane)
+    if was_paused:
+        append_job_log("▶️ Resume requested.", lane=target_lane)
     return True
 
 
@@ -556,11 +574,11 @@ def get_all_lanes_state() -> dict[str, dict]:
             slot_key = f"{lane_key}__p{s_idx}"
             if get_lane_state_file(slot_key).exists():
                 st_s = get_active_job_state(lane=slot_key)
-                if st_s.get("status") == "RUNNING" or (time.time() - float(st_s.get("updated_epoch", 0.0)) < 180.0):
+                if st_s.get("status") in ("RUNNING", "PAUSED") or (time.time() - float(st_s.get("updated_epoch", 0.0)) < 180.0):
                     clean_slot = {k: v for k, v in st_s.items() if k != "parallel_workers"}
                     slots.append(clean_slot)
                     
-        running_slots = [s for s in slots if s.get("status") == "RUNNING"]
+        running_slots = [s for s in slots if s.get("status") in ("RUNNING", "PAUSED")]
         primary["parallel_workers"] = slots
         primary["running_workers_count"] = len(running_slots)
         primary["queued_jobs"] = load_lane_job_queue(lane_key)
@@ -1199,6 +1217,13 @@ def get_active_job_state(lane: Optional[str] = None) -> dict:
             except Exception:
                 pass
         else:
+            pause_info = _read_lane_pause_flag(clean_lane)
+            if pause_info is not None:
+                p_reason = str(pause_info.get("reason") or state.get("pause_reason") or "Paused by user — click Resume to continue").strip()
+                state["status"] = "PAUSED"
+                state["pause_reason"] = p_reason
+                if not state.get("current_item"):
+                    state["current_item"] = p_reason[:180]
             state["elapsed_seconds"] = round(max(0.0, now_t - s_ep), 1)
             if state.get("sub_start_epoch"):
                 state["sub_elapsed_seconds"] = round(max(0.0, now_t - float(state["sub_start_epoch"])), 1)
@@ -1235,6 +1260,10 @@ def write_job_state(
 ):
     """Atomic job state writer preventing half-written JSON reads by the live UI poller."""
     ensure_directories()
+    if status == "RUNNING" and is_lane_paused(lane):
+        pause_info = _read_lane_pause_flag(lane) or {}
+        status = "PAUSED"
+        pause_reason = str(pause_reason or pause_info.get("reason") or "Paused by user — click Resume to continue").strip()
     now_ep = time.time()
     s_ep = float(start_epoch or now_ep)
     elapsed = max(0.0, now_ep - s_ep)
@@ -2137,6 +2166,7 @@ def run_background_job_from_file(payload_path: Path):
             lane=target_lane,
             completed_cards=int(state_tracker.get("completed_cards") or 0),
             total_cards=int(state_tracker.get("total_cards") or 0),
+            pause_reason=str(cf_pause),
         )
     except Exception as e:
         tb_str = traceback.format_exc()

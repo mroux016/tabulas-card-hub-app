@@ -8,6 +8,7 @@ __version__ = "0.25.0-beta.1"
 __last_updated__ = "2026-11-21 18:45:00"
 import argparse
 import csv
+import errno
 import json
 import mimetypes
 import os
@@ -25,8 +26,28 @@ from urllib.parse import parse_qs, unquote, urlparse
 _ACTIVE_HTTP_SERVER = None
 _ACTIVE_SERVER_PORT = 5000
 _ACTIVE_FORCE_BROWSER = False
+_ACTIVE_OPEN_WINDOW = True
+_ACTIVE_WEBVIEW_WINDOW = None
 _RESTART_LOCK = threading.Lock()
 _RESTART_IN_PROGRESS = False
+
+
+def build_restart_command(
+    port: int,
+    *,
+    force_browser: bool = False,
+    open_window: bool = True,
+    script_path: str | None = None,
+) -> list[str]:
+    """Build the child command for self-restart, preserving window vs. headless mode."""
+    script = script_path or str(Path(__file__).resolve())
+    cmd = [sys.executable, script, "--port", str(int(port))]
+    if force_browser:
+        cmd.append("--browser")
+        cmd.append("--no-open")
+    elif not open_window:
+        cmd.append("--no-open")
+    return cmd
 
 
 def request_clean_server_restart(
@@ -72,12 +93,16 @@ def request_clean_server_restart(
 
     port = int(_ACTIVE_SERVER_PORT or os.environ.get("TABULAS_PORT", 5000) or 5000)
     force_browser = bool(_ACTIVE_FORCE_BROWSER)
+    open_window = bool(_ACTIVE_OPEN_WINDOW)
     script_path = str(Path(__file__).resolve())
 
     def _default_spawn():
-        cmd = [sys.executable, script_path, "--port", str(port), "--no-open"]
-        if force_browser:
-            cmd.append("--browser")
+        cmd = build_restart_command(
+            port,
+            force_browser=force_browser,
+            open_window=open_window,
+            script_path=script_path,
+        )
         kwargs: dict = {
             "cwd": str(HUB_DIR),
             "close_fds": True,
@@ -105,6 +130,12 @@ def request_clean_server_restart(
                 except Exception:
                     pass
             do_spawn()
+            win = _ACTIVE_WEBVIEW_WINDOW
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
         finally:
             do_exit()
 
@@ -844,10 +875,15 @@ def _get_live_lanes_and_logs() -> dict:
         safe_states = {}
         for lk, st_obj in all_states.items():
             clean_st = {k: v for k, v in st_obj.items() if k != "parallel_workers"}
+            clean_st["is_paused"] = (clean_st.get("status") == "PAUSED")
+            clean_st["is_terminal"] = clean_st.get("status") in ("COMPLETED", "FAILED", "STOPPED", "INTERRUPTED")
             clean_workers = []
             for w in st_obj.get("parallel_workers") or []:
                 if isinstance(w, dict):
-                    clean_workers.append({wk: wv for wk, wv in w.items() if wk != "parallel_workers"})
+                    cw = {wk: wv for wk, wv in w.items() if wk != "parallel_workers"}
+                    cw["is_paused"] = (cw.get("status") == "PAUSED")
+                    cw["is_terminal"] = cw.get("status") in ("COMPLETED", "FAILED", "STOPPED", "INTERRUPTED")
+                    clean_workers.append(cw)
             clean_st["parallel_workers"] = clean_workers
             safe_states[lk] = clean_st
         logs_by_lane = {lk: cli.get_active_job_logs(max_lines=500, lane=lk) for lk in cli.PROCESS_LANES.keys()}
@@ -3452,13 +3488,54 @@ def _find_edge_executable() -> str | None:
     return shutil.which("msedge")
 
 
+def _bind_http_server_with_retry(
+    host: str,
+    port: int,
+    handler_cls,
+    *,
+    timeout_seconds: float = 8.0,
+    initial_backoff: float = 0.15,
+    max_backoff: float = 0.75,
+    server_cls=ThreadingHTTPServer,
+    sleep_fn=time.sleep,
+    monotonic_fn=time.monotonic,
+):
+    """Bind the HTTP server, retrying briefly on EADDRINUSE during a restart handoff."""
+    deadline = monotonic_fn() + max(0.0, float(timeout_seconds))
+    backoff = max(0.05, float(initial_backoff))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return server_cls((host, port), handler_cls)
+        except OSError as exc:
+            is_addr_in_use = (
+                exc.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048))
+                or getattr(exc, "winerror", None) in (10048, 10013)
+            )
+            now = monotonic_fn()
+            if not is_addr_in_use or now >= deadline:
+                raise
+            if attempt == 1:
+                print(
+                    f"  [Startup] Port {port} busy; waiting up to {timeout_seconds:.1f}s "
+                    "for previous instance to release it...",
+                    flush=True,
+                )
+            sleep_for = min(backoff, max(0.0, deadline - now))
+            if sleep_for > 0:
+                sleep_fn(sleep_for)
+            backoff = min(float(max_backoff), backoff * 1.5)
+
+
 def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool = False, open_window: bool = True):
-    global _ACTIVE_HTTP_SERVER, _ACTIVE_SERVER_PORT, _ACTIVE_FORCE_BROWSER
+    global _ACTIVE_HTTP_SERVER, _ACTIVE_SERVER_PORT, _ACTIVE_FORCE_BROWSER, _ACTIVE_OPEN_WINDOW, _ACTIVE_WEBVIEW_WINDOW
     url = f"http://localhost:{port}"
-    server = ThreadingHTTPServer(("127.0.0.1", port), _TabulasPythonApiAndReactHandler)
+    server = _bind_http_server_with_retry("127.0.0.1", port, _TabulasPythonApiAndReactHandler)
     _ACTIVE_HTTP_SERVER = server
     _ACTIVE_SERVER_PORT = int(port)
     _ACTIVE_FORCE_BROWSER = bool(force_browser)
+    _ACTIVE_OPEN_WINDOW = bool(open_window)
 
     print("\n" + "=" * 72)
     print("🚀 TABULAS CARD HUB (DESKTOP APP + FULL PYTHON REST API) IS LIVE!")
@@ -3492,7 +3569,7 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
             srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
             srv_thread.start()
             print("  [Window] Opening Native Desktop Window (pywebview)...")
-            webview.create_window(
+            win = webview.create_window(
                 "Tabulas Card Management Hub",
                 url,
                 width=1600,
@@ -3500,7 +3577,11 @@ def launch_zero_node_python_react_server(port: int = 5000, force_browser: bool =
                 min_size=(1120, 720),
                 background_color="#020617",
             )
-            webview.start()
+            _ACTIVE_WEBVIEW_WINDOW = win
+            try:
+                webview.start()
+            finally:
+                _ACTIVE_WEBVIEW_WINDOW = None
             server.shutdown()
             server.server_close()
             return

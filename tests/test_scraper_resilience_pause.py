@@ -388,6 +388,250 @@ class ScraperResilienceAndPauseTests(unittest.TestCase):
         watcher.join(timeout=2.0)
         self.assertIn("Auto-paused after 3 clearance failures", str(ctx.exception))
 
+    # ------------------------------------------------------------------
+    # 5. Profile rotation tempfile, scoped preflight, & UI pause sync
+    # ------------------------------------------------------------------
+    def test_connect_session_profile_rotation_no_nameerror_and_cleanup(self):
+        seen_profile_dirs: list[str] = []
+        attempts = {"count": 0}
+
+        class _FakeDriver:
+            window_handles = ["h1"]
+            title = "TCDB | Trading Card Database"
+            page_source = "<html><body>" + ("x" * 200) + "</body></html>"
+
+            class _SwitchTo:
+                def window(self, _h):
+                    pass
+
+            switch_to = _SwitchTo()
+
+            def get_cookies(self):
+                return [{"name": "cf_clearance", "value": "cf_rot_ok"}]
+
+            def execute_script(self, script: str):
+                if "readyState" in script:
+                    return "complete"
+                if "userAgent" in script:
+                    return "Mozilla/5.0 RotationTestUA"
+                return ""
+
+        class _RotateTestSB:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.driver = _FakeDriver()
+
+            def __enter__(self):
+                if "user_data_dir" in self.kwargs:
+                    seen_profile_dirs.append(self.kwargs["user_data_dir"])
+                attempts["count"] += 1
+                if attempts["count"] == 1 and not self.kwargs.get("_force_ok"):
+                    raise RuntimeError("Transient launch failure on attempt 1")
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def uc_open_with_reconnect(self, _url, _t):
+                pass
+
+            def sleep(self, _s):
+                pass
+
+        # Case A: attempt > 1 triggers profile rotation without NameError and cleans up temp dir
+        sess_a = _StrictMockSession({})
+        with mock.patch.object(self.se, "SB", _RotateTestSB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            out_a = self.se.connect_session(
+                existing_session=sess_a,
+                max_attempts=3,
+                run_preflight=False,
+                rotate_profile=False,
+            )
+        self.assertIs(out_a, sess_a)
+        self.assertEqual(len(seen_profile_dirs), 1)
+        self.assertIn("tcdb_uc_prof_", Path(seen_profile_dirs[0]).name)
+        self.assertFalse(Path(seen_profile_dirs[0]).exists())
+
+        # Case B: rotate_profile=True on first attempt creates & cleans up temp dir
+        attempts["count"] = 1  # Next enter is count=2 -> succeeds immediately
+        seen_profile_dirs.clear()
+        sess_b = _StrictMockSession({})
+        with mock.patch.object(self.se, "SB", _RotateTestSB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            out_b = self.se.connect_session(
+                existing_session=sess_b,
+                max_attempts=2,
+                run_preflight=False,
+                rotate_profile=True,
+            )
+        self.assertIs(out_b, sess_b)
+        self.assertEqual(len(seen_profile_dirs), 1)
+        self.assertIn("tcdb_uc_prof_", Path(seen_profile_dirs[0]).name)
+        self.assertFalse(Path(seen_profile_dirs[0]).exists())
+
+    def test_checklist_only_mode_does_not_fail_when_images_large_returns_403(self):
+        class _HealthySB:
+            def __init__(self, **_kwargs):
+                class _D:
+                    window_handles = ["h1"]
+                    title = "TCDB"
+                    page_source = "<html><body>" + ("ok" * 100) + "</body></html>"
+
+                    class _SW:
+                        def window(self, _h):
+                            pass
+
+                    switch_to = _SW()
+
+                    def get_cookies(self):
+                        return [{"name": "cf_clearance", "value": "cf_chk_tok"}]
+
+                    def execute_script(self, script: str):
+                        return "complete" if "readyState" in script else "Mozilla/5.0 ChecklistUA"
+
+                self.driver = _D()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def uc_open_with_reconnect(self, _url, _t):
+                pass
+
+            def sleep(self, _s):
+                pass
+
+        probe_url = self.se.DEFAULT_PREFLIGHT_IMAGE_URL
+        sess = _StrictMockSession({probe_url: _MockResponse(403, text="Forbidden")})
+
+        with mock.patch.object(self.se, "SB", _HealthySB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            out_sess = self.se.connect_session(
+                existing_session=sess,
+                max_attempts=1,
+                require_image_probe=False,
+            )
+        self.assertIs(out_sess, sess)
+        self.assertIs(getattr(out_sess, "_require_image_probe", None), False)
+        self.assertEqual(sess.calls, [])
+
+        # Verify run_tcdb_checklist_pipeline passes require_image_probe=False
+        captured_kwargs: dict = {}
+
+        def _fake_connect(**kwargs):
+            captured_kwargs.update(kwargs)
+            return sess
+
+        with (
+            mock.patch.object(self.se, "connect_session", side_effect=_fake_connect),
+            mock.patch.object(self.se, "prescan_queue_card_metrics", return_value={"total_cards": 0, "total_subsets": 0, "per_set_metrics": {}, "prefetched_inserts": {}, "prefetched_insert_counts": {}, "prefetched_base_html": {}}),
+            mock.patch.object(self.se, "scrape_tcdb_checklist_set", return_value=(pd.DataFrame(), [])),
+            mock.patch.object(self.se, "sync_set_library_download_status", lambda **_kw: None),
+        ):
+            self.se.run_tcdb_checklist_pipeline(
+                selected_tcdb_sets={"https://www.tcdb.com/ViewSet.cfm/sid/100/Test-Set": "Test_Set"}
+            )
+        self.assertIs(captured_kwargs.get("require_image_probe"), False)
+
+    def test_image_download_preflight_sends_referer_ua_and_cf_clearance(self):
+        class _HealthySB:
+            def __init__(self, **_kwargs):
+                class _D:
+                    window_handles = ["h1"]
+                    title = "TCDB"
+                    page_source = "<html><body>" + ("ok" * 100) + "</body></html>"
+
+                    class _SW:
+                        def window(self, _h):
+                            pass
+
+                    switch_to = _SW()
+
+                    def get_cookies(self):
+                        return [{"name": "cf_clearance", "value": "cf_tok_123"}]
+
+                    def execute_script(self, script: str):
+                        return "complete" if "readyState" in script else "Mozilla/5.0 SeleniumBaseTestUA"
+
+                self.driver = _D()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def uc_open_with_reconnect(self, _url, _t):
+                pass
+
+            def sleep(self, _s):
+                pass
+
+        captured_reqs: list[dict] = []
+
+        class _CapturingSession:
+            def __init__(self, status_code: int = 200):
+                self.status_code = status_code
+                self.cookies: dict[str, str] = {}
+                self.headers: dict[str, str] = {}
+
+            def get(self, url: str, headers=None, cookies=None, timeout=15):
+                captured_reqs.append({"url": url, "headers": dict(headers or {}), "cookies": dict(cookies or {})})
+                if self.status_code == 200:
+                    return _MockResponse(200, content=b"\xff\xd8\xff\xe0" + b"0" * 600)
+                return _MockResponse(self.status_code, text="Forbidden")
+
+        sess_ok = _CapturingSession(status_code=200)
+        with mock.patch.object(self.se, "SB", _HealthySB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            self.se.connect_session(existing_session=sess_ok, max_attempts=1, require_image_probe=True)
+
+        self.assertEqual(len(captured_reqs), 1)
+        self.assertIn("/Images/Large/", captured_reqs[0]["url"])
+        self.assertEqual(captured_reqs[0]["headers"].get("Referer"), "https://www.tcdb.com/")
+        self.assertEqual(captured_reqs[0]["headers"].get("User-Agent"), "Mozilla/5.0 SeleniumBaseTestUA")
+        self.assertEqual(captured_reqs[0]["cookies"].get("cf_clearance"), "cf_tok_123")
+
+        # When /Images/Large/ returns 403 and require_image_probe=True, handshake must fail
+        sess_403 = _CapturingSession(status_code=403)
+        with mock.patch.object(self.se, "SB", _HealthySB), mock.patch.object(self.se.time, "sleep", lambda _s: None):
+            with self.assertRaises(self.se.CloudflareEdgeBlockPaused):
+                self.se.connect_session(
+                    existing_session=sess_403,
+                    max_attempts=1,
+                    max_clearance_failures=1,
+                    require_image_probe=True,
+                )
+
+    def test_job_status_endpoint_reflects_auto_pause_immediately_and_dedupes_logs(self):
+        import launch_tabulas_hub
+
+        self.cli.write_job_state("RUNNING", "scrape_tcdb_images", "Live Scrape", pid=0, lane="slot_1")
+        self.se.set_pause_state_callback(
+            lambda paused, reason="": self.cli.pause_active_job("slot_1", reason) if paused else self.cli.resume_active_job("slot_1")
+        )
+
+        reason = "Auto-paused after 3 clearance failures"
+        self.se.request_auto_pause(reason)
+
+        # Even if a progress callback writes RUNNING afterward while pause flag exists, status stays PAUSED
+        self.cli.write_job_state("RUNNING", "scrape_tcdb_images", "Live Scrape", current=2, total=10, pid=0, lane="slot_1")
+
+        st = self.cli.get_active_job_state("slot_1")
+        self.assertEqual(st["status"], "PAUSED")
+        self.assertEqual(st["pause_reason"], reason)
+
+        live_payload = launch_tabulas_hub._get_live_lanes_and_logs()
+        slot_1 = live_payload["lanes"]["slot_1"]
+        self.assertEqual(slot_1["status"], "PAUSED")
+        self.assertEqual(slot_1["pause_reason"], reason)
+        self.assertTrue(slot_1["is_paused"])
+        self.assertFalse(slot_1["is_terminal"])
+
+        # Repeated pause calls must NOT spam "Pause requested"
+        self.cli.pause_active_job("slot_1", reason=reason)
+        logs_txt = self.cli.get_active_job_logs(lane="slot_1")
+        self.assertEqual(logs_txt.count("Pause requested"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
