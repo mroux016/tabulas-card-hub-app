@@ -4122,6 +4122,8 @@ function MultiCardSplitterReviewStudio({
   onClose,
   skin,
   pushNotification,
+  onTaskStart,
+  onTaskEnd,
 }) {
   const items = Array.isArray(pendingItems) ? pendingItems : [];
   const [pageIdx, setPageIdx] = useState(0);
@@ -4500,6 +4502,9 @@ function MultiCardSplitterReviewStudio({
     if (!currentItem || committing) return;
     setCommitting(true);
     setCommitError('');
+    const taskId = onTaskStart
+      ? onTaskStart('splitter_commit', `Committing Split (${currentItem.stem_name || currentItem.stage_id})`, '✂️')
+      : null;
     fetch(`${NODE_API_BASE}/splitter/commit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4512,7 +4517,11 @@ function MultiCardSplitterReviewStudio({
       .then((r) => r.json())
       .then((res) => {
         if (!res || !res.success) {
-          setCommitError(res?.error || 'Failed to split staged cards.');
+          const errMsg = res?.error || 'Failed to split staged cards.';
+          setCommitError(errMsg);
+          if (pushNotification) {
+            pushNotification('Splitter Commit Error', errMsg, 'Scan', 'error');
+          }
           return;
         }
         const prof = res.learningProfile || {};
@@ -4527,10 +4536,15 @@ function MultiCardSplitterReviewStudio({
         if (onCommitted) onCommitted(res);
       })
       .catch((err) => {
-        setCommitError(err?.message || 'Network error while committing split.');
+        const errMsg = err?.message || 'Network error while committing split.';
+        setCommitError(errMsg);
+        if (pushNotification) {
+          pushNotification('Splitter Commit Error', errMsg, 'Scan', 'error');
+        }
       })
       .finally(() => {
         setCommitting(false);
+        if (onTaskEnd && taskId) onTaskEnd(taskId);
       });
   };
 
@@ -5277,6 +5291,29 @@ export default function App() {
   const [ghError, setGhError] = useState('');
   const [liveLanes, setLiveLanes] = useState({});
   const [liveLogs, setLiveLogs] = useState({});
+  const [liveInlineTasks, setLiveInlineTasks] = useState([]);
+  const [localActiveTasks, setLocalActiveTasks] = useState([]);
+
+  const startLocalTask = (jobType, title, icon = '✂️') => {
+    const taskId = `local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    setLocalActiveTasks((prev) => [
+      ...prev,
+      {
+        task_id: taskId,
+        job_type: String(jobType || 'inline_task'),
+        title: String(title || 'Running Task'),
+        job_icon: String(icon || '⚙️'),
+        status: 'RUNNING',
+        start_epoch: Math.floor(Date.now() / 1000),
+      },
+    ]);
+    return taskId;
+  };
+
+  const endLocalTask = (taskId) => {
+    if (!taskId) return;
+    setLocalActiveTasks((prev) => prev.filter((t) => t.task_id !== taskId));
+  };
   const [selectedTrackedUrls, setSelectedTrackedUrls] = useState([]);
   const [trackedSearch, setTrackedSearch] = useState('');
   const [trackedSportF, setTrackedSportF] = useState('All Sports');
@@ -5512,6 +5549,79 @@ export default function App() {
   const [planPreviewLoading, setPlanPreviewLoading] = useState(false);
   const [planPreviewMode, setPlanPreviewMode] = useState('checklist_only');
   const [showMaintenanceWidget, setShowMaintenanceWidget] = useState(false);
+  const [nameAuditResult, setNameAuditResult] = useState(null);
+  const [nameAuditLoading, setNameAuditLoading] = useState(false);
+  const [nameAuditRepairing, setNameAuditRepairing] = useState(false);
+  const [nameAuditFilter, setNameAuditFilter] = useState('all');
+  const [nameAuditSelectedSkus, setNameAuditSelectedSkus] = useState({});
+
+  const runInventoryNameAudit = (silent = false) => {
+    setNameAuditLoading(true);
+    return fetch(`${NODE_API_BASE}/maintenance/audit-inventory-names`)
+      .then((r) => r.json())
+      .then((res) => {
+        if (!res || !res.success) {
+          if (!silent) pushNotification('Name Audit Error', res?.error || 'Failed to audit inventory names.', 'Maintenance', 'error');
+          return res;
+        }
+        setNameAuditResult(res);
+        const selMap = {};
+        (res.mismatches || []).forEach((m) => {
+          if (m && m.sku) selMap[m.sku] = true;
+        });
+        setNameAuditSelectedSkus(selMap);
+        if (!silent) {
+          pushNotification(
+            'Inventory Name Audit Complete',
+            res.mismatch_count > 0
+              ? `Found ${res.mismatch_count} mismatch(es): ${res.name_mismatch_count} name mismatch, ${res.punctuation_only_count} punctuation only.`
+              : 'All uniquely matched Inventory SKUs match Master_Checklist.csv.',
+            'Maintenance',
+            res.mismatch_count > 0 ? 'warning' : 'success'
+          );
+        }
+        return res;
+      })
+      .catch((err) => {
+        if (!silent) pushNotification('Name Audit Error', err?.message || 'Network error auditing names.', 'Maintenance', 'error');
+        return null;
+      })
+      .finally(() => setNameAuditLoading(false));
+  };
+
+  const repairSelectedInventoryNames = () => {
+    const selectedList = Object.keys(nameAuditSelectedSkus).filter((sku) => nameAuditSelectedSkus[sku]);
+    if (selectedList.length === 0 || nameAuditRepairing) return;
+    setNameAuditRepairing(true);
+    const taskId = startLocalTask('repair_inventory_names', `Repairing ${selectedList.length} Inventory Name(s)...`, '🔧');
+    fetch(`${NODE_API_BASE}/maintenance/repair-inventory-names`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ skus: selectedList }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (!res || !res.success) {
+          pushNotification('Name Repair Error', res?.error || 'Failed to repair inventory names.', 'Maintenance', 'error');
+          return;
+        }
+        pushNotification(
+          'Inventory Names Repaired',
+          `Updated ${res.repaired_count || 0} SKU(s) and renamed ${res.renamed_files_count || 0} image file(s).`,
+          'Maintenance',
+          'success'
+        );
+        refreshAllHubData();
+        runInventoryNameAudit(true);
+      })
+      .catch((err) => {
+        pushNotification('Name Repair Error', err?.message || 'Network error repairing inventory names.', 'Maintenance', 'error');
+      })
+      .finally(() => {
+        setNameAuditRepairing(false);
+        endLocalTask(taskId);
+      });
+  };
 
   const fetchScraperPlanPreview = (modeKey, targetMap, forceRefreshOverride) => {
     const useMode = modeKey || planPreviewMode || 'checklist_only';
@@ -6064,6 +6174,7 @@ export default function App() {
 
           setLiveLanes(d.lanes);
           setLiveLogs(d.logs || {});
+          setLiveInlineTasks(Array.isArray(d.inline_tasks) ? d.inline_tasks : []);
 
           if (pausedJobs.length > 0) {
             pausedJobs.forEach((pj) => {
@@ -7605,8 +7716,38 @@ export default function App() {
                   const st = liveLanes[lk] || {};
                   return st.status === 'RUNNING' || st.status === 'PAUSED' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
                 });
-                if (activeTopBar.length === 0) return null;
-                return activeTopBar.map(([lk, meta]) => {
+                const seenInlineTypes = new Set();
+                const mergedInlineTasks = [];
+                [...liveInlineTasks, ...localActiveTasks].forEach((t) => {
+                  if (!t) return;
+                  const jt = String(t.job_type || t.task_id || '');
+                  if (jt && seenInlineTypes.has(jt)) return;
+                  if (jt) seenInlineTypes.add(jt);
+                  mergedInlineTasks.push(t);
+                });
+                if (activeTopBar.length === 0 && mergedInlineTasks.length === 0) return null;
+                return (
+                  <React.Fragment>
+                    {mergedInlineTasks.map((t, idx) => {
+                      const elapsedSec = t.elapsed_seconds != null
+                        ? t.elapsed_seconds
+                        : (t.start_epoch ? Math.max(0, Math.floor(Date.now() / 1000) - Number(t.start_epoch)) : 0);
+                      return (
+                        <div
+                          key={t.task_id || `${t.job_type}_${idx}`}
+                          title={t.title || 'Active Task'}
+                          className="rounded-xl border bg-cyan-950/75 border-cyan-500/60 text-cyan-100 px-2.5 py-1 shadow-md flex items-center gap-1.5 shrink-0"
+                        >
+                          <span className="inline-block w-3 h-3 border-2 border-cyan-300 border-t-transparent rounded-full animate-spin shrink-0" />
+                          <span className="text-xs">{t.job_icon || '⚙️'}</span>
+                          <span className="font-bold text-[10.5px] text-white max-w-[190px] truncate">{t.title || 'Running...'}</span>
+                          {elapsedSec > 0 && (
+                            <span className="font-mono text-[10px] text-cyan-300 shrink-0">⏱️ {fmtEta(elapsedSec)}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {activeTopBar.map(([lk, meta]) => {
                   const st = liveLanes[lk] || {};
                   const isRun = st.status === 'RUNNING';
                   const isPausedTop = st.status === 'PAUSED';
@@ -7643,7 +7784,9 @@ export default function App() {
                       </div>
                     </button>
                   );
-                });
+                })}
+                  </React.Fragment>
+                );
               })()
             )}
           </div>
@@ -8916,27 +9059,42 @@ export default function App() {
                           🚀 Process
                         </button>
                         <button
-                          onClick={() => fetch(`${NODE_API_BASE}/batches/split-flatbed`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ batchName: selectedIncomingBatch }) }).then((r) => r.json()).then((res) => {
-                            if (res && res.success) {
-                              if (res.status === 'PENDING_REVIEW') {
-                                refreshPendingSplitterReviews().then((pd) => {
-                                  const items = Array.isArray(pd?.pending) ? pd.pending : (Array.isArray(res.stagedItems) ? res.stagedItems : []);
-                                  if (Array.isArray(res.stagedItems) && res.stagedItems.length > 0 && (!pd || !Array.isArray(pd.pending) || pd.pending.length === 0)) {
-                                    setPendingSplitterReviews(res.stagedItems);
-                                  }
-                                  if (items.length > 0 || (res.stagedItems && res.stagedItems.length > 0)) {
-                                    setShowSplitterStudio(true);
-                                    pushNotification('Flatbed Pages Staged for Review', `Staged ${res.pendingCount || items.length} multi-card page pair(s). Review boxes & pairs in the studio.`, 'Scan', 'info');
+                          onClick={() => {
+                            const taskId = startLocalTask('split_flatbed', `Splitting Flatbed PDFs (${selectedIncomingBatch || 'ALL'})...`, '✂️');
+                            fetch(`${NODE_API_BASE}/batches/split-flatbed`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ batchName: selectedIncomingBatch }),
+                            })
+                              .then((r) => r.json())
+                              .then((res) => {
+                                if (res && res.success) {
+                                  if (res.status === 'PENDING_REVIEW') {
+                                    refreshPendingSplitterReviews().then((pd) => {
+                                      const items = Array.isArray(pd?.pending) ? pd.pending : (Array.isArray(res.stagedItems) ? res.stagedItems : []);
+                                      if (Array.isArray(res.stagedItems) && res.stagedItems.length > 0 && (!pd || !Array.isArray(pd.pending) || pd.pending.length === 0)) {
+                                        setPendingSplitterReviews(res.stagedItems);
+                                      }
+                                      if (items.length > 0 || (res.stagedItems && res.stagedItems.length > 0)) {
+                                        setShowSplitterStudio(true);
+                                        pushNotification('Flatbed Pages Staged for Review', `Staged ${res.pendingCount || items.length} multi-card page pair(s). Review boxes & pairs in the studio.`, 'Scan', 'info');
+                                      } else {
+                                        pushNotification('No Multi-Card Sheets Found', 'No multi-card flatbed PDFs required splitting in the selected batch.', 'Scan', 'info');
+                                      }
+                                    });
                                   } else {
-                                    pushNotification('No Multi-Card Sheets Found', 'No multi-card flatbed PDFs required splitting in the selected batch.', 'Scan', 'info');
+                                    refreshAllHubData();
+                                    pushNotification('Flatbed Split Complete', `Created ${res.createdCount || 0} individual Front/Back card PDF(s).`, 'Scan', 'success');
                                   }
-                                });
-                              } else {
-                                refreshAllHubData();
-                                pushNotification('Flatbed Split Complete', `Created ${res.createdCount || 0} individual Front/Back card PDF(s).`, 'Scan', 'success');
-                              }
-                            }
-                          })}
+                                } else {
+                                  pushNotification('Flatbed Split Error', res?.error || 'Failed to split flatbed PDFs.', 'Scan', 'error');
+                                }
+                              })
+                              .catch((err) => {
+                                pushNotification('Flatbed Split Error', err?.message || 'Network error while splitting flatbed PDFs.', 'Scan', 'error');
+                              })
+                              .finally(() => endLocalTask(taskId));
+                          }}
                           title="Detect & review multi-card flatbed PDFs before splitting into individual 2-page card PDFs"
                           className="py-2 px-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold shrink-0"
                         >
@@ -14383,6 +14541,163 @@ export default function App() {
                                   <button onClick={() => triggerJob('set_scraper', 'Rebuild Visual Feature Cache (.pkl)', 'rebuild_feature_cache', { estimated_total: 1 })} className="py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 font-bold text-xs">🧠 Rebuild Feature Cache</button>
                                   <button onClick={() => triggerJob('system', 'Build / Update DINOv2 Neural Index (GPU)', 'build_neural_index', { batch_size: 32, force_rebuild: false, estimated_total: 1000 })} className="py-2 px-3 rounded-xl bg-indigo-950/90 hover:bg-indigo-800 border border-indigo-600/70 text-indigo-200 font-bold text-xs">🧬 Update Neural Index</button>
                                 </div>
+
+                                {/* AUDIT & REPAIR STALE PLAYER NAMES */}
+                                <div className="mt-2 p-3 bg-slate-900/80 border border-cyan-500/30 rounded-xl space-y-2.5">
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div>
+                                      <div className="text-xs font-bold text-cyan-300">🔎 Audit &amp; Repair Stale Player Names</div>
+                                      <div className="text-[10.5px] text-slate-400">
+                                        Compares Inventory SKUs against unambiguous Master_Checklist.csv rows, separates name mismatches from punctuation-only diffs, and atomically renames _F/_B/_C images.
+                                      </div>
+                                    </div>
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        disabled={nameAuditLoading}
+                                        onClick={() => runInventoryNameAudit(false)}
+                                        className="px-3 py-1.5 rounded-xl bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white font-bold text-xs shadow"
+                                      >
+                                        {nameAuditLoading ? '⏳ Scanning...' : '🔎 Scan Mismatches'}
+                                      </button>
+                                      {nameAuditResult && (
+                                        <button
+                                          type="button"
+                                          disabled={nameAuditRepairing || Object.values(nameAuditSelectedSkus).filter(Boolean).length === 0}
+                                          onClick={repairSelectedInventoryNames}
+                                          className="px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 disabled:opacity-45 text-white font-bold text-xs shadow"
+                                        >
+                                          {nameAuditRepairing
+                                            ? '⏳ Repairing...'
+                                            : `🔧 Repair Selected (${Object.values(nameAuditSelectedSkus).filter(Boolean).length})`}
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {nameAuditResult && (() => {
+                                    const allRows = nameAuditResult.mismatches || [];
+                                    const filteredRows = allRows.filter((m) => nameAuditFilter === 'all' || m.category === nameAuditFilter);
+                                    return (
+                                      <div className="space-y-2">
+                                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                          <div className="flex flex-wrap items-center gap-1.5">
+                                            {[
+                                              { id: 'all', label: `All (${allRows.length})` },
+                                              { id: 'name_mismatch', label: `Name Mismatches (${nameAuditResult.name_mismatch_count || 0})` },
+                                              { id: 'punctuation_only', label: `Punctuation Only (${nameAuditResult.punctuation_only_count || 0})` },
+                                            ].map((tab) => (
+                                              <button
+                                                key={tab.id}
+                                                type="button"
+                                                onClick={() => setNameAuditFilter(tab.id)}
+                                                className={`px-2.5 py-1 rounded-lg border font-semibold transition ${
+                                                  nameAuditFilter === tab.id
+                                                    ? 'bg-cyan-900/80 border-cyan-400/70 text-cyan-100'
+                                                    : 'bg-slate-950/70 border-slate-700 text-slate-300 hover:bg-slate-800'
+                                                }`}
+                                              >
+                                                {tab.label}
+                                              </button>
+                                            ))}
+                                          </div>
+                                          <div className="flex items-center gap-2 text-[10.5px] text-slate-400">
+                                            <span>Matched: {nameAuditResult.matched_unique || 0}</span>
+                                            <span>• Ambiguous skipped: {nameAuditResult.ambiguous_skipped || 0}</span>
+                                            {filteredRows.length > 0 && (
+                                              <React.Fragment>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    const next = { ...nameAuditSelectedSkus };
+                                                    filteredRows.forEach((m) => { if (m.sku) next[m.sku] = true; });
+                                                    setNameAuditSelectedSkus(next);
+                                                  }}
+                                                  className="text-cyan-300 hover:underline font-semibold"
+                                                >
+                                                  Select Visible
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    const next = { ...nameAuditSelectedSkus };
+                                                    filteredRows.forEach((m) => { if (m.sku) next[m.sku] = false; });
+                                                    setNameAuditSelectedSkus(next);
+                                                  }}
+                                                  className="text-slate-400 hover:underline font-semibold"
+                                                >
+                                                  Uncheck Visible
+                                                </button>
+                                              </React.Fragment>
+                                            )}
+                                          </div>
+                                        </div>
+
+                                        {filteredRows.length === 0 ? (
+                                          <div className="p-3 rounded-lg bg-slate-950/70 border border-slate-800 text-xs text-slate-400 text-center">
+                                            No mismatches in this filter.
+                                          </div>
+                                        ) : (
+                                          <div className="max-h-72 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/80">
+                                            <table className="w-full text-left text-[11px] border-collapse">
+                                              <thead className="sticky top-0 bg-slate-900 text-slate-300 border-b border-slate-800">
+                                                <tr>
+                                                  <th className="p-2 w-8">Use</th>
+                                                  <th className="p-2">SKU</th>
+                                                  <th className="p-2">Set / Subset / #</th>
+                                                  <th className="p-2">Inventory → Checklist Player</th>
+                                                  <th className="p-2">Type</th>
+                                                </tr>
+                                              </thead>
+                                              <tbody className="divide-y divide-slate-800/70">
+                                                {filteredRows.map((m) => {
+                                                  const checked = Boolean(nameAuditSelectedSkus[m.sku]);
+                                                  return (
+                                                    <tr key={m.sku} className="hover:bg-slate-900/60">
+                                                      <td className="p-2">
+                                                        <input
+                                                          type="checkbox"
+                                                          checked={checked}
+                                                          onChange={(e) => setNameAuditSelectedSkus((prev) => ({ ...prev, [m.sku]: e.target.checked }))}
+                                                        />
+                                                      </td>
+                                                      <td className="p-2 font-mono text-slate-300 whitespace-nowrap">{m.sku}</td>
+                                                      <td className="p-2 text-slate-300">
+                                                        <div className="font-semibold truncate max-w-[220px]" title={m.set}>{m.set}</div>
+                                                        <div className="text-[10px] text-slate-400">{m.subset} • #{m.card_number}</div>
+                                                      </td>
+                                                      <td className="p-2">
+                                                        <div className="flex flex-wrap items-center gap-1.5">
+                                                          <span className="text-rose-300 line-through">{m.current_player || '—'}</span>
+                                                          <span className="text-slate-500">→</span>
+                                                          <span className="text-emerald-300 font-bold">{m.checklist_player}</span>
+                                                        </div>
+                                                        {m.checklist_team && m.current_team !== m.checklist_team && (
+                                                          <div className="text-[10px] text-slate-400">
+                                                            Team: {m.current_team || '—'} → {m.checklist_team}
+                                                          </div>
+                                                        )}
+                                                      </td>
+                                                      <td className="p-2 whitespace-nowrap">
+                                                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                                                          m.category === 'name_mismatch'
+                                                            ? 'bg-rose-950/80 border-rose-500/50 text-rose-200'
+                                                            : 'bg-sky-950/80 border-sky-500/50 text-sky-200'
+                                                        }`}>
+                                                          {m.category === 'name_mismatch' ? 'Name Mismatch' : 'Punctuation Only'}
+                                                        </span>
+                                                      </td>
+                                                    </tr>
+                                                  );
+                                                })}
+                                              </tbody>
+                                            </table>
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
                               </div>
                             )}
                             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
@@ -15197,6 +15512,8 @@ export default function App() {
           }}
           skin={skin}
           pushNotification={pushNotification}
+          onTaskStart={startLocalTask}
+          onTaskEnd={endLocalTask}
         />
       )}
     </div>

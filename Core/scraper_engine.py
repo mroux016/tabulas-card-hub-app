@@ -3127,8 +3127,7 @@ _GENERIC_TCDB_NAV_LABELS = {
 }
 
 _TCDB_GLOSSARY_SUFFIX_RE = re.compile(
-    r"(?:\s+|\b)(?:RC|CPC|LL|TC|FS|ASR|SP|SSP|VAR|ERR|COR|UER|HOF|AS|PRO|DP|FDP|EXCH|AU|AUTO|MEM|REL|SN\d*|\d+/\d+|1/1)+\s*$",
-    re.IGNORECASE,
+    r"(?:[\s,]+)(?:RC|CPC|LL|TC|FS|ASR|SP|SSP|VAR|ERR|COR|UER|HOF|AS|PRO|DP|FDP|EXCH|AU|AUTO|MEM|REL|SN\d+|\d+/\d+|1/1)+\s*$"
 )
 
 
@@ -3276,10 +3275,23 @@ _INLINE_GLOSSARY_TAIL_RE = re.compile(
     r"\s+\b(AU|AUTO|MEM|REL|SN\s*\d+|#/\d+|1/1)\b(.*)$"
 )
 
+_STAGE_CONNECTOR_WORDS = frozenset({
+    "the", "a", "an", "of", "de", "la", "el", "da", "di", "du",
+    "le", "les", "von", "van", "and", "&", "tha",
+})
+
+
+def _ends_with_stage_connector(head: str) -> bool:
+    tokens = [w.strip(",.;:/-&").lower() for w in str(head or "").split() if w.strip(",.;:/-&")]
+    if not tokens:
+        return True
+    return tokens[-1] in _STAGE_CONNECTOR_WORDS
+
 
 def _strip_inline_tags_errors_and_occupations(
     raw_player: str,
     team_str: str = "",
+    strip_occupations: bool = True,
 ) -> tuple[str, list[str], str]:
     """
     Cleans TCDB player names while extracting embedded metadata:
@@ -3325,28 +3337,29 @@ def _strip_inline_tags_errors_and_occupations(
             s = head
 
     # 3. Iteratively strip trailing non-baseball profession/occupation descriptors
-    is_no_team = not str(team_str or "").strip() or str(team_str).strip().upper() in ("NO TEAM", "UNKNOWN", "NONE", "NAN")
-    stripped_unambiguous_once = False
+    if strip_occupations:
+        is_no_team = not str(team_str or "").strip() or str(team_str).strip().upper() in ("NO TEAM", "UNKNOWN", "NONE", "NAN")
+        stripped_unambiguous_once = False
 
-    for _ in range(5):
-        m_u = _UNAMBIGUOUS_OCC_RE.search(s)
-        if m_u:
-            head = s[: m_u.start()].strip(" ,/-&")
-            if len(head) >= 2 and head.lower() not in ("the", "a", "an"):
-                s = head
-                stripped_unambiguous_once = True
-                continue
-
-        # Only consider secondary occupation words if Team == NO TEAM AND (2+ words remain OR paired with another occupation)
-        if is_no_team:
-            m_sec = _SECONDARY_OCC_RE.search(s)
-            if m_sec:
-                head = s[: m_sec.start()].strip(" ,/-&")
-                head_words = [w for w in head.split() if w]
-                if len(head_words) >= 2 or (stripped_unambiguous_once and len(head) >= 2):
+        for _ in range(5):
+            m_u = _UNAMBIGUOUS_OCC_RE.search(s)
+            if m_u:
+                head = s[: m_u.start()].strip(" ,/-&")
+                if len(head) >= 2 and not _ends_with_stage_connector(head):
                     s = head
+                    stripped_unambiguous_once = True
                     continue
-        break
+
+            # Only consider secondary occupation words if Team == NO TEAM AND (2+ words remain OR paired with another occupation)
+            if is_no_team:
+                m_sec = _SECONDARY_OCC_RE.search(s)
+                if m_sec:
+                    head = s[: m_sec.start()].strip(" ,/-&")
+                    head_words = [w for w in head.split() if w]
+                    if (len(head_words) >= 2 or (stripped_unambiguous_once and len(head) >= 2)) and not _ends_with_stage_connector(head):
+                        s = head
+                        continue
+            break
 
     # 4. Final glossary suffix cleanup
     prev = None
@@ -3357,7 +3370,7 @@ def _strip_inline_tags_errors_and_occupations(
     return s, extracted_tags, extracted_pr
 
 
-def _clean_tcdb_card_subject_title(raw_subject: str, team_str: str = "") -> str:
+def _clean_tcdb_card_subject_title(raw_subject: str, team_str: str = "", strip_occupations: bool = True) -> str:
     s = trim_clean(raw_subject)
     if not s:
         return ""
@@ -3365,7 +3378,7 @@ def _clean_tcdb_card_subject_title(raw_subject: str, team_str: str = "") -> str:
         before_paren = s.split("(", 1)[0].strip()
         if len(before_paren) >= 3 and not before_paren.isdigit():
             s = before_paren
-    cleaned, _, _ = _strip_inline_tags_errors_and_occupations(s, team_str=team_str)
+    cleaned, _, _ = _strip_inline_tags_errors_and_occupations(s, team_str=team_str, strip_occupations=strip_occupations)
     return cleaned
 
 
@@ -3673,7 +3686,7 @@ def parse_tcdb_checklist_table_rows(
         ]
         person_names = []
         for pa in person_links:
-            ptxt = _clean_tcdb_card_subject_title(pa.get_text(" ", strip=True))
+            ptxt = _clean_tcdb_card_subject_title(pa.get_text(" ", strip=True), strip_occupations=False)
             if ptxt and ptxt not in person_names:
                 person_names.append(ptxt)
 
@@ -3733,6 +3746,7 @@ def parse_tcdb_checklist_table_rows(
         #    'Comedian, Actor', 'Rapper', 'Actress', 'AU, SN99 Bassist', or 'UER: ...').
         # 2. Otherwise use TCDB's unlinked TD text / ViewCard hyperlink slug (protecting LL & CPC titles).
         player_str = ""
+        resolved_from_person_link = False
         if (
             len(person_names) == 1
             and not is_cpc_or_ll_tag
@@ -3744,6 +3758,7 @@ def parse_tcdb_checklist_table_rows(
             )
         ):
             player_str = person_names[0]
+            resolved_from_person_link = True
         elif (
             subject_td_title
             and not _is_placeholder_team_checklist_name(subject_td_title)
@@ -3768,7 +3783,11 @@ def parse_tcdb_checklist_table_rows(
             player_str = primary_viewcard_title
 
         if player_str:
-            p_stripped, extra_tags_p, extra_pr_p = _strip_inline_tags_errors_and_occupations(player_str, team_str=team_str)
+            p_stripped, extra_tags_p, extra_pr_p = _strip_inline_tags_errors_and_occupations(
+                player_str,
+                team_str=team_str,
+                strip_occupations=not resolved_from_person_link,
+            )
             if p_stripped:
                 player_str = p_stripped
             if extra_pr_p and not print_run:

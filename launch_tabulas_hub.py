@@ -7,6 +7,7 @@ from __future__ import annotations
 __version__ = "0.25.0-beta.1"
 __last_updated__ = "2026-11-21 18:45:00"
 import argparse
+import contextlib
 import csv
 import errno
 import json
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -600,7 +602,7 @@ def _build_tabulas_react_html_v2(jsx_path: Path) -> str:
 # MTIME-KEYED IN-MEMORY CHECKLIST CACHE & SKU RANGE PARSER
 # ==============================================================================
 _MEM_CACHE_LOCK = threading.RLock()
-_CHK_MASTER_CACHE = {"mtime": -1.0, "df": None, "known_sets": [], "known_years": []}
+_CHK_MASTER_CACHE = {"mtime": -1.0, "path": "", "df": None, "known_sets": [], "known_years": []}
 _CHK_SET_CACHE: dict[str, tuple[float, object]] = {}
 _INV_MEM_CACHE = {"mtime": -1.0, "rows": []}
 _DIR_MEM_CACHE = {"mtime": -1.0, "rows": []}
@@ -796,7 +798,11 @@ def _get_cached_checklist_df(set_name: str = ""):
             return pd.DataFrame(columns=CHECKLIST_COLUMNS)
 
         mt_master = CHECKLIST_PATH.stat().st_mtime
-        if _CHK_MASTER_CACHE["df"] is None or _CHK_MASTER_CACHE["mtime"] != mt_master:
+        if (
+            _CHK_MASTER_CACHE["df"] is None
+            or _CHK_MASTER_CACHE["mtime"] != mt_master
+            or _CHK_MASTER_CACHE.get("path") != str(CHECKLIST_PATH)
+        ):
             df_m = _ensure_cols(pd.read_csv(CHECKLIST_PATH, dtype=str, keep_default_na=False))
             k_sets = sorted([s for s in df_m["Set"].dropna().unique().tolist() if str(s).strip()])
             k_yrs = set()
@@ -808,6 +814,7 @@ def _get_cached_checklist_df(set_name: str = ""):
             _CHK_MASTER_CACHE["known_sets"] = k_sets
             _CHK_MASTER_CACHE["known_years"] = sorted(list(k_yrs), reverse=True)
             _CHK_MASTER_CACHE["mtime"] = mt_master
+            _CHK_MASTER_CACHE["path"] = str(CHECKLIST_PATH)
 
         master_df = _CHK_MASTER_CACHE["df"]
         if set_name:
@@ -1012,7 +1019,60 @@ def _discover_uncommitted_batches(include_cards_for: str = "") -> list[dict]:
     return out
 
 
+_INLINE_TASKS_LOCK = threading.Lock()
+_INLINE_ACTIVE_TASKS: dict[str, dict] = {}
+
+
+def _begin_inline_task(task_type: str, title: str, icon: str = "✂️", detail: str = "") -> str:
+    """Register a short-lived synchronous UI/API task so the top-bar running bubble can show it."""
+    from datetime import datetime
+    task_id = f"inline_{uuid.uuid4().hex[:10]}"
+    now_ep = time.time()
+    rec = {
+        "task_id": task_id,
+        "job_type": str(task_type or "inline_task"),
+        "title": str(title or "Running Task"),
+        "process_name": str(title or "Running Task"),
+        "job_icon": str(icon or "⚙️"),
+        "status": "RUNNING",
+        "detail": str(detail or ""),
+        "start_epoch": now_ep,
+        "updated_at": datetime.now().isoformat(),
+    }
+    with _INLINE_TASKS_LOCK:
+        _INLINE_ACTIVE_TASKS[task_id] = rec
+    return task_id
+
+
+def _end_inline_task(task_id: str) -> None:
+    if not task_id:
+        return
+    with _INLINE_TASKS_LOCK:
+        _INLINE_ACTIVE_TASKS.pop(task_id, None)
+
+
+def _get_active_inline_tasks() -> list[dict]:
+    now_ep = time.time()
+    with _INLINE_TASKS_LOCK:
+        out = []
+        for t in _INLINE_ACTIVE_TASKS.values():
+            cp = dict(t)
+            cp["elapsed_seconds"] = max(0, int(now_ep - float(t.get("start_epoch") or now_ep)))
+            out.append(cp)
+        return out
+
+
+@contextlib.contextmanager
+def _track_inline_task(task_type: str, title: str, icon: str = "✂️", detail: str = ""):
+    task_id = _begin_inline_task(task_type, title, icon=icon, detail=detail)
+    try:
+        yield task_id
+    finally:
+        _end_inline_task(task_id)
+
+
 def _get_live_lanes_and_logs() -> dict:
+    inline_tasks = _get_active_inline_tasks()
     try:
         import cli
         all_states = cli.get_all_lanes_state()
@@ -1031,9 +1091,276 @@ def _get_live_lanes_and_logs() -> dict:
             clean_st["parallel_workers"] = clean_workers
             safe_states[lk] = clean_st
         logs_by_lane = {lk: cli.get_active_job_logs(max_lines=500, lane=lk) for lk in cli.PROCESS_LANES.keys()}
-        return {"lanes": safe_states, "logs": logs_by_lane, "runLogFiles": []}
+        return {"lanes": safe_states, "logs": logs_by_lane, "inline_tasks": inline_tasks, "runLogFiles": []}
     except Exception as e:
-        return {"lanes": {}, "logs": {}, "error": str(e)}
+        return {"lanes": {}, "logs": {}, "inline_tasks": inline_tasks, "error": str(e)}
+
+
+def _normalize_player_alnum(name: str) -> str:
+    from Core.config import strip_accents
+    return re.sub(r"[^a-z0-9]+", "", strip_accents(str(name or "")).lower())
+
+
+def _build_unique_checklist_map(chk_df) -> tuple[dict[tuple[str, str, str], dict], set[tuple[str, str, str]]]:
+    """Index Master_Checklist rows by exact (Set, Subset, Card Number), excluding ambiguous multi-row keys."""
+    counts: dict[tuple[str, str, str], int] = {}
+    first_row: dict[tuple[str, str, str], dict] = {}
+    if chk_df is None or chk_df.empty:
+        return {}, set()
+    for _, row in chk_df.iterrows():
+        s_val = str(row.get("Set") or "").strip()
+        sub_val = str(row.get("Subset") or "Base").strip() or "Base"
+        cn_val = str(row.get("Card Number") or "").strip().lstrip("#")
+        if not s_val or not cn_val:
+            continue
+        key = (s_val, sub_val, cn_val)
+        counts[key] = counts.get(key, 0) + 1
+        if key not in first_row:
+            first_row[key] = {
+                "Set": s_val,
+                "Subset": sub_val,
+                "Card Number": cn_val,
+                "Player": str(row.get("Player") or "").strip(),
+                "Team": str(row.get("Team") or "").strip(),
+            }
+    ambiguous = {k for k, c in counts.items() if c > 1}
+    unique_map = {k: v for k, v in first_row.items() if k not in ambiguous}
+    return unique_map, ambiguous
+
+
+def _audit_inventory_names_against_checklist(inv_df=None, chk_df=None) -> dict:
+    """Compare Inventory SKUs against unambiguous Master_Checklist rows by exact (Set, Subset, Card Number)."""
+    from Core.database import load_inventory_df
+
+    if inv_df is None:
+        inv_df = load_inventory_df()
+    if chk_df is None:
+        chk_df = _get_cached_checklist_df()
+
+    unique_map, ambiguous_keys = _build_unique_checklist_map(chk_df)
+    mismatches: list[dict] = []
+    matched_unique = 0
+    ambiguous_skipped = 0
+    unmatched_skipped = 0
+    name_mismatch_count = 0
+    punctuation_only_count = 0
+
+    if inv_df is not None and not inv_df.empty:
+        for _, row in inv_df.iterrows():
+            sku_str = str(row.get("SKU") or "").strip()
+            s_val = str(row.get("Set") or "").strip()
+            sub_val = str(row.get("Subset") or "Base").strip() or "Base"
+            cn_val = str(row.get("Card Number") or "").strip().lstrip("#")
+            key = (s_val, sub_val, cn_val)
+            if key in ambiguous_keys:
+                ambiguous_skipped += 1
+                continue
+            chk_rec = unique_map.get(key)
+            if not chk_rec:
+                unmatched_skipped += 1
+                continue
+
+            matched_unique += 1
+            inv_player = str(row.get("Player") or "").strip()
+            chk_player = str(chk_rec.get("Player") or "").strip()
+            if not chk_player or inv_player == chk_player:
+                continue
+
+            if _normalize_player_alnum(inv_player) == _normalize_player_alnum(chk_player):
+                cat = "punctuation_only"
+                punctuation_only_count += 1
+            else:
+                cat = "name_mismatch"
+                name_mismatch_count += 1
+
+            mismatches.append({
+                "sku": sku_str,
+                "set": s_val,
+                "subset": sub_val,
+                "card_number": cn_val,
+                "current_player": inv_player,
+                "checklist_player": chk_player,
+                "current_team": str(row.get("Team") or "").strip(),
+                "checklist_team": str(chk_rec.get("Team") or "").strip(),
+                "category": cat,
+                "front_file": str(row.get("Front_File") or "").strip(),
+                "back_file": str(row.get("Back_File") or "").strip(),
+                "corners_file": str(row.get("Corners_File") or "").strip(),
+            })
+
+    return {
+        "success": True,
+        "total_inventory": int(len(inv_df)) if inv_df is not None else 0,
+        "matched_unique": matched_unique,
+        "ambiguous_skipped": ambiguous_skipped,
+        "unmatched_skipped": unmatched_skipped,
+        "mismatch_count": len(mismatches),
+        "name_mismatch_count": name_mismatch_count,
+        "punctuation_only_count": punctuation_only_count,
+        "mismatches": mismatches,
+    }
+
+
+def _atomic_rename_file(src: Path, dst: Path) -> bool:
+    """Atomically rename/move `src` to `dst` (handles Windows case-only renames and cross-device fallback)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src_parent_res = src.parent.resolve()
+    dst_parent_res = dst.parent.resolve()
+    if src_parent_res == dst_parent_res and src.name == dst.name:
+        return False
+
+    if src_parent_res == dst_parent_res and src.name.lower() == dst.name.lower():
+        tmp_path = dst.parent / f".{dst.name}.{uuid.uuid4().hex[:8]}.tmp"
+        os.replace(src, tmp_path)
+        os.replace(tmp_path, dst)
+        return True
+
+    try:
+        os.replace(src, dst)
+        return True
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        tmp_path = dst.parent / f".{dst.name}.{uuid.uuid4().hex[:8]}.tmp"
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+        src.unlink()
+        return True
+
+
+def _repair_inventory_names_from_checklist(
+    skus: list[str] | None = None,
+    repair_all: bool = False,
+    category: str = "all",
+) -> dict:
+    """Update Inventory Player/Team from unambiguous Master_Checklist rows and atomically rename _F/_B/_C images."""
+    from Core.config import (
+        INVENTORY_FILE,
+        REVIEWED_CARDS_DIR,
+        build_card_image_filenames,
+        sanitize_filename_part,
+    )
+    from Core.database import (
+        _index_reviewed_cards_by_sku,
+        load_inventory_df,
+        save_inventory_df,
+    )
+
+    target_skus = {str(s).strip() for s in (skus or []) if str(s or "").strip()}
+    if not repair_all and not target_skus:
+        raise ValueError("Provide a non-empty list of SKUs or set all=true.")
+
+    cat_filter = str(category or "all").strip().lower()
+    repaired_skus: list[str] = []
+    renamed_files: list[dict] = []
+    errors: list[dict] = []
+
+    inv_lock = INVENTORY_FILE.with_suffix(".csv.lock")
+    with interprocess_file_lock(inv_lock, timeout=30.0):
+        inv_df = load_inventory_df()
+        chk_df = _get_cached_checklist_df()
+        unique_map, ambiguous_keys = _build_unique_checklist_map(chk_df)
+        if inv_df.empty or not unique_map:
+            return {
+                "success": True,
+                "repaired_count": 0,
+                "renamed_files_count": 0,
+                "repaired_skus": [],
+                "renamed_files": [],
+                "errors": [],
+            }
+
+        sku_file_index = _index_reviewed_cards_by_sku()
+        changed_any = False
+
+        for idx, row in inv_df.iterrows():
+            sku_str = str(row.get("SKU") or "").strip()
+            if not repair_all and sku_str not in target_skus:
+                continue
+
+            s_val = str(row.get("Set") or "").strip()
+            sub_val = str(row.get("Subset") or "Base").strip() or "Base"
+            cn_val = str(row.get("Card Number") or "").strip().lstrip("#")
+            key = (s_val, sub_val, cn_val)
+            if key in ambiguous_keys:
+                continue
+            chk_rec = unique_map.get(key)
+            if not chk_rec:
+                continue
+
+            inv_player = str(row.get("Player") or "").strip()
+            chk_player = str(chk_rec.get("Player") or "").strip()
+            if not chk_player or inv_player == chk_player:
+                continue
+
+            row_cat = "punctuation_only" if _normalize_player_alnum(inv_player) == _normalize_player_alnum(chk_player) else "name_mismatch"
+            if repair_all and cat_filter in ("name_mismatch", "punctuation_only") and row_cat != cat_filter:
+                continue
+
+            chk_team = str(chk_rec.get("Team") or "").strip()
+            inv_df.at[idx, "Player"] = chk_player
+            if chk_team:
+                inv_df.at[idx, "Team"] = chk_team
+            inv_df.at[idx, "Label_Printed"] = "False"
+            changed_any = True
+            repaired_skus.append(sku_str)
+
+            new_f, new_b, new_c = build_card_image_filenames(s_val, sub_val, cn_val, chk_player, sku_str)
+            set_dir = REVIEWED_CARDS_DIR / sanitize_filename_part(s_val)
+
+            for side_tag, col_name, new_fname in (
+                ("F", "Front_File", new_f),
+                ("B", "Back_File", new_b),
+                ("C", "Corners_File", new_c),
+            ):
+                old_val = str(row.get(col_name) or "").strip()
+                src_path = None
+                if old_val:
+                    cand_abs = Path(old_val)
+                    if cand_abs.is_absolute() and cand_abs.exists():
+                        src_path = cand_abs
+                    else:
+                        cand_rel = set_dir / Path(old_val).name
+                        if cand_rel.exists():
+                            src_path = cand_rel
+                if src_path is None:
+                    idx_path = sku_file_index.get((sku_str, side_tag))
+                    if idx_path is not None and idx_path.exists():
+                        src_path = idx_path
+
+                if src_path is not None and src_path.exists():
+                    dst_path = set_dir / new_fname
+                    try:
+                        did_rename = _atomic_rename_file(src_path, dst_path)
+                        inv_df.at[idx, col_name] = new_fname
+                        if did_rename:
+                            renamed_files.append({
+                                "sku": sku_str,
+                                "side": side_tag,
+                                "old_file": src_path.name,
+                                "new_file": dst_path.name,
+                            })
+                            _log_ui_action_to_file(
+                                "Maintenance",
+                                "Inventory Name Repair",
+                                f"{sku_str} [{side_tag}]: {src_path.name} -> {dst_path.name}",
+                            )
+                    except Exception as exc:
+                        errors.append({"sku": sku_str, "side": side_tag, "error": str(exc)})
+
+        if changed_any:
+            save_inventory_df(inv_df)
+            with _MEM_CACHE_LOCK:
+                _INV_MEM_CACHE["mtime"] = -1.0
+
+    return {
+        "success": True,
+        "repaired_count": len(repaired_skus),
+        "renamed_files_count": len(renamed_files),
+        "repaired_skus": repaired_skus,
+        "renamed_files": renamed_files,
+        "errors": errors,
+    }
 
 
 def _load_tracked_sets_list() -> list[dict]:
@@ -2009,6 +2336,10 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if route == "/api/maintenance/audit-inventory-names":
+            self._send_json(_audit_inventory_names_against_checklist())
+            return
+
         if route == "/api/config/tracked-sets":
             self._send_json(_load_tracked_sets_list())
             return
@@ -2786,46 +3117,47 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
         if route == "/api/batches/delete-cards" and isinstance(payload, dict):
             from Core.database import remove_cards_from_batch
             try:
-                delete_files = bool(payload.get("deleteFiles", True))
-                grouped: dict[str, list[str]] = {}
-                if isinstance(payload.get("items"), list) and payload["items"]:
-                    for it in payload["items"]:
-                        if not isinstance(it, dict):
-                            continue
-                        bn = str(it.get("batchName") or "").strip()
-                        sk = str(it.get("sku") or "").strip()
-                        if bn and sk:
-                            grouped.setdefault(bn, []).append(sk)
-                else:
-                    bn = str(payload.get("batchName") or "").strip()
-                    sks = payload.get("skus") if isinstance(payload.get("skus"), list) else [payload.get("sku")]
-                    clean_sks = [str(s).strip() for s in sks if str(s or "").strip()]
-                    if bn and clean_sks:
-                        grouped[bn] = clean_sks
+                with _track_inline_task("batch_delete_cards", "Removing Batch Card(s)", icon="🗑️"):
+                    delete_files = bool(payload.get("deleteFiles", True))
+                    grouped: dict[str, list[str]] = {}
+                    if isinstance(payload.get("items"), list) and payload["items"]:
+                        for it in payload["items"]:
+                            if not isinstance(it, dict):
+                                continue
+                            bn = str(it.get("batchName") or "").strip()
+                            sk = str(it.get("sku") or "").strip()
+                            if bn and sk:
+                                grouped.setdefault(bn, []).append(sk)
+                    else:
+                        bn = str(payload.get("batchName") or "").strip()
+                        sks = payload.get("skus") if isinstance(payload.get("skus"), list) else [payload.get("sku")]
+                        clean_sks = [str(s).strip() for s in sks if str(s or "").strip()]
+                        if bn and clean_sks:
+                            grouped[bn] = clean_sks
 
-                if not grouped:
-                    self._send_json({"success": False, "error": "No batch card SKU(s) provided to delete."}, status=400)
-                    return
+                    if not grouped:
+                        self._send_json({"success": False, "error": "No batch card SKU(s) provided to delete."}, status=400)
+                        return
 
-                total_removed = 0
-                removed_skus_all: list[str] = []
-                last_cards = None
-                for bn, sk_list in grouped.items():
-                    res_del = remove_cards_from_batch(BATCHES_DIR / bn, sk_list, delete_files=delete_files)
-                    if res_del.get("success"):
-                        total_removed += int(res_del.get("removedCount", 0))
-                        removed_skus_all.extend(res_del.get("removedSkus") or [])
-                        last_cards = res_del.get("cards")
-                        _log_ui_action_to_file("Batch", f"Removed {res_del.get('removedCount', 0)} card(s) from {bn}", f"SKUs: {', '.join(res_del.get('removedSkus') or [])[:200]}")
+                    total_removed = 0
+                    removed_skus_all: list[str] = []
+                    last_cards = None
+                    for bn, sk_list in grouped.items():
+                        res_del = remove_cards_from_batch(BATCHES_DIR / bn, sk_list, delete_files=delete_files)
+                        if res_del.get("success"):
+                            total_removed += int(res_del.get("removedCount", 0))
+                            removed_skus_all.extend(res_del.get("removedSkus") or [])
+                            last_cards = res_del.get("cards")
+                            _log_ui_action_to_file("Batch", f"Removed {res_del.get('removedCount', 0)} card(s) from {bn}", f"SKUs: {', '.join(res_del.get('removedSkus') or [])[:200]}")
 
-                view_batch = str(payload.get("activeBatchName") or (next(iter(grouped.keys())) if len(grouped) == 1 else "__ALL__"))
-                self._send_json({
-                    "success": True,
-                    "removedCount": total_removed,
-                    "removedSkus": removed_skus_all,
-                    "cards": last_cards,
-                    "batches": _discover_uncommitted_batches(include_cards_for=view_batch),
-                })
+                    view_batch = str(payload.get("activeBatchName") or (next(iter(grouped.keys())) if len(grouped) == 1 else "__ALL__"))
+                    self._send_json({
+                        "success": True,
+                        "removedCount": total_removed,
+                        "removedSkus": removed_skus_all,
+                        "cards": last_cards,
+                        "batches": _discover_uncommitted_batches(include_cards_for=view_batch),
+                    })
             except Exception as e:
                 self._send_json({"success": False, "error": f"Delete card failed: {e}"}, status=500)
             return
@@ -2834,11 +3166,12 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             from Core.database import clear_uncommitted_batch
             b_name = str(payload.get("batchName") or "").strip()
             b_dir = (BATCHES_DIR / b_name) if b_name else None
-            res_clr = clear_uncommitted_batch(
-                batch_dir=b_dir,
-                clear_all=bool(payload.get("clearAll", False)),
-                restore_raw_scans_from_archive=True,
-            )
+            with _track_inline_task("batch_clear", f"Clearing Batch ({b_name or 'ALL'})", icon="🧹"):
+                res_clr = clear_uncommitted_batch(
+                    batch_dir=b_dir,
+                    clear_all=bool(payload.get("clearAll", False)),
+                    restore_raw_scans_from_archive=True,
+                )
             _log_ui_action_to_file("Batch", f"Cleared {b_name or 'ALL'}", f"restored_pdfs={res_clr.get('restored_pdfs', 0)}")
             self._send_json({"success": True, **res_clr, "batches": _discover_uncommitted_batches()})
             return
@@ -2850,33 +3183,35 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             target_name = str(payload.get("batchName") or "ALL").strip()
             flip_mode = str(payload.get("flipMode") or "auto").strip()
             immediate = bool(payload.get("immediate", False))
-            discovered = find_unarchived_scan_batches()
-            if immediate:
-                total_split = 0
+            task_title = f"Splitting Flatbed PDFs ({target_name})" if immediate else f"Staging Flatbed PDFs ({target_name})"
+            with _track_inline_task("split_flatbed", task_title, icon="✂️"):
+                discovered = find_unarchived_scan_batches()
+                if immediate:
+                    total_split = 0
+                    for b_name, b_path, b_pdfs in discovered:
+                        if target_name in ("", "ALL") or b_name == target_name:
+                            _, cnt = expand_flatbed_pdfs_in_batch_folder(
+                                b_path, pdf_files=b_pdfs, flip_mode=flip_mode, stage_for_review=False
+                            )
+                            total_split += cnt
+                    _log_ui_action_to_file("Scan", "Flatbed Split", f"Created {total_split} individual card PDF(s) for {target_name}")
+                    self._send_json({"success": True, "createdCount": total_split, "incomingScans": _discover_incoming_scans()})
+                    return
+                staged_all = []
                 for b_name, b_path, b_pdfs in discovered:
                     if target_name in ("", "ALL") or b_name == target_name:
-                        _, cnt = expand_flatbed_pdfs_in_batch_folder(
-                            b_path, pdf_files=b_pdfs, flip_mode=flip_mode, stage_for_review=False
+                        staged_all.extend(
+                            stage_flatbed_pdfs_for_review(b_path, pdf_files=b_pdfs, flip_mode=flip_mode)
                         )
-                        total_split += cnt
-                _log_ui_action_to_file("Scan", "Flatbed Split", f"Created {total_split} individual card PDF(s) for {target_name}")
-                self._send_json({"success": True, "createdCount": total_split, "incomingScans": _discover_incoming_scans()})
+                _log_ui_action_to_file("Scan", "Flatbed Stage", f"Staged {len(staged_all)} multi-card page pair(s) for review ({target_name})")
+                self._send_json({
+                    "success": True,
+                    "status": "PENDING_REVIEW",
+                    "stagedItems": staged_all,
+                    "pendingCount": len(staged_all),
+                    "incomingScans": _discover_incoming_scans(),
+                })
                 return
-            staged_all = []
-            for b_name, b_path, b_pdfs in discovered:
-                if target_name in ("", "ALL") or b_name == target_name:
-                    staged_all.extend(
-                        stage_flatbed_pdfs_for_review(b_path, pdf_files=b_pdfs, flip_mode=flip_mode)
-                    )
-            _log_ui_action_to_file("Scan", "Flatbed Stage", f"Staged {len(staged_all)} multi-card page pair(s) for review ({target_name})")
-            self._send_json({
-                "success": True,
-                "status": "PENDING_REVIEW",
-                "stagedItems": staged_all,
-                "pendingCount": len(staged_all),
-                "incomingScans": _discover_incoming_scans(),
-            })
-            return
 
         if route == "/api/splitter/commit" and isinstance(payload, dict):
             from Core.flatbed_splitter import commit_staged_splitter_review, list_pending_splitter_reviews
@@ -2887,11 +3222,12 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": "Missing stageId."}, status=400)
                 return
             try:
-                res = commit_staged_splitter_review(
-                    stage_id=stage_id,
-                    front_boxes=list(front_boxes),
-                    back_boxes=list(back_boxes),
-                )
+                with _track_inline_task("splitter_commit", f"Committing Flatbed Split ({stage_id})", icon="✂️"):
+                    res = commit_staged_splitter_review(
+                        stage_id=stage_id,
+                        front_boxes=list(front_boxes),
+                        back_boxes=list(back_boxes),
+                    )
             except FileNotFoundError as exc:
                 self._send_json({"success": False, "error": str(exc)}, status=404)
                 return
@@ -3534,6 +3870,24 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             from Core.maintenance_scheduler import update_maintenance_schedule
             saved_ms = update_maintenance_schedule(payload)
             self._send_json({"success": True, "schedule": saved_ms})
+            return
+
+        if route == "/api/maintenance/repair-inventory-names" and isinstance(payload, dict):
+            try:
+                skus_in = payload.get("skus") if isinstance(payload.get("skus"), list) else []
+                repair_all = bool(payload.get("all", False))
+                cat_filter = str(payload.get("category") or "all").strip()
+                with _track_inline_task("repair_inventory_names", "Repairing Inventory Player Names", icon="🔧"):
+                    res_rep = _repair_inventory_names_from_checklist(
+                        skus=skus_in,
+                        repair_all=repair_all,
+                        category=cat_filter,
+                    )
+                self._send_json(res_rep)
+            except ValueError as exc:
+                self._send_json({"success": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({"success": False, "error": str(exc)}, status=500)
             return
 
         if route == "/api/maintenance/run-now" and isinstance(payload, dict):
