@@ -352,6 +352,69 @@ class MultiCardSplitterReviewTests(unittest.TestCase):
             self.assertEqual(h_post.responses[0][1]["createdCount"], 4)
             self.assertEqual(h_post.responses[0][1]["pending"], [])
 
+    def test_dark_noisy_mat_tight_grid_separates_all_cards(self):
+        """Dark scanner mat with realistic grain/noise and tightly spaced cards must not fuse."""
+        rng = np.random.default_rng(42)
+        w, h = 1200, 1600
+        canvas = np.full((h, w, 3), (34, 34, 34), dtype=np.int16)
+        noise = rng.integers(-12, 13, size=(h, w, 3), dtype=np.int16)
+        canvas = np.clip(canvas + noise, 0, 255).astype(np.uint8)
+
+        specs = [
+            {"cx": 270, "cy": 330, "w": 220, "h": 310, "angle": -1.5, "rgb": (210, 210, 210)},
+            {"cx": 540, "cy": 330, "w": 220, "h": 310, "angle": 0.5, "rgb": (200, 70, 70)},
+            {"cx": 810, "cy": 330, "w": 220, "h": 310, "angle": 1.0, "rgb": (60, 150, 210)},
+            {"cx": 270, "cy": 720, "w": 220, "h": 310, "angle": 0.0, "rgb": (220, 190, 80)},
+            {"cx": 540, "cy": 720, "w": 220, "h": 310, "angle": -0.8, "rgb": (80, 185, 110)},
+            {"cx": 810, "cy": 720, "w": 220, "h": 310, "angle": 1.2, "rgb": (195, 195, 205)},
+        ]
+        for sp in specs:
+            _draw_rotated_card(
+                canvas,
+                cx=sp["cx"],
+                cy=sp["cy"],
+                w=sp["w"],
+                h=sp["h"],
+                angle_deg=sp["angle"],
+                fill_rgb=sp["rgb"],
+                border_rgb=(230, 230, 230),
+            )
+
+        profile = self.fs.load_splitter_profile(self.profile_path)
+        boxes = self.fs.detect_cards_on_page(Image.fromarray(canvas, mode="RGB"), profile=profile)
+        self.assertEqual(len(boxes), 6, f"Expected 6 cards on noisy dark mat, got {len(boxes)}: {boxes}")
+
+    def test_white_lid_with_thin_dark_outer_bezel_detects_all_cards(self):
+        """White flatbed lid framed by a thin black outer scanner bezel must not return 0 boxes."""
+        w, h = 1200, 1600
+        canvas = np.full((h, w, 3), (244, 244, 244), dtype=np.uint8)
+        # Thin 2.5% black scanner bezel around all 4 edges
+        bx, by = int(w * 0.025), int(h * 0.025)
+        canvas[:by, :] = (28, 28, 28)
+        canvas[-by:, :] = (28, 28, 28)
+        canvas[:, :bx] = (28, 28, 28)
+        canvas[:, -bx:] = (28, 28, 28)
+
+        specs = [
+            {"cx": 330, "cy": 420, "w": 220, "h": 310, "angle": -6.0, "rgb": (200, 50, 50)},
+            {"cx": 840, "cy": 450, "w": 220, "h": 310, "angle": 8.0, "rgb": (45, 130, 210)},
+            {"cx": 560, "cy": 1100, "w": 310, "h": 220, "angle": -4.0, "rgb": (60, 175, 85)},
+        ]
+        for sp in specs:
+            _draw_rotated_card(
+                canvas,
+                cx=sp["cx"],
+                cy=sp["cy"],
+                w=sp["w"],
+                h=sp["h"],
+                angle_deg=sp["angle"],
+                fill_rgb=sp["rgb"],
+            )
+
+        profile = self.fs.load_splitter_profile(self.profile_path)
+        boxes = self.fs.detect_cards_on_page(Image.fromarray(canvas, mode="RGB"), profile=profile)
+        self.assertEqual(len(boxes), 3, f"Expected 3 cards inside white lid + black bezel, got {len(boxes)}: {boxes}")
+
 
 if __name__ == "__main__":
     unittest.main()

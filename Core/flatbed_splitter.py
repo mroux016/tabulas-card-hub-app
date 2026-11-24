@@ -302,6 +302,354 @@ def _box_center_overlap_dup(b1: dict, b2: dict) -> bool:
     return dx < 0.35 * min_dim and dy < 0.35 * min_dim
 
 
+def _estimate_background_candidates(
+    small_rgb: np.ndarray,
+    lab: np.ndarray,
+    gray: np.ndarray,
+) -> list[tuple[str, np.ndarray, float]]:
+    """
+    Estimate candidate flatbed background Lab colors and noise levels (MAD):
+      1. `outer`: outer 2% perimeter strips.
+      2. `inset_mode`: dominant low-gradient L-channel peak in an inset ring (2.5%-6.5%),
+         avoiding thin dark scanner bezels around bright flatbed lids.
+      3. `global_mode`: dominant low-gradient L-channel peak across the full page.
+    Deduplicates candidates within Lab distance < 18.0.
+    """
+    sh, sw = small_rgb.shape[:2]
+    b_x = max(4, int(sw * 0.02))
+    b_y = max(4, int(sh * 0.02))
+    outer_samples = np.concatenate(
+        [
+            lab[:b_y, :, :].reshape(-1, 3),
+            lab[-b_y:, :, :].reshape(-1, 3),
+            lab[:, :b_x, :].reshape(-1, 3),
+            lab[:, -b_x:, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    outer_lab = np.median(outer_samples, axis=0)
+    outer_mad = float(np.median(np.linalg.norm(outer_samples - outer_lab, axis=1)))
+    raw_candidates: list[tuple[str, np.ndarray, float]] = [("outer", outer_lab, outer_mad)]
+
+    # Low-gradient pixels across the page
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gmag = np.hypot(gx, gy)
+    g_thresh = max(4.0, float(np.percentile(gmag, 35)))
+    low_grad = gmag <= g_thresh
+
+    def _mode_from_lab_samples(samples: np.ndarray) -> Optional[tuple[np.ndarray, float]]:
+        if len(samples) < 64:
+            return None
+        hist, edges = np.histogram(samples[:, 0], bins=32, range=(0.0, 256.0))
+        peak_bin = int(np.argmax(hist))
+        peak_center = 0.5 * (float(edges[peak_bin]) + float(edges[peak_bin + 1]))
+        in_peak = np.abs(samples[:, 0] - peak_center) <= 12.0
+        peak_px = samples[in_peak] if np.any(in_peak) else samples
+        med_lab = np.median(peak_px, axis=0)
+        mad = float(np.median(np.linalg.norm(peak_px - med_lab, axis=1)))
+        return med_lab, mad
+
+    # Inset ring (2.5% to 6.5% from edges)
+    ix1, ix2 = max(b_x + 1, int(sw * 0.025)), max(b_x + 4, int(sw * 0.065))
+    iy1, iy2 = max(b_y + 1, int(sh * 0.025)), max(b_y + 4, int(sh * 0.065))
+    if ix2 < sw - ix2 and iy2 < sh - iy2:
+        inset_mask = np.zeros((sh, sw), dtype=bool)
+        inset_mask[iy1:iy2, ix1:-ix1] = True
+        inset_mask[-iy2:-iy1, ix1:-ix1] = True
+        inset_mask[iy1:-iy1, ix1:ix2] = True
+        inset_mask[iy1:-iy1, -ix2:-ix1] = True
+        ring_lg = inset_mask & low_grad
+        ring_samples = lab[ring_lg] if int(ring_lg.sum()) >= 200 else lab[inset_mask]
+        inset_res = _mode_from_lab_samples(ring_samples)
+        if inset_res is not None:
+            raw_candidates.append(("inset_mode", inset_res[0], inset_res[1]))
+
+    # Global low-gradient mode
+    lg_samples = lab[low_grad]
+    glob_res = _mode_from_lab_samples(lg_samples)
+    if glob_res is not None:
+        raw_candidates.append(("global_mode", glob_res[0], glob_res[1]))
+
+    deduped: list[tuple[str, np.ndarray, float]] = []
+    for tag, cand_lab, cand_mad in raw_candidates:
+        if any(float(np.linalg.norm(cand_lab - prev_lab)) < 18.0 for _, prev_lab, _ in deduped):
+            continue
+        deduped.append((tag, cand_lab, cand_mad))
+    return deduped
+
+
+def _score_and_build_candidate(
+    contour: np.ndarray,
+    lab_dist: np.ndarray,
+    small_area: float,
+    scale: float,
+    full_w: int,
+    full_h: int,
+    profile: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Validate geometry & aspect ratio of a contour and build a canonical OBB dict."""
+    sh, sw = lab_dist.shape[:2]
+    min_area_r = float(profile.get("min_area_ratio", 0.012))
+    max_area_r = float(profile.get("max_area_ratio", 0.48))
+    min_aspect = float(profile.get("min_aspect_ratio", 1.08))
+    max_aspect = float(profile.get("max_aspect_ratio", 1.95))
+    target_aspect = float(profile.get("target_aspect_ratio", 1.40))
+    pad_x = float(profile.get("pad_ratio_x", 0.075))
+    pad_y = float(profile.get("pad_ratio_y", 0.065))
+
+    c_area = float(cv2.contourArea(contour))
+    if c_area < 0.5 * min_area_r * small_area:
+        return None
+    rect = cv2.minAreaRect(contour)
+    rcx, rcy, rw, rh, ang = _canonicalize_min_area_rect(rect)
+    box_area = rw * rh
+    if box_area <= 1.0:
+        return None
+
+    area_ratio = box_area / small_area
+    if not (min_area_r <= area_ratio <= max_area_r):
+        return None
+
+    aspect = max(rw, rh) / max(1.0, min(rw, rh))
+    if not (min_aspect <= aspect <= max_aspect):
+        return None
+
+    rectangularity = min(1.0, c_area / box_area)
+    if rectangularity < 0.50:
+        return None
+
+    x_i1 = max(0, int(rcx - rw * 0.4))
+    x_i2 = min(sw, int(rcx + rw * 0.4))
+    y_i1 = max(0, int(rcy - rh * 0.4))
+    y_i2 = min(sh, int(rcy + rh * 0.4))
+    mean_contrast = float(np.mean(lab_dist[y_i1:y_i2, x_i1:x_i2])) if (x_i2 > x_i1 and y_i2 > y_i1) else 20.0
+    contrast_score = min(1.0, mean_contrast / 35.0)
+    aspect_score = max(0.0, 1.0 - abs(aspect - target_aspect) / max(0.5, target_aspect))
+    confidence = round(0.45 * rectangularity + 0.30 * aspect_score + 0.25 * contrast_score, 4)
+
+    raw_w = rw / scale
+    raw_h = rh / scale
+    cx_full = rcx / scale
+    cy_full = rcy / scale
+
+    padded_w = min(float(full_w), raw_w * (1.0 + 2.0 * pad_x))
+    padded_h = min(float(full_h), raw_h * (1.0 + 2.0 * pad_y))
+
+    return {
+        "cx": round(cx_full, 2),
+        "cy": round(cy_full, 2),
+        "width": round(padded_w, 2),
+        "height": round(padded_h, 2),
+        "angle_deg": round(ang, 2),
+        "confidence": confidence,
+        "raw_width": round(raw_w, 2),
+        "raw_height": round(raw_h, 2),
+    }
+
+
+def _split_merged_contour_watershed(
+    contour: np.ndarray,
+    mask: np.ndarray,
+    min_area_px: float,
+) -> list[np.ndarray]:
+    """
+    Split a merged foreground contour into individual card contours using
+    distance-transform peak seeding + cv2.watershed inside a tight ROI.
+    """
+    mh, mw = mask.shape[:2]
+    x, y, bw, bh = cv2.boundingRect(contour)
+    pad = 4
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(mw, x + bw + pad)
+    y2 = min(mh, y + bh + pad)
+    rw, rh = x2 - x1, y2 - y1
+    if rw < 16 or rh < 16:
+        return []
+
+    roi_fg = np.zeros((rh, rw), dtype=np.uint8)
+    shifted_c = contour - np.array([[[x1, y1]]], dtype=contour.dtype)
+    cv2.drawContours(roi_fg, [shifted_c], -1, 255, thickness=-1)
+
+    dist = cv2.distanceTransform(roi_fg, cv2.DIST_L2, 5)
+    max_d = float(dist.max())
+    if max_d < 6.0:
+        return []
+
+    sure_fg = None
+    n_labels = 0
+    labels = None
+    for frac in (0.50, 0.40):
+        cand_fg = (dist > frac * max_d).astype(np.uint8) * 255
+        cand_fg = cv2.morphologyEx(cand_fg, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+        nl, lbl = cv2.connectedComponents(cand_fg)
+        if nl >= 3:  # background (0) + at least 2 foreground seeds
+            sure_fg = cand_fg
+            n_labels = nl
+            labels = lbl
+            break
+
+    if sure_fg is None or labels is None or n_labels < 3:
+        return []
+
+    sure_bg = cv2.dilate(roi_fg, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    markers = labels.astype(np.int32) + 1
+    markers[roi_fg == 0] = 1
+    markers[unknown == 255] = 0
+
+    roi_bgr = cv2.cvtColor(roi_fg, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(roi_bgr, markers)
+
+    sub_contours: list[np.ndarray] = []
+    for label_id in range(2, n_labels + 1):
+        comp = (markers == label_id).astype(np.uint8) * 255
+        sub_cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for sc in sub_cnts:
+            if float(cv2.contourArea(sc)) >= min_area_px:
+                sub_contours.append(sc + np.array([[[x1, y1]]], dtype=sc.dtype))
+    return sub_contours
+
+
+def _extract_boxes_from_mask(
+    mask: np.ndarray,
+    lab_dist: np.ndarray,
+    scale: float,
+    full_w: int,
+    full_h: int,
+    profile: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Extract deduplicated card OBBs from a binary foreground mask using `RETR_TREE`
+    hierarchy (to look inside page-spanning dark scanner frames) and watershed
+    splitting for touching/merged card regions.
+    """
+    sh, sw = mask.shape[:2]
+    small_area = float(sw * sh)
+    min_area_r = float(profile.get("min_area_ratio", 0.012))
+    max_area_r = float(profile.get("max_area_ratio", 0.48))
+    max_aspect = float(profile.get("max_aspect_ratio", 1.95))
+    min_area_px = 0.5 * min_area_r * small_area
+
+    cnts, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts or hierarchy is None:
+        return []
+
+    hier = hierarchy[0]  # shape (N, 4): [next, prev, first_child, parent]
+    candidates: list[dict[str, Any]] = []
+
+    def _collect_descendants_at_even_depth(idx: int, depth: int):
+        child = int(hier[idx][2])
+        while child != -1:
+            if depth % 2 == 0:
+                c = cnts[child]
+                c_area = float(cv2.contourArea(c))
+                if c_area >= min_area_px:
+                    cand = _score_and_build_candidate(c, lab_dist, small_area, scale, full_w, full_h, profile)
+                    if cand is not None:
+                        candidates.append(cand)
+                    else:
+                        rect = cv2.minAreaRect(c)
+                        _, _, rw, rh, _ = _canonicalize_min_area_rect(rect)
+                        box_area = rw * rh
+                        if box_area > 1.0 and (box_area / small_area) > 2.0 * min_area_r:
+                            for sc in _split_merged_contour_watershed(c, mask, min_area_px):
+                                sc_cand = _score_and_build_candidate(sc, lab_dist, small_area, scale, full_w, full_h, profile)
+                                if sc_cand is not None:
+                                    candidates.append(sc_cand)
+            _collect_descendants_at_even_depth(child, depth + 1)
+            child = int(hier[child][0])
+
+    # Walk top-level contours (parent == -1)
+    top_idx = 0
+    while top_idx != -1:
+        c = cnts[top_idx]
+        c_area = float(cv2.contourArea(c))
+        if c_area >= min_area_px:
+            rect = cv2.minAreaRect(c)
+            _, _, rw, rh, _ = _canonicalize_min_area_rect(rect)
+            box_area = rw * rh
+            area_ratio = (box_area / small_area) if box_area > 1.0 else 0.0
+            aspect = (max(rw, rh) / max(1.0, min(rw, rh))) if box_area > 1.0 else 0.0
+            rectangularity = min(1.0, c_area / box_area) if box_area > 1.0 else 0.0
+
+            if area_ratio > 0.70:
+                # Page-spanning contour (e.g., thin black scanner bezel around a white lid, or merged sheet)
+                _collect_descendants_at_even_depth(top_idx, 1)
+                if rectangularity > 0.60:
+                    for sc in _split_merged_contour_watershed(c, mask, min_area_px):
+                        sc_cand = _score_and_build_candidate(sc, lab_dist, small_area, scale, full_w, full_h, profile)
+                        if sc_cand is not None:
+                            candidates.append(sc_cand)
+            else:
+                cand = _score_and_build_candidate(c, lab_dist, small_area, scale, full_w, full_h, profile)
+                if cand is not None and not (rectangularity < 0.65 and area_ratio > 2.0 * min_area_r):
+                    candidates.append(cand)
+                elif area_ratio > max_area_r or aspect > max_aspect or (rectangularity < 0.65 and area_ratio > 2.0 * min_area_r):
+                    split_added = False
+                    for sc in _split_merged_contour_watershed(c, mask, min_area_px):
+                        sc_cand = _score_and_build_candidate(sc, lab_dist, small_area, scale, full_w, full_h, profile)
+                        if sc_cand is not None:
+                            candidates.append(sc_cand)
+                            split_added = True
+                    if not split_added and cand is not None:
+                        candidates.append(cand)
+
+        top_idx = int(hier[top_idx][0])
+
+    candidates.sort(key=lambda b: b["confidence"], reverse=True)
+    kept: list[dict[str, Any]] = []
+    for cand in candidates:
+        if any(_box_center_overlap_dup(cand, k) for k in kept):
+            continue
+        kept.append(cand)
+    return kept
+
+
+def _detect_for_bg_candidate(
+    lab: np.ndarray,
+    gray: np.ndarray,
+    bg_lab: np.ndarray,
+    bg_mad: float,
+    scale: float,
+    full_w: int,
+    full_h: int,
+    profile: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Run primary Lab-distance segmentation and guarded low-contrast edge fallback."""
+    lab_dist = np.linalg.norm(lab - bg_lab, axis=2)
+    thresh = max(14.0, min(28.0, bg_mad * 3.5 + 10.0))
+    fg_color = (lab_dist > thresh).astype(np.uint8) * 255
+
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_primary = cv2.morphologyEx(fg_color, cv2.MORPH_OPEN, open_k, iterations=1)
+    mask_primary = cv2.morphologyEx(mask_primary, cv2.MORPH_CLOSE, close_k, iterations=1)
+
+    boxes = _extract_boxes_from_mask(mask_primary, lab_dist, scale, full_w, full_h, profile)
+    if len(boxes) >= 2:
+        return boxes
+
+    # Guarded edge-assisted fallback for low-contrast cards (no CLAHE amplification)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 40, 120)
+    edges_dil = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    combined = cv2.bitwise_or(fg_color, edges_dil)
+    mask_edge = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k, iterations=1)
+    mask_edge = cv2.morphologyEx(mask_edge, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
+
+    if float(np.mean(mask_edge > 0)) < 0.75:
+        edge_boxes = _extract_boxes_from_mask(mask_edge, lab_dist, scale, full_w, full_h, profile)
+        score_p = sum(b["confidence"] for b in boxes)
+        score_e = sum(b["confidence"] for b in edge_boxes)
+        if len(edge_boxes) > len(boxes) or (len(edge_boxes) == len(boxes) and score_e > score_p):
+            return edge_boxes
+
+    return boxes
+
+
 def detect_cards_on_page(
     page_img: Image.Image | np.ndarray,
     profile: Optional[dict[str, Any]] = None,
@@ -339,121 +687,32 @@ def detect_cards_on_page(
     else:
         small_rgb = rgb_full
 
-    # Estimate scanner bed background Lab color from the outer 2% perimeter strips
     lab = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    b_x = max(4, int(sw * 0.02))
-    b_y = max(4, int(sh * 0.02))
-    bg_samples = np.concatenate(
-        [
-            lab[:b_y, :, :].reshape(-1, 3),
-            lab[-b_y:, :, :].reshape(-1, 3),
-            lab[:, :b_x, :].reshape(-1, 3),
-            lab[:, -b_x:, :].reshape(-1, 3),
-        ],
-        axis=0,
-    )
-    bg_lab = np.median(bg_samples, axis=0)
-
-    lab_dist = np.linalg.norm(lab - bg_lab, axis=2)
-    fg_color = (lab_dist > 15.0).astype(np.uint8) * 255
-
     gray = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
-    blur = cv2.GaussianBlur(clahe, (5, 5), 0)
-    edges = cv2.Canny(blur, 25, 95)
-    edges_dil = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
 
-    combined = cv2.bitwise_or(fg_color, edges_dil)
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_k, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k, iterations=1)
+    bg_candidates = _estimate_background_candidates(small_rgb, lab, gray)
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_kept: list[dict[str, Any]] = []
+    best_score = -1.0
+    for tag, bg_lab, bg_mad in bg_candidates:
+        kept = _detect_for_bg_candidate(lab, gray, bg_lab, bg_mad, scale, w, h, profile)
+        score = sum(b["confidence"] for b in kept) + (0.05 if tag == "outer" and kept else 0.0)
+        if score > best_score:
+            best_score = score
+            best_kept = kept
 
-    small_area = float(sw * sh)
-    min_area_r = float(profile.get("min_area_ratio", 0.012))
-    max_area_r = float(profile.get("max_area_ratio", 0.48))
-    min_aspect = float(profile.get("min_aspect_ratio", 1.08))
-    max_aspect = float(profile.get("max_aspect_ratio", 1.95))
-    target_aspect = float(profile.get("target_aspect_ratio", 1.40))
-    pad_x = float(profile.get("pad_ratio_x", 0.075))
-    pad_y = float(profile.get("pad_ratio_y", 0.065))
-
-    candidates: list[dict[str, Any]] = []
-    for c in cnts:
-        c_area = float(cv2.contourArea(c))
-        if c_area < 0.5 * min_area_r * small_area:
-            continue
-        rect = cv2.minAreaRect(c)
-        rcx, rcy, rw, rh, ang = _canonicalize_min_area_rect(rect)
-        box_area = rw * rh
-        if box_area <= 1.0:
-            continue
-
-        area_ratio = box_area / small_area
-        if not (min_area_r <= area_ratio <= max_area_r):
-            continue
-
-        aspect = max(rw, rh) / max(1.0, min(rw, rh))
-        if not (min_aspect <= aspect <= max_aspect):
-            continue
-
-        rectangularity = min(1.0, c_area / box_area)
-        if rectangularity < 0.50:
-            continue
-
-        # Contrast signal inside the candidate
-        x_i1 = max(0, int(rcx - rw * 0.4))
-        x_i2 = min(sw, int(rcx + rw * 0.4))
-        y_i1 = max(0, int(rcy - rh * 0.4))
-        y_i2 = min(sh, int(rcy + rh * 0.4))
-        mean_contrast = float(np.mean(lab_dist[y_i1:y_i2, x_i1:x_i2])) if (x_i2 > x_i1 and y_i2 > y_i1) else 20.0
-        contrast_score = min(1.0, mean_contrast / 35.0)
-        aspect_score = max(0.0, 1.0 - abs(aspect - target_aspect) / max(0.5, target_aspect))
-        confidence = round(0.45 * rectangularity + 0.30 * aspect_score + 0.25 * contrast_score, 4)
-
-        raw_w = rw / scale
-        raw_h = rh / scale
-        cx_full = rcx / scale
-        cy_full = rcy / scale
-
-        padded_w = min(float(w), raw_w * (1.0 + 2.0 * pad_x))
-        padded_h = min(float(h), raw_h * (1.0 + 2.0 * pad_y))
-
-        candidates.append(
-            {
-                "cx": round(cx_full, 2),
-                "cy": round(cy_full, 2),
-                "width": round(padded_w, 2),
-                "height": round(padded_h, 2),
-                "angle_deg": round(ang, 2),
-                "confidence": confidence,
-                "raw_width": round(raw_w, 2),
-                "raw_height": round(raw_h, 2),
-            }
-        )
-
-    # Deduplicate overlapping boxes (keep higher confidence)
-    candidates.sort(key=lambda b: b["confidence"], reverse=True)
-    kept: list[dict[str, Any]] = []
-    for cand in candidates:
-        if any(_box_center_overlap_dup(cand, k) for k in kept):
-            continue
-        kept.append(cand)
-
-    if not kept:
+    if not best_kept:
         return []
 
-    med_h = float(np.median([b["height"] for b in kept]))
+    med_h = float(np.median([b["height"] for b in best_kept]))
     row_band = max(40.0, 0.55 * med_h)
-    kept.sort(key=lambda b: (int(b["cy"] // row_band), b["cx"]))
+    best_kept.sort(key=lambda b: (int(b["cy"] // row_band), b["cx"]))
 
-    for idx, b in enumerate(kept, 1):
+    for idx, b in enumerate(best_kept, 1):
         b["pair_id"] = idx
         b["color"] = get_pair_color(idx)
 
-    return kept
+    return best_kept
 
 
 # ==============================================================================
@@ -982,50 +1241,55 @@ def stage_flatbed_pdfs_for_review(
         if num_pages < 2 or (0.0 < max_pt_dim < 420.0):
             continue
 
-        p1_img = _render_pdf_page_rgb(pdf_p, 0, dpi=preview_dpi)
-        p2_img = _render_pdf_page_rgb(pdf_p, 1, dpi=preview_dpi)
-        if p1_img is None or p2_img is None:
-            continue
+        for pair_idx in range(0, num_pages - 1, 2):
+            p1_img = _render_pdf_page_rgb(pdf_p, pair_idx, dpi=preview_dpi)
+            p2_img = _render_pdf_page_rgb(pdf_p, pair_idx + 1, dpi=preview_dpi)
+            if p1_img is None or p2_img is None:
+                continue
 
-        f_boxes = detect_cards_on_page(p1_img, profile=profile)
-        if len(f_boxes) < 2:
-            continue
-        b_boxes = detect_cards_on_page(p2_img, profile=profile)
-        if not b_boxes:
-            b_boxes = copy.deepcopy(f_boxes)
+            f_boxes = detect_cards_on_page(p1_img, profile=profile)
+            if len(f_boxes) < 2:
+                continue
+            b_boxes = detect_cards_on_page(p2_img, profile=profile)
+            if not b_boxes:
+                b_boxes = copy.deepcopy(f_boxes)
 
-        paired_f, paired_b, chosen_mode = match_front_back_pancake(
-            f_boxes, b_boxes, p1_img.size, p2_img.size, flip_mode=flip_mode, profile=profile
-        )
+            paired_f, paired_b, chosen_mode = match_front_back_pancake(
+                f_boxes, b_boxes, p1_img.size, p2_img.size, flip_mode=flip_mode, profile=profile
+            )
 
-        stage_id = f"{sanitize_filename_part(batch_folder.name)}_{sanitize_filename_part(pdf_p.stem)}_{uuid.uuid4().hex[:8]}"
-        item_dir = stage_root / stage_id
-        item_dir.mkdir(parents=True, exist_ok=True)
-        p1_img.save(item_dir / "front.jpg", format="JPEG", quality=92)
-        p2_img.save(item_dir / "back.jpg", format="JPEG", quality=92)
+            sheet_num = pair_idx // 2 + 1
+            stem_out = f"{pdf_p.stem}_s{sheet_num:02d}" if num_pages > 2 else pdf_p.stem
+            stage_id = f"{sanitize_filename_part(batch_folder.name)}_{sanitize_filename_part(stem_out)}_{uuid.uuid4().hex[:8]}"
+            item_dir = stage_root / stage_id
+            item_dir.mkdir(parents=True, exist_ok=True)
+            p1_img.save(item_dir / "front.jpg", format="JPEG", quality=92)
+            p2_img.save(item_dir / "back.jpg", format="JPEG", quality=92)
 
-        stage_meta = {
-            "stage_id": stage_id,
-            "status": "PENDING_REVIEW",
-            "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "batch_name": batch_folder.name,
-            "output_dir": str(batch_folder),
-            "stem_name": pdf_p.stem,
-            "source_front_image": "",
-            "source_back_image": "",
-            "source_pdf": str(pdf_p),
-            "front_image_url": f"/static/splitter/{stage_id}/front.jpg",
-            "back_image_url": f"/static/splitter/{stage_id}/back.jpg",
-            "front_size": [p1_img.width, p1_img.height],
-            "back_size": [p2_img.width, p2_img.height],
-            "flip_mode_detected": chosen_mode,
-            "proposed_front_boxes": paired_f,
-            "proposed_back_boxes": paired_b,
-        }
-        atomic_write_text(item_dir / "stage.json", json.dumps(stage_meta, indent=2), encoding="utf-8")
-        staged_items.append(stage_meta)
-        if log_cb:
-            log_cb(f"  ⏸️ Staged '{pdf_p.name}' ({len(paired_f)} card pair(s)) for pre-split review [{stage_id}].")
+            stage_meta = {
+                "stage_id": stage_id,
+                "status": "PENDING_REVIEW",
+                "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "batch_name": batch_folder.name,
+                "output_dir": str(batch_folder),
+                "stem_name": stem_out,
+                "source_front_image": "",
+                "source_back_image": "",
+                "source_pdf": str(pdf_p),
+                "front_page_idx": pair_idx,
+                "back_page_idx": pair_idx + 1,
+                "front_image_url": f"/static/splitter/{stage_id}/front.jpg",
+                "back_image_url": f"/static/splitter/{stage_id}/back.jpg",
+                "front_size": [p1_img.width, p1_img.height],
+                "back_size": [p2_img.width, p2_img.height],
+                "flip_mode_detected": chosen_mode,
+                "proposed_front_boxes": paired_f,
+                "proposed_back_boxes": paired_b,
+            }
+            atomic_write_text(item_dir / "stage.json", json.dumps(stage_meta, indent=2), encoding="utf-8")
+            staged_items.append(stage_meta)
+            if log_cb:
+                log_cb(f"  ⏸️ Staged '{pdf_p.name}' (p{pair_idx + 1}-{pair_idx + 2}, {len(paired_f)} card pair(s)) for pre-split review [{stage_id}].")
 
     return staged_items
 
@@ -1117,8 +1381,10 @@ def commit_staged_splitter_review(
     created_files: list[str] = []
 
     if src_pdf and src_pdf.exists():
-        p1_hi = _render_pdf_page_rgb(src_pdf, 0, dpi=dpi_val)
-        p2_hi = _render_pdf_page_rgb(src_pdf, 1, dpi=dpi_val)
+        front_page_idx = int(meta.get("front_page_idx", 0))
+        back_page_idx = int(meta.get("back_page_idx", 1))
+        p1_hi = _render_pdf_page_rgb(src_pdf, front_page_idx, dpi=dpi_val)
+        p2_hi = _render_pdf_page_rgb(src_pdf, back_page_idx, dpi=dpi_val)
         if p1_hi is None or p2_hi is None:
             raise RuntimeError(f"Failed to render PDF pages for commit: {src_pdf}")
 
@@ -1148,12 +1414,30 @@ def commit_staged_splitter_review(
             new_doc.close()
             created_files.append(str(out_pdf))
 
-        arc_fb_dir = output_dir / "Archive_Flatbed_Sheets"
-        arc_fb_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            src_pdf.replace(arc_fb_dir / src_pdf.name)
-        except Exception:
-            pass
+        has_other_pending = False
+        src_resolved = str(src_pdf.resolve())
+        for other_meta_file in stage_root.glob("*/stage.json"):
+            if other_meta_file == meta_path:
+                continue
+            try:
+                other_meta = json.loads(other_meta_file.read_text(encoding="utf-8"))
+                if (
+                    other_meta.get("status") == "PENDING_REVIEW"
+                    and other_meta.get("source_pdf")
+                    and str(Path(other_meta["source_pdf"]).resolve()) == src_resolved
+                ):
+                    has_other_pending = True
+                    break
+            except Exception:
+                continue
+
+        if not has_other_pending:
+            arc_fb_dir = output_dir / "Archive_Flatbed_Sheets"
+            arc_fb_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                src_pdf.replace(arc_fb_dir / src_pdf.name)
+            except Exception:
+                pass
     else:
         src_f_path = Path(meta.get("source_front_image") or (stage_root / stage_id / "front.jpg"))
         src_b_path = Path(meta.get("source_back_image") or (stage_root / stage_id / "back.jpg"))
