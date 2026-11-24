@@ -3939,6 +3939,7 @@ def _update_catalog_from_parsed_rows(
             "referer": str(r.get("_referer") or prev_entry.get("referer", "")),
             "subset_url": str(r.get("_subset_url") or r.get("_referer") or prev_entry.get("subset_url", "")),
             "page_num": int(r.get("_page_num") or prev_entry.get("page_num") or 1),
+            "image_source": str(r.get("_image_source") or prev_entry.get("image_source") or "parsed"),
             "front": prev_entry.get("front"),
             "back": prev_entry.get("back"),
         }
@@ -3967,6 +3968,189 @@ def _extract_total_cards_from_checklist_soup(soup: BeautifulSoup, page1_rows_cou
     return (max_pages - 1) * per_page + max(1, per_page // 2)
 
 
+_BASE_PARALLEL_HINT_KEYWORDS = (
+    "foil", "gold", "silver", "blue", "red", "green", "orange", "purple", "pink", "black",
+    "platinum", "aqua", "yellow", "camo", "rainbow", "sandglitter", "holo", "diamante",
+    "vintage stock", "clear", "holiday", "true photo", "variation", "variations",
+    "printing plate", "independence day", "mother's day", "father's day", "memorial day",
+    "spring training", "golden mirror", "first card", "crackle", "confetti", "refractor",
+    "fractor", "prizm", "chrome", "sepia", "wave", "lava", "shimmer", "mojo", "ice",
+    "sparkle", "mini", "wood", "canvas", "acetate", "glossy", "tiffany", "parallel",
+    "team color", "companion", "superfractor", "foilfractor",
+)
+_STANDALONE_INSERT_EXCL_KEYWORDS = (
+    "autograph", "relic", "patch", "jersey", "memorabilia", "all aces", "home field",
+    "heavy lumber", "stars of mlb", "greatest hits", "call to the hall", "topps now",
+    "first pitch", "training grounds", "big ticket",
+)
+
+
+def _is_likely_base_parallel_name(subset_name: str) -> bool:
+    s_low = str(subset_name or "").strip().lower()
+    if not s_low or s_low in ("base", "base set"):
+        return False
+    if any(ex in s_low for ex in _STANDALONE_INSERT_EXCL_KEYWORDS):
+        return False
+    return s_low.startswith("base ") or any(kw in s_low for kw in _BASE_PARALLEL_HINT_KEYWORDS)
+
+
+def _dedupe_physical_parent_cards(rows: list[dict], sort_by_cid: bool = False) -> list[dict]:
+    """Deduplicates parent rows to 1 entry per physical TCDB_CID (keeping multiline/LL cards 1-to-1)."""
+    deduped: list[dict] = []
+    seen_cids: set[str] = set()
+    for r in rows or []:
+        cid_s = normalize_numeric_tcdb_cid(r.get("TCDB_CID", ""))
+        if not cid_s or cid_s == "0" or not cid_s.isdigit():
+            continue
+        if cid_s in seen_cids:
+            continue
+        seen_cids.add(cid_s)
+        deduped.append(r)
+    if sort_by_cid and deduped:
+        deduped.sort(key=lambda r: int(normalize_numeric_tcdb_cid(r.get("TCDB_CID", "")) or 0))
+    return deduped
+
+
+def _resolve_parallel_parent_subset(
+    subset_label: str,
+    parent_cards_by_key: dict[str, tuple[str, list[dict]]],
+    expected_cards: int = 0,
+) -> tuple[Optional[str], list[dict]]:
+    """
+    Resolves a candidate parallel subset to its scraped/local parent subset
+    (covering both Base parallels and Insert parallels).
+    """
+    cand_norm = normalize_subset_name_for_diff(subset_label)
+    cand_canon = canonical_subset_key(subset_label)
+    if cand_norm == "base":
+        return None, []
+
+    best_insert: Optional[tuple[int, str, list[dict]]] = None
+    for p_canon, (p_disp, p_cards) in parent_cards_by_key.items():
+        if p_canon == cand_canon or len(p_cards) < 3:
+            continue
+        p_norm = normalize_subset_name_for_diff(p_disp)
+        if not p_norm or p_norm == "base":
+            continue
+        if cand_norm.startswith(p_norm + " ") and cand_norm[len(p_norm) + 1:].strip():
+            if best_insert is None or len(p_norm) > best_insert[0]:
+                best_insert = (len(p_norm), p_disp, p_cards)
+    if best_insert is not None:
+        return best_insert[1], best_insert[2]
+
+    base_entry = parent_cards_by_key.get(canonical_subset_key("Base"))
+    if base_entry and len(base_entry[1]) >= 3:
+        if expected_cards == len(base_entry[1]) or expected_cards <= 0 or _is_likely_base_parallel_name(subset_label):
+            return base_entry[0], base_entry[1]
+
+    return None, []
+
+
+def _try_strict_cid_interpolation(
+    resolved_subset: str,
+    base_chk_url: str,
+    rows_p1: list[dict],
+    rows_last: list[dict],
+    parent_cards: list[dict],
+    page_size: int,
+    existing_local_by_cid: Optional[dict[str, dict]] = None,
+) -> tuple[Optional[list[dict]], str, str]:
+    """
+    Validates strict contiguity & boundary order against `parent_cards` and synthesizes
+    middle rows if all guardrails pass. Returns `(rows_or_None, reason_code, detail)`.
+    """
+    n_parent = len(parent_cards)
+    if n_parent < 3 or len(rows_p1) < 2 or len(rows_last) < 2 or (len(rows_p1) + len(rows_last)) >= n_parent:
+        return None, "cid_gap", f"insufficient boundary rows vs count={n_parent}"
+
+    cids_p1: list[int] = []
+    for r in rows_p1:
+        c_s = normalize_numeric_tcdb_cid(r.get("TCDB_CID", ""))
+        if not c_s or not c_s.isdigit() or int(c_s) <= 0:
+            return None, "cid_gap", f"non-numeric CID vs count={n_parent}"
+        cids_p1.append(int(c_s))
+
+    cids_last: list[int] = []
+    for r in rows_last:
+        c_s = normalize_numeric_tcdb_cid(r.get("TCDB_CID", ""))
+        if not c_s or not c_s.isdigit() or int(c_s) <= 0:
+            return None, "cid_gap", f"non-numeric CID vs count={n_parent}"
+        cids_last.append(int(c_s))
+
+    first_cid = cids_p1[0]
+    last_cid = cids_last[-1]
+    span = last_cid - first_cid + 1
+
+    # Guardrail 4: Page 1 and Last Page rows themselves are strictly monotonic
+    if not (
+        all(cids_p1[i] == cids_p1[i - 1] + 1 for i in range(1, len(cids_p1)))
+        and all(cids_last[i] == cids_last[i - 1] + 1 for i in range(1, len(cids_last)))
+    ):
+        return None, "cid_gap", f"span={span} vs count={n_parent}"
+
+    # Guardrail 1: Zero CID gaps across entire subset
+    if span != n_parent:
+        return None, "cid_gap", f"span={span} vs count={n_parent}"
+
+    # Guardrails 2 & 3: Boundary card numbers & second/penultimate CID spot checks
+    def _norm_cn(row: dict) -> str:
+        return str(row.get("Card Number") or "").strip().lstrip("#").upper()
+
+    if not (
+        _norm_cn(rows_p1[0]) == _norm_cn(parent_cards[0])
+        and _norm_cn(rows_last[-1]) == _norm_cn(parent_cards[-1])
+        and cids_p1[1] == first_cid + 1
+        and _norm_cn(rows_p1[1]) == _norm_cn(parent_cards[1])
+        and cids_last[-2] == last_cid - 1
+        and _norm_cn(rows_last[-2]) == _norm_cn(parent_cards[-2])
+    ):
+        return None, "order_mismatch", "boundary card numbers differ from parent"
+
+    boundary_prs = {
+        str(r.get("Print Run") or "").strip()
+        for r in (rows_p1 + rows_last)
+        if str(r.get("Print Run") or "").strip()
+    }
+    uniform_pr = next(iter(boundary_prs)) if len(boundary_prs) == 1 else ""
+    sep = "&" if "?" in base_chk_url else "?"
+    local_map = existing_local_by_cid or {}
+
+    middle_rows: list[dict] = []
+    for idx in range(len(rows_p1), n_parent - len(rows_last)):
+        p_row = parent_cards[idx]
+        cid_s = str(first_cid + idx)
+        pg_num = (idx // max(1, page_size)) + 1
+        ref_u = f"{base_chk_url}{sep}PageIndex={pg_num}"
+        prev_loc = local_map.get(cid_s) or {}
+        front_dl = str(prev_loc.get("Front_Downloaded") or "").strip() or "No"
+        back_dl = str(prev_loc.get("Back_Downloaded") or "").strip() or "No"
+        img_stat = str(prev_loc.get("TCDB_Image_Status") or "").strip() or "Interpolated (Unchecked)"
+
+        middle_rows.append({
+            "Subset": resolved_subset,
+            "Card Number": str(p_row.get("Card Number") or "").strip().lstrip("#"),
+            "Player": str(p_row.get("Player") or "").strip(),
+            "Team": str(p_row.get("Team") or "").strip(),
+            "Print Run": uniform_pr or str(p_row.get("Print Run") or "").strip(),
+            "Attributes": str(p_row.get("Attributes") or "").strip(),
+            "TCDB_CID": cid_s,
+            "Front_Downloaded": front_dl,
+            "Back_Downloaded": back_dl,
+            "TCDB_Image_Status": img_stat,
+            "_front_thumb": "",
+            "_back_thumb": "",
+            "_front_tier_hint": "",
+            "_back_tier_hint": "",
+            "_referer": ref_u,
+            "_subset_url": base_chk_url,
+            "_page_num": pg_num,
+            "_image_source": "interpolated",
+        })
+
+    combined = list(rows_p1) + middle_rows + list(rows_last)
+    return combined, "interpolated", f"{n_parent} cards, CID {first_cid}..{last_cid}"
+
+
 def _scrape_tcdb_subset_checklist_pages(
     req_session,
     base_chk_url: str,
@@ -3977,13 +4161,24 @@ def _scrape_tcdb_subset_checklist_pages(
     prefetched_page1_html: Optional[str] = None,
     known_subset_total: int = 0,
     start_page: int = 1,
+    parent_cards: Optional[list[dict]] = None,
+    existing_local_by_cid: Optional[dict[str, dict]] = None,
+    interpolation_stats_out: Optional[dict] = None,
 ) -> list[dict]:
     all_rows = []
     page_idx = max(1, int(start_page))
     est_max_pages = 1
     hard_max_pages = 200
     seen_page_cids: set[str] = set()
+    prefetched_pages: dict[int, str] = {}
     resolved_subset = clean_tcdb_subset_title(subset_name, checklist_set_name=checklist_set_name) or subset_name
+
+    can_interpolate = bool(parent_cards and len(parent_cards) >= 3 and page_idx == 1)
+    if can_interpolate and known_subset_total > 0 and known_subset_total != len(parent_cards):
+        log_msg(f"      [FALLBACK: count_mismatch] {resolved_subset} (parallel={known_subset_total} vs parent={len(parent_cards)})")
+        if isinstance(interpolation_stats_out, dict):
+            interpolation_stats_out["reason"] = "count_mismatch"
+        can_interpolate = False
 
     while page_idx <= hard_max_pages:
         page_url = (
@@ -3994,6 +4189,9 @@ def _scrape_tcdb_subset_checklist_pages(
         if page_idx == 1 and prefetched_page1_html:
             html_body = prefetched_page1_html
             log_msg(f"      [Cache Hit] Reusing pre-scanned Page 1 HTML for '{resolved_subset}' -> {page_url}")
+        elif page_idx in prefetched_pages:
+            html_body = prefetched_pages.pop(page_idx)
+            log_msg(f"      [Cache Hit] Reusing pre-fetched Page {page_idx} HTML for '{resolved_subset}' -> {page_url}")
         else:
             log_msg(f"      [HTTP GET] Subset '{resolved_subset}' Page {page_idx}/{max(est_max_pages, page_idx)} -> {page_url}")
             res = safe_get(req_session, page_url, silent_404=True)
@@ -4042,6 +4240,89 @@ def _scrape_tcdb_subset_checklist_pages(
 
         for r_item in rows_p:
             r_item["_subset_url"] = base_chk_url
+
+        if can_interpolate and page_idx == 1:
+            if est_max_pages <= 1 and not has_next_page_link:
+                can_interpolate = False
+            else:
+                page_size = len(rows_p)
+                expected_last_page = (len(parent_cards) + page_size - 1) // page_size
+                target_last_page = max(est_max_pages, expected_last_page)
+                reported_total = (
+                    known_subset_total
+                    if known_subset_total > 0
+                    else _extract_total_cards_from_checklist_soup(soup, len(rows_p), target_last_page)
+                )
+                if reported_total != len(parent_cards):
+                    log_msg(f"      [FALLBACK: count_mismatch] {resolved_subset} (parallel={reported_total} vs parent={len(parent_cards)})")
+                    if isinstance(interpolation_stats_out, dict):
+                        interpolation_stats_out["reason"] = "count_mismatch"
+                elif target_last_page >= 3:
+                    last_page_url = f"{base_chk_url}{'&' if '?' in base_chk_url else '?'}PageIndex={target_last_page}"
+                    log_msg(f"      [HTTP GET] Subset '{resolved_subset}' Last Page {target_last_page}/{target_last_page} (interpolation probe) -> {last_page_url}")
+                    res_last = safe_get(req_session, last_page_url, silent_404=True)
+                    if res_last and (not hasattr(res_last, "url") or not res_last.url or "PageIndex" in str(res_last.url)):
+                        last_html = decode_html_response(res_last)
+                        prefetched_pages[target_last_page] = last_html
+                        soup_last = BeautifulSoup(last_html, "html.parser")
+                        last_has_next = False
+                        for a_lp in soup_last.find_all("a", href=re.compile(r"PageIndex=(\d+)", re.IGNORECASE)):
+                            m_lp = re.search(r"PageIndex=(\d+)", str(a_lp.get("href", "")), re.IGNORECASE)
+                            if m_lp:
+                                lp_num = int(m_lp.group(1))
+                                lp_txt = trim_clean(a_lp.get_text(" ", strip=True)).lower()
+                                if lp_num == target_last_page + 1 or lp_txt in ("next", ">", "»", "next >", "next »"):
+                                    last_has_next = True
+                                    break
+                        rows_last = parse_tcdb_checklist_table_rows(
+                            soup_last,
+                            subset_name=resolved_subset or "Base",
+                            current_url=last_page_url,
+                            page_num=target_last_page,
+                        )
+                        for r_item in rows_last:
+                            r_item["_subset_url"] = base_chk_url
+
+                        if rows_last and not last_has_next:
+                            combined, interp_reason, interp_detail = _try_strict_cid_interpolation(
+                                resolved_subset or "Base",
+                                base_chk_url,
+                                rows_p,
+                                rows_last,
+                                parent_cards,
+                                page_size,
+                                existing_local_by_cid=existing_local_by_cid,
+                            )
+                            if combined is not None:
+                                skipped_pages = max(0, target_last_page - 2)
+                                if page_info_callback is not None:
+                                    page_info_callback(1, target_last_page, len(combined))
+                                log_msg(
+                                    f"      [INTERPOLATED] {resolved_subset} "
+                                    f"({len(combined)} cards, CID {combined[0]['TCDB_CID']}..{combined[-1]['TCDB_CID']}, "
+                                    f"skipped {skipped_pages} middle page(s))"
+                                )
+                                if card_callback is not None:
+                                    for c_row in combined:
+                                        card_callback(c_row)
+                                if isinstance(interpolation_stats_out, dict):
+                                    interpolation_stats_out["interpolated"] = True
+                                    interpolation_stats_out["pages_saved"] = skipped_pages
+                                    interpolation_stats_out["reason"] = "interpolated"
+                                return combined
+                            else:
+                                log_msg(f"      [FALLBACK: {interp_reason}] {resolved_subset} ({interp_detail})")
+                                if isinstance(interpolation_stats_out, dict):
+                                    interpolation_stats_out["reason"] = interp_reason
+                        else:
+                            log_msg(f"      [FALLBACK: cid_gap] {resolved_subset} (last page {target_last_page} invalid or has next page)")
+                            if isinstance(interpolation_stats_out, dict):
+                                interpolation_stats_out["reason"] = "cid_gap"
+                    else:
+                        log_msg(f"      [FALLBACK: cid_gap] {resolved_subset} (last page {target_last_page} fetch failed)")
+                        if isinstance(interpolation_stats_out, dict):
+                            interpolation_stats_out["reason"] = "cid_gap"
+                can_interpolate = False
 
         if page_info_callback is not None:
             if page_idx == 1:
@@ -4468,6 +4749,17 @@ def scrape_tcdb_checklist_set(
             log_msg(f"        [Card #{cnum}] {plr} [{sub_n} | CID none] -> No TCDB image available")
             return
         if not f_thumb:
+            if str(c_row.get("_image_source") or "") == "interpolated":
+                f_fname, b_fname = build_template_image_filenames(checklist_set_name, sub_n, cnum, plr, cid)
+                f_path = target_set_dir / f_fname
+                b_path = target_set_dir / b_fname
+                if _check_or_rename_existing_cid_file(disk_cid_index, cid, "F", f_path):
+                    img_stats["front_skip"] += 1
+                    c_row["Front_Downloaded"] = "Yes"
+                if _check_or_rename_existing_cid_file(disk_cid_index, cid, "B", b_path):
+                    img_stats["back_skip"] += 1
+                    c_row["Back_Downloaded"] = "Yes"
+                return
             if b_thumb:
                 img_stats["back_only_skip"] += 1
                 img_stats["no_img"] += 1
@@ -4727,7 +5019,15 @@ def scrape_tcdb_checklist_set(
     known_sub_counts = dict((p_ctx.get("active_set_subset_counts") or {}))
     set_cards_processed = 0
 
-    def _run_subset_with_telemetry(sub_url: str, sub_lbl: str, expected_cards: int = 0, pre_page1_html: Optional[str] = None) -> list[dict]:
+    def _run_subset_with_telemetry(
+        sub_url: str,
+        sub_lbl: str,
+        expected_cards: int = 0,
+        pre_page1_html: Optional[str] = None,
+        parent_cards: Optional[list[dict]] = None,
+        existing_local_by_cid: Optional[dict[str, dict]] = None,
+        interpolation_stats_out: Optional[dict] = None,
+    ) -> list[dict]:
         nonlocal set_cards_processed
         sub_t0 = time.time()
         init_sub_tot = max(1, int(expected_cards or known_sub_counts.get(sub_lbl, 0) or 100))
@@ -4804,6 +5104,9 @@ def scrape_tcdb_checklist_set(
             page_info_callback=_on_page_info,
             prefetched_page1_html=pre_page1_html,
             known_subset_total=sub_state["pre_est"],
+            parent_cards=parent_cards,
+            existing_local_by_cid=existing_local_by_cid,
+            interpolation_stats_out=interpolation_stats_out,
         )
         # Reconcile any remaining gap between estimated subset total and actual extracted rows
         actual_sub_cards = len(rows_out)
@@ -4856,8 +5159,25 @@ def scrape_tcdb_checklist_set(
 
     subsets_skipped = 0
     subsets_fetched = 0
+    subsets_interpolated = 0
+    pages_saved_by_interpolation = 0
     changed_since_flush = 0
     set_csv_checkpoint = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(canonicalize_checklist_set_title(checklist_set_name))}.csv"
+
+    parent_cards_pool: dict[str, tuple[str, list[dict]]] = {}
+
+    def _register_parent_subset(sub_name: str, rows_list: list[dict], from_csv: bool = False):
+        if not rows_list:
+            return
+        deduped = _dedupe_physical_parent_cards(rows_list, sort_by_cid=from_csv)
+        if len(deduped) >= 3:
+            disp = str(rows_list[0].get("Subset") or sub_name).strip() or sub_name
+            parent_cards_pool[canonical_subset_key(disp)] = (disp, deduped)
+
+    if local_rows_by_key:
+        for _sk_loc, _rows_loc in local_rows_by_key.items():
+            if _rows_loc:
+                _register_parent_subset(str(_rows_loc[0].get("Subset") or _sk_loc), _rows_loc, from_csv=True)
 
     def _subset_is_complete_and_unchanged(
         sid_key: str,
@@ -4931,6 +5251,7 @@ def scrape_tcdb_checklist_set(
         p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
         p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_base_rows)
         subset_rows_store[canonical_subset_key("Base")] = local_base_rows
+        _register_parent_subset("Base", local_base_rows, from_csv=True)
         pend_imgs = _download_missing_images_for_skipped_subset("Base") if download_images_card_by_card else 0
         learner.record_subset_duration(mode_key_cur, time.time() - base_skip_t0, card_count=len(local_base_rows), was_skipped=True)
         if pend_imgs > 0:
@@ -4943,6 +5264,7 @@ def scrape_tcdb_checklist_set(
         base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
         subset_rows_store[canonical_subset_key("Base")] = base_rows
         if base_rows:
+            _register_parent_subset("Base", base_rows, from_csv=False)
             _record_subset_checkpoint(base_sid, urls["checklist"], "Base", base_expected or len(base_rows), base_rows, is_base=True)
             changed_since_flush += 1
         log_msg(f"  + Base Set: {len(base_rows)} card rows extracted (with TCDB_CIDs).")
@@ -5009,6 +5331,7 @@ def scrape_tcdb_checklist_set(
                     p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
                     p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_sub_rows)
                     subset_rows_store[canonical_subset_key(fallback_label)] = local_sub_rows
+                    _register_parent_subset(fallback_label, local_sub_rows, from_csv=True)
                     pend_ins_imgs = _download_missing_images_for_skipped_subset(fallback_label) if download_images_card_by_card else 0
                     learner.record_subset_duration(mode_key_cur, time.time() - sub_skip_t0, card_count=len(local_sub_rows), was_skipped=True)
                     if pend_ins_imgs > 0:
@@ -5019,10 +5342,33 @@ def scrape_tcdb_checklist_set(
 
                 log_msg(f"    [{idx}/{len(insert_by_sid)}] [QUEUE: {sub_reason}] {fallback_label} ({sub_detail})")
                 subsets_fetched += 1
-                sub_rows = _run_subset_with_telemetry(ins_url, fallback_label, expected_cards=exp_ins_cards)
+                _parent_name, resolved_parent_cards = _resolve_parallel_parent_subset(
+                    fallback_label,
+                    parent_cards_pool,
+                    expected_cards=exp_ins_cards,
+                )
+                sub_local_rows = _lookup_local_subset_rows(local_rows_by_key, fallback_label)
+                sub_local_by_cid = {
+                    normalize_numeric_tcdb_cid(r.get("TCDB_CID", "")): r
+                    for r in sub_local_rows
+                    if normalize_numeric_tcdb_cid(r.get("TCDB_CID", "")) not in ("", "0")
+                }
+                interp_stats: dict = {"interpolated": False, "pages_saved": 0, "reason": ""}
+                sub_rows = _run_subset_with_telemetry(
+                    ins_url,
+                    fallback_label,
+                    expected_cards=exp_ins_cards,
+                    parent_cards=resolved_parent_cards or None,
+                    existing_local_by_cid=sub_local_by_cid or None,
+                    interpolation_stats_out=interp_stats,
+                )
+                if interp_stats.get("interpolated"):
+                    subsets_interpolated += 1
+                    pages_saved_by_interpolation += int(interp_stats.get("pages_saved") or 0)
                 resolved_lbl = sub_rows[0]["Subset"] if sub_rows else fallback_label
                 if sub_rows:
                     subset_rows_store[canonical_subset_key(resolved_lbl)] = sub_rows
+                    _register_parent_subset(resolved_lbl, sub_rows, from_csv=False)
                     _record_subset_checkpoint(sid_k, ins_url, resolved_lbl, exp_ins_cards or len(sub_rows), sub_rows, is_base=False)
                     changed_since_flush += 1
                 log_msg(f"    [{idx}/{len(insert_by_sid)}] {resolved_lbl}: {len(sub_rows)} rows extracted.")
@@ -5100,7 +5446,8 @@ def scrape_tcdb_checklist_set(
     if download_images_card_by_card:
         log_msg(
             f"  ✅ Combined Card-by-Card Complete for '{checklist_set_name}': {len(final_df):,} unique rows "
-            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped) | "
+            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped, "
+            f"{subsets_interpolated} interpolated, {pages_saved_by_interpolation} page(s) saved) | "
             f"Downloaded {img_stats['front_dl']:,} Fronts, {img_stats['back_dl']:,} Backs "
             f"(Skipped existing: {img_stats['front_skip']:,}F/{img_stats['back_skip']:,}B | "
             f"Back-Only skipped: {img_stats['back_only_skip']:,} | NoBack skipped: {img_stats['no_back']:,} | No TCDB img: {img_stats['no_img']:,})."
@@ -5108,7 +5455,8 @@ def scrape_tcdb_checklist_set(
     else:
         log_msg(
             f"  ✅ TCDB Checklist Complete for '{checklist_set_name}': {len(final_df):,} unique card rows "
-            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped)!"
+            f"(Subsets: {subsets_fetched} fetched, {subsets_skipped} skipped, "
+            f"{subsets_interpolated} interpolated, {pages_saved_by_interpolation} page(s) saved)!"
         )
     return final_df, all_raw_rows
 
