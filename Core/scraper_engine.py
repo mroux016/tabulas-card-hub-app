@@ -179,6 +179,11 @@ CLOUDFLARE_COOLDOWN_SCHEDULE_S = (900.0, 1800.0, 3600.0)
 _LOG_CALLBACK: Optional[Callable[[str], None]] = None
 _PROGRESS_CALLBACK: Optional[Callable[[dict], None]] = None
 _STOP_CHECK_CALLBACK: Optional[Callable[[], bool]] = None
+_PAUSE_CHECK_CALLBACK: Optional[Callable[[], bool]] = None
+_PAUSE_STATE_CALLBACK: Optional[Callable[[bool, str], None]] = None
+
+DEFAULT_MAX_CLEARANCE_FAILURES = 3
+DEFAULT_PREFLIGHT_IMAGE_URL = "https://www.tcdb.com/Images/Large/Baseball/100/100-1Fr.jpg"
 
 
 def set_log_callback(cb: Optional[Callable[[str], None]]):
@@ -196,6 +201,16 @@ def set_stop_check_callback(cb: Optional[Callable[[], bool]]):
     _STOP_CHECK_CALLBACK = cb
 
 
+def set_pause_check_callback(cb: Optional[Callable[[], bool]]):
+    global _PAUSE_CHECK_CALLBACK
+    _PAUSE_CHECK_CALLBACK = cb
+
+
+def set_pause_state_callback(cb: Optional[Callable[[bool, str], None]]):
+    global _PAUSE_STATE_CALLBACK
+    _PAUSE_STATE_CALLBACK = cb
+
+
 def is_stop_requested() -> bool:
     if _STOP_CHECK_CALLBACK is not None:
         try:
@@ -203,6 +218,67 @@ def is_stop_requested() -> bool:
         except Exception:
             return False
     return False
+
+
+def is_pause_requested() -> bool:
+    if _PAUSE_CHECK_CALLBACK is not None:
+        try:
+            return bool(_PAUSE_CHECK_CALLBACK())
+        except Exception:
+            return False
+    return False
+
+
+def request_auto_pause(reason: str):
+    msg = str(reason or "Auto-paused by scraper").strip()
+    log_msg(f"⏸️ [AUTO-PAUSED] {msg}")
+    emit_progress(current_item=msg)
+    if _PAUSE_STATE_CALLBACK is not None:
+        try:
+            _PAUSE_STATE_CALLBACK(True, msg)
+        except Exception:
+            pass
+
+
+def wait_if_paused(
+    poll_interval: float = 0.5,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    reason: str = "",
+) -> bool:
+    """
+    Cooperatively pauses the calling worker while `is_pause_requested()` is True.
+    Returns True if not paused or resumed cleanly; returns False if stop was requested.
+    """
+    if is_stop_requested():
+        return False
+    if not is_pause_requested():
+        return True
+
+    pause_msg = str(reason or "Paused by user — click Resume to continue").strip()
+    if _PAUSE_STATE_CALLBACK is not None:
+        try:
+            _PAUSE_STATE_CALLBACK(True, pause_msg)
+        except Exception:
+            pass
+    log_msg(f"⏸️ Worker paused ({pause_msg}). Waiting for Resume or Stop...")
+    emit_progress(current_item=pause_msg)
+
+    interval = max(0.05, float(poll_interval))
+    while is_pause_requested():
+        if is_stop_requested():
+            log_msg("🛑 Stop requested while paused; exiting cleanly.")
+            return False
+        sleep_fn(interval)
+
+    if is_stop_requested():
+        return False
+    if _PAUSE_STATE_CALLBACK is not None:
+        try:
+            _PAUSE_STATE_CALLBACK(False, "")
+        except Exception:
+            pass
+    log_msg("▶️ Worker resumed!")
+    return True
 
 
 def emit_progress(**kwargs):
@@ -445,10 +521,148 @@ def sanitize_header_value(val):
     return quote(strip_accents(val), safe=":/?=&%-")
 
 
-def connect_session(existing_session=None, max_attempts: int = 5, target_domain: str = BASE_URL):
+def preflight_probe_tcdb_images(
+    req_session,
+    test_image_url: str = "",
+    timeout: float = 15.0,
+    allow_404_as_ok: bool = False,
+) -> dict:
+    """
+    Lightweight Pre-Flight Probe verifying that the active session's `cf_clearance` cookie,
+    exact User-Agent, and egress path can reach `/Images/Large/...` without a Cloudflare 403 block.
+    Distinguishes: `200_ok`, `403_cf_block`, `503_origin_overload`, `404_not_found`, and `timeout`.
+    """
+    probe_url = str(test_image_url or DEFAULT_PREFLIGHT_IMAGE_URL).strip()
+    cookies_obj = getattr(req_session, "cookies", None)
+    has_cf_clearance = False
+    try:
+        if isinstance(cookies_obj, dict):
+            has_cf_clearance = bool(cookies_obj.get("cf_clearance"))
+        elif cookies_obj is not None:
+            has_cf_clearance = bool(cookies_obj.get("cf_clearance", None))
+    except Exception:
+        has_cf_clearance = False
+
+    headers_obj = getattr(req_session, "headers", None) or {}
+    ua = ""
+    try:
+        ua = str(headers_obj.get("User-Agent") or headers_obj.get("user-agent") or "")
+    except Exception:
+        ua = ""
+
+    t0 = time.time()
+    try:
+        res = req_session.get(probe_url, headers={"Referer": BASE_URL + "/"}, timeout=timeout)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        code = int(getattr(res, "status_code", 0) or 0)
+        ct = str((getattr(res, "headers", None) or {}).get("Content-Type", "")).lower()
+        body_head = str(getattr(res, "text", "") or "")[:600]
+
+        if code == 200 and ("image" in ct or ("Just a moment..." not in body_head and "cf-browser-verification" not in body_head)):
+            msg = f"[PREFLIGHT OK] /Images/Large/ returned HTTP 200 ({elapsed_ms}ms, cf_clearance={has_cf_clearance})"
+            log_msg(f"  ✅ {msg}")
+            return {
+                "ok": True,
+                "status_code": 200,
+                "classification": "200_ok",
+                "url": probe_url,
+                "has_cf_clearance": has_cf_clearance,
+                "user_agent": ua,
+                "elapsed_ms": elapsed_ms,
+                "message": msg,
+            }
+        if code == 403 or (code == 200 and ("Just a moment..." in body_head or "cf-browser-verification" in body_head)):
+            msg = "[PREFLIGHT BLOCKED: /Images/Large/ returned HTTP 403]"
+            log_msg(f"  🛡️ {msg}")
+            return {
+                "ok": False,
+                "status_code": 403,
+                "classification": "403_cf_block",
+                "url": probe_url,
+                "has_cf_clearance": has_cf_clearance,
+                "user_agent": ua,
+                "elapsed_ms": elapsed_ms,
+                "message": msg,
+            }
+        if code == 503:
+            msg = f"[PREFLIGHT DEGRADED: /Images/Large/ returned HTTP 503 Origin-Overload ({elapsed_ms}ms)]"
+            log_msg(f"  ⚠️ {msg}")
+            return {
+                "ok": False,
+                "status_code": 503,
+                "classification": "503_origin_overload",
+                "url": probe_url,
+                "has_cf_clearance": has_cf_clearance,
+                "user_agent": ua,
+                "elapsed_ms": elapsed_ms,
+                "message": msg,
+            }
+        if code == 404:
+            msg = f"[PREFLIGHT 404] /Images/Large/ probe asset returned HTTP 404 (CF edge reachable, {elapsed_ms}ms)"
+            log_msg(f"  ℹ️ {msg}")
+            return {
+                "ok": bool(allow_404_as_ok),
+                "status_code": 404,
+                "classification": "404_not_found",
+                "url": probe_url,
+                "has_cf_clearance": has_cf_clearance,
+                "user_agent": ua,
+                "elapsed_ms": elapsed_ms,
+                "message": msg,
+            }
+        msg = f"[PREFLIGHT WARN: /Images/Large/ returned HTTP {code} ({elapsed_ms}ms)]"
+        log_msg(f"  ⚠️ {msg}")
+        return {
+            "ok": False,
+            "status_code": code,
+            "classification": f"http_{code}",
+            "url": probe_url,
+            "has_cf_clearance": has_cf_clearance,
+            "user_agent": ua,
+            "elapsed_ms": elapsed_ms,
+            "message": msg,
+        }
+    except Exception as e:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        err_s = str(e) or type(e).__name__
+        err_low = err_s.lower()
+        is_to = isinstance(e, TimeoutError) or ("timed out" in err_low) or ("timeout" in err_low) or ("(28)" in err_low)
+        cls = "timeout" if is_to else "network_error"
+        msg = (
+            f"[PREFLIGHT TIMEOUT: /Images/Large/ timed out ({elapsed_ms}ms)]"
+            if is_to
+            else f"[PREFLIGHT ERROR: /Images/Large/ failed ({err_s.splitlines()[0]})]"
+        )
+        log_msg(f"  ⚠️ {msg}")
+        return {
+            "ok": False,
+            "status_code": 0,
+            "classification": cls,
+            "url": probe_url,
+            "has_cf_clearance": has_cf_clearance,
+            "user_agent": ua,
+            "elapsed_ms": elapsed_ms,
+            "message": msg,
+        }
+
+
+def connect_session(
+    existing_session=None,
+    max_attempts: int = 5,
+    target_domain: str = BASE_URL,
+    clearance_timeout_s: float = 20.0,
+    run_preflight: bool = True,
+    preflight_image_url: str = "",
+    rotate_profile: bool = False,
+    max_clearance_failures: int = DEFAULT_MAX_CLEARANCE_FAILURES,
+):
     """
     Launches SeleniumBase UC mode to clear Cloudflare on `target_domain`, extracts
     `cf_clearance` cookies and User-Agent, and injects them into `curl_cffi.requests.Session`.
+    Waits explicitly up to `clearance_timeout_s` (default 20s) for real TCDB page readiness
+    (stopping early as soon as ready), preserves healthy cookies/profile unless recovering
+    from failure, runs a `/Images/Large/` pre-flight probe, and auto-pauses after
+    `max_clearance_failures` consecutive clearance/preflight failures.
     """
     log_msg(f"🚀 Launching Stealth Browser to clear Cloudflare ({target_domain})...")
 
@@ -460,16 +674,33 @@ def connect_session(existing_session=None, max_attempts: int = 5, target_domain:
             return cffi_requests.Session(impersonate="chrome120")
         return requests.Session()
 
-    for attempt in range(1, max_attempts + 1):
+    consecutive_clearance_failures = 0
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
         if is_stop_requested():
             raise CloudflareEdgeBlockPaused("Cancelled during stealth browser launch")
+        if not wait_if_paused(reason="Paused before stealth browser launch"):
+            raise CloudflareEdgeBlockPaused("Stopped while paused during stealth browser launch")
+
+        use_fresh_profile = bool(rotate_profile or attempt > 1)
+        temp_profile_dir: Optional[str] = None
         try:
             cleanup_orphaned_drivers()
             time.sleep(1.5)
 
             session_pids: list[int] = []
+            sb_kwargs: dict = {"uc": True, "window_size": "800,1000"}
+            if use_fresh_profile:
+                temp_profile_dir = tempfile.mkdtemp(prefix="tcdb_uc_prof_")
+                sb_kwargs["user_data_dir"] = temp_profile_dir
+                log_msg("  🔄 Rotating to fresh isolated Stealth Browser profile for recovery...")
+
+            clearance_ready = False
+            cookies: dict[str, str] = {}
+            ua = ""
             try:
-                with SB(uc=True, window_size="800,1000") as sb:
+                with SB(**sb_kwargs) as sb:
                     try:
                         svc = getattr(getattr(sb, "driver", None), "service", None)
                         svc_proc = getattr(svc, "process", None)
@@ -484,37 +715,100 @@ def connect_session(existing_session=None, max_attempts: int = 5, target_domain:
                         pass
 
                     sb.uc_open_with_reconnect(target_domain, 5)
-                    log_msg(f"⏳ Waiting 10 seconds for Cloudflare clearance (Attempt {attempt}/{max_attempts})...")
-                    sb.sleep(10)
+                    max_wait = max(1.0, float(clearance_timeout_s or 20.0))
+                    log_msg(f"⏳ Waiting up to {int(round(max_wait))}s for explicit TCDB Cloudflare clearance (Attempt {attempt}/{max_attempts})...")
+                    wait_t0 = time.time()
+                    while (time.time() - wait_t0) < max_wait:
+                        if is_stop_requested():
+                            raise CloudflareEdgeBlockPaused("Cancelled during Cloudflare clearance wait")
+                        if not wait_if_paused(reason="Paused during Cloudflare clearance wait"):
+                            raise CloudflareEdgeBlockPaused("Stopped while paused during Cloudflare clearance")
+                        try:
+                            if sb.driver.window_handles:
+                                sb.driver.switch_to.window(sb.driver.window_handles[-1])
+                            cur_cookies = {c["name"]: c["value"] for c in (sb.driver.get_cookies() or [])}
+                            title_s = str(getattr(sb.driver, "title", "") or "")
+                            src_head = str(getattr(sb.driver, "page_source", "") or "")[:1200]
+                            ready_state = str(sb.driver.execute_script("return document.readyState;") or "")
+                            is_cf_page = (
+                                "just a moment" in title_s.lower()
+                                or "cf-browser-verification" in src_head.lower()
+                                or "just a moment..." in src_head.lower()
+                            )
+                            has_clearance = bool(cur_cookies.get("cf_clearance"))
+                            if not is_cf_page and (has_clearance or (ready_state in ("interactive", "complete") and len(src_head) > 100)):
+                                clearance_ready = True
+                                elapsed_c = time.time() - wait_t0
+                                log_msg(f"  ✅ TCDB page ready in {elapsed_c:.1f}s (cf_clearance={has_clearance}).")
+                                break
+                        except CloudflareEdgeBlockPaused:
+                            raise
+                        except Exception:
+                            pass
+                        sb.sleep(1.0)
 
                     if sb.driver.window_handles:
                         sb.driver.switch_to.window(sb.driver.window_handles[-1])
 
-                    cookies = {cookie["name"]: cookie["value"] for cookie in sb.driver.get_cookies()}
+                    cookies = {cookie["name"]: cookie["value"] for cookie in (sb.driver.get_cookies() or [])}
                     ua = sb.driver.execute_script("return navigator.userAgent;")
             finally:
                 for spid in session_pids:
                     unregister_driver_pid(spid)
+                if temp_profile_dir:
+                    shutil.rmtree(temp_profile_dir, ignore_errors=True)
+
+            if not clearance_ready and not cookies.get("cf_clearance"):
+                raise RuntimeError(f"Cloudflare clearance timed out after {int(round(max_wait))}s")
 
             if existing_session is not None:
-                existing_session.cookies.clear()
+                if use_fresh_profile:
+                    existing_session.cookies.clear()
                 existing_session.headers.update({"User-Agent": ua})
                 existing_session.cookies.update(cookies)
-                log_msg("✅ Cloudflare session refreshed in-place!")
-                return existing_session
+                target_sess = existing_session
             else:
-                req_session = cffi_requests.Session(impersonate="chrome120") if cffi_requests is not None else requests.Session()
-                req_session.headers.update({"User-Agent": ua})
-                req_session.cookies.update(cookies)
+                target_sess = cffi_requests.Session(impersonate="chrome120") if cffi_requests is not None else requests.Session()
+                target_sess.headers.update({"User-Agent": ua})
+                target_sess.cookies.update(cookies)
+
+            if run_preflight:
+                probe = preflight_probe_tcdb_images(
+                    target_sess,
+                    test_image_url=preflight_image_url,
+                    allow_404_as_ok=True,
+                )
+                if probe.get("classification") == "403_cf_block":
+                    raise RuntimeError(probe.get("message") or "Pre-flight /Images/Large/ returned HTTP 403")
+
+            if existing_session is not None:
+                log_msg("✅ Cloudflare session refreshed in-place!")
+            else:
                 log_msg("✅ Cloudflare clearance acquired!")
-                return req_session
+            return target_sess
 
         except CloudflareEdgeBlockPaused:
             raise
         except Exception as e:
+            consecutive_clearance_failures += 1
             err_line = str(e).splitlines()[0] if str(e) else "Unknown Error"
-            wait_s = 4 * attempt
             cleanup_orphaned_drivers()
+            if consecutive_clearance_failures >= max(1, int(max_clearance_failures or DEFAULT_MAX_CLEARANCE_FAILURES)):
+                pause_msg = (
+                    f"Auto-paused after {consecutive_clearance_failures} clearance failures — "
+                    f"switch VPN node or clear CAPTCHA, then click Resume"
+                )
+                request_auto_pause(pause_msg)
+                if _PAUSE_CHECK_CALLBACK is not None and is_pause_requested():
+                    resumed = wait_if_paused(reason=pause_msg)
+                    if resumed:
+                        consecutive_clearance_failures = 0
+                        rotate_profile = True
+                        attempt = 0
+                        continue
+                raise CloudflareEdgeBlockPaused(pause_msg)
+
+            wait_s = 4 * attempt
             log_msg(f"  ⚠️ Stealth browser handshake failed ({err_line}). Retrying in {wait_s}s ({attempt}/{max_attempts})...")
             time.sleep(wait_s)
 
@@ -567,12 +861,17 @@ class CloudflareImageCircuitBreaker:
         self.cooldown_stage = 0
 
     def interruptible_sleep(self, seconds: float, reason: str = "") -> bool:
+        if not wait_if_paused(poll_interval=self.stop_poll_interval, sleep_fn=self.sleep_fn, reason=reason):
+            return False
         remaining = max(0.0, float(seconds))
         while remaining > 0.0:
             if self._is_stopped():
                 if reason:
                     log_msg(f"🛑 Stop requested during {reason}; exiting cleanly.")
                 return False
+            if is_pause_requested():
+                if not wait_if_paused(poll_interval=self.stop_poll_interval, sleep_fn=self.sleep_fn, reason=reason):
+                    return False
             chunk = min(self.stop_poll_interval, remaining)
             self.sleep_fn(chunk)
             remaining -= chunk
@@ -697,6 +996,8 @@ def safe_get(
     while net_attempt < retries:
         if is_stop_requested():
             raise CloudflareEdgeBlockPaused("Cancelled during HTTP fetch")
+        if not wait_if_paused(reason="Paused before HTTP fetch"):
+            raise CloudflareEdgeBlockPaused("Stopped while paused during HTTP fetch")
         learner.wait_before_request(ep_key)
         t0 = time.time()
         try:
@@ -786,10 +1087,10 @@ def safe_get(
         except (StealthBrowserError, CloudflareEdgeBlockPaused):
             raise
         except Exception as e:
-            _record_status(0, "network_error")
+            err_line = str(e).splitlines()[0] if str(e) else type(e).__name__
+            _record_status(0, err_line)
             net_attempt += 1
             elapsed_ms = int((time.time() - t0) * 1000)
-            err_line = str(e).splitlines()[0] if str(e) else type(e).__name__
             log_msg(f"  🔌 [Conn Error | {elapsed_ms}ms] {clean_url} ({net_attempt}/{retries}): {err_line}")
             if net_attempt == 3:
                 connect_session(existing_session=req_session, target_domain=BASE_URL)
@@ -2843,6 +3144,49 @@ def compute_subset_rows_checksum(rows: list[dict]) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def normalize_subset_name_for_diff(subset_name: str) -> str:
+    """
+    Normalizes subset names consistently for live TCDB vs local CSV/checkpoint comparison:
+    - strips accents and lowercases
+    - normalizes `&` -> ` and `, `_`/`-` -> spaces, collapses whitespace
+    - maps common Base aliases to `base`
+    """
+    s = strip_accents(str(subset_name or "Base")).lower().strip()
+    s = s.replace("&", " and ").replace("_", " ").replace("-", " ")
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if s in (
+        "",
+        "base",
+        "base set",
+        "base rookie",
+        "base rookies",
+        "base veteran",
+        "base veterans",
+        "base veteran combos",
+        "base rookie debut",
+    ):
+        return "base"
+    if s.startswith("base ") and not s.startswith("base paper"):
+        s = s[5:].strip()
+    return s or "base"
+
+
+def _lookup_local_subset_rows(local_rows_by_key: dict[str, list[dict]], sub_label: str) -> list[dict]:
+    if not local_rows_by_key:
+        return []
+    sub_k = canonical_subset_key(sub_label)
+    if sub_k in local_rows_by_key:
+        return local_rows_by_key[sub_k]
+    target_norm = normalize_subset_name_for_diff(sub_label)
+    for k_loc, rows_loc in local_rows_by_key.items():
+        if normalize_subset_name_for_diff(k_loc) == target_norm:
+            return rows_loc
+        if rows_loc and normalize_subset_name_for_diff(str(rows_loc[0].get("Subset") or "")) == target_norm:
+            return rows_loc
+    return []
+
+
 def _load_local_set_csv_rows_by_subset(
     chk_title: str,
     folder_name: str = "",
@@ -2912,7 +3256,9 @@ def _try_bootstrap_subset_checkpoint(
         "subset_url": str(subset_url),
         "is_base": bool(is_base),
         "expected_cards": int(expected_cards),
+        "tcdb_reported_count": int(expected_cards),
         "scraped_cards": len(local_rows),
+        "local_deduped_count": len(local_rows),
         "imaged_fronts_on_tcdb": imaged_f,
         "imaged_backs_on_tcdb": imaged_b,
         "rows_sha256": compute_subset_rows_checksum(local_rows),
@@ -4100,9 +4446,12 @@ def scrape_tcdb_checklist_set(
     dead_fronts_dirty = False
     img_circuit_breaker = CloudflareImageCircuitBreaker(stop_check=is_stop_requested) if download_images_card_by_card else None
     img_stats = {"front_dl": 0, "back_dl": 0, "front_skip": 0, "back_skip": 0, "no_back": 0, "back_only_skip": 0, "no_img": 0, "cards_seen": 0}
+    overload_state = {"consecutive": 0}
 
     def _download_card_immediately(c_row: dict):
         nonlocal dead_backs_dirty, dead_fronts_dirty
+        if not wait_if_paused(reason="Paused during card-by-card download"):
+            raise CloudflareEdgeBlockPaused("Stopped while paused")
         img_stats["cards_seen"] += 1
         cid = str(c_row.get("TCDB_CID") or "").strip()
         sub_n = str(c_row.get("Subset") or "Base").strip() or "Base"
@@ -4173,6 +4522,8 @@ def scrape_tcdb_checklist_set(
 
         q_f_winner = ""
         has_front = False
+        f_out: dict = {}
+        b_out: dict = {}
         existing_f_note = _check_or_rename_existing_cid_file(disk_cid_index, cid, "F", f_path)
         if existing_f_note:
             has_front = True
@@ -4185,7 +4536,6 @@ def scrape_tcdb_checklist_set(
             img_stats["no_img"] += 1
             f_note = "Skip(DeadFrontCached)"
         else:
-            f_out: dict = {}
             q_f = _download_single_template_side(
                 req_session,
                 f_urls["rep"],
@@ -4232,7 +4582,6 @@ def scrape_tcdb_checklist_set(
             img_stats["no_back"] += 1
             b_note = "Skip(DeadBackCached)"
         else:
-            b_out: dict = {}
             q_b = _download_single_template_side(
                 req_session,
                 b_urls["rep"],
@@ -4260,22 +4609,41 @@ def scrape_tcdb_checklist_set(
                 err_c = int(b_out.get("status_code", 0) or 0)
                 b_note = f"Err(HTTP {err_c}-Uncached)" if err_c > 0 else "Err(Net-Uncached)"
 
+        if f_out.get("transient_overload") or b_out.get("transient_overload"):
+            overload_state["consecutive"] += 1
+            if overload_state["consecutive"] >= 3:
+                log_msg("⏳ [Origin Overload Breather] 3 consecutive cards hit HTTP 503/timeout — resting 15s...")
+                if img_circuit_breaker is not None:
+                    img_circuit_breaker.interruptible_sleep(15.0, reason="503/timeout breather")
+                else:
+                    time.sleep(15.0)
+                overload_state["consecutive"] = 0
+        elif f_out.get("outcome") in ("ok", "404") or b_out.get("outcome") in ("ok", "404"):
+            overload_state["consecutive"] = 0
+
         log_msg(f"        [Card #{cnum}] {plr} [{sub_n} | CID {cid}] -> Front: {f_note} | Back: {b_note}")
 
-    def _download_missing_images_for_skipped_subset(sub_lbl: str):
-        """Downloads any missing front/back images for an unchanged subset directly from catalog."""
+    def _download_missing_images_for_skipped_subset(sub_lbl: str) -> int:
+        """Downloads any missing front/back images for an unchanged subset directly from catalog. Returns pending count attempted."""
         nonlocal dead_backs_dirty, dead_fronts_dirty
         if not download_images_card_by_card or not isinstance(catalog, dict):
-            return
+            return 0
         target_sk = canonical_subset_key(sub_lbl)
+        target_norm = normalize_subset_name_for_diff(sub_lbl)
         matched_sub_dicts = [
             cards_d for k_sub, cards_d in catalog.items()
-            if isinstance(cards_d, dict) and canonical_subset_key(str(k_sub)) == target_sk
+            if isinstance(cards_d, dict) and (
+                canonical_subset_key(str(k_sub)) == target_sk
+                or normalize_subset_name_for_diff(str(k_sub)) == target_norm
+            )
         ]
+        pending_attempted = 0
         for cards_d in matched_sub_dicts:
             for cid, entry in cards_d.items():
                 if str(cid).startswith("_") or not isinstance(entry, dict):
                     continue
+                if not wait_if_paused(reason="Paused during skipped-subset image sync"):
+                    raise CloudflareEdgeBlockPaused("Stopped while paused")
                 cid_s = str(cid).strip()
                 url_rep_f = str(entry.get("url_rep_front") or "")
                 url_std_f = str(entry.get("url_std_front") or "")
@@ -4303,6 +4671,7 @@ def scrape_tcdb_checklist_set(
                 elif cid_s in dead_fronts:
                     img_stats["no_img"] += 1
                 else:
+                    pending_attempted += 1
                     f_out: dict = {}
                     q_f = _download_single_template_side(
                         req_session, url_rep_f, url_std_f, referer, f_path,
@@ -4327,6 +4696,7 @@ def scrape_tcdb_checklist_set(
                 if _check_or_rename_existing_cid_file(disk_cid_index, cid_s, "B", b_path):
                     img_stats["back_skip"] += 1
                 elif has_front and (url_rep_b or url_std_b) and cid_s not in dead_backs:
+                    pending_attempted += 1
                     b_out: dict = {}
                     q_b = _download_single_template_side(
                         req_session, url_rep_b, url_std_b, referer, b_path,
@@ -4343,6 +4713,7 @@ def scrape_tcdb_checklist_set(
                     elif b_out.get("confirmed_404"):
                         dead_backs[cid_s] = time.time()
                         dead_backs_dirty = True
+        return pending_attempted
 
     set_t0 = time.time()
     p_ctx = progress_ctx if isinstance(progress_ctx, dict) else {
@@ -4488,11 +4859,18 @@ def scrape_tcdb_checklist_set(
     changed_since_flush = 0
     set_csv_checkpoint = SET_CHECKLISTS_DIR / f"{sanitize_filename_part(canonicalize_checklist_set_title(checklist_set_name))}.csv"
 
-    def _subset_is_complete_and_unchanged(sid_key: str, sub_url: str, sub_label: str, expected_cards: int, is_base: bool = False) -> tuple[bool, list[dict]]:
+    def _subset_is_complete_and_unchanged(
+        sid_key: str,
+        sub_url: str,
+        sub_label: str,
+        expected_cards: int,
+        is_base: bool = False,
+    ) -> tuple[bool, list[dict], str, str]:
+        local_rows = _lookup_local_subset_rows(local_rows_by_key, sub_label)
         if not incremental or force_refresh:
-            return False, []
-        sub_k = canonical_subset_key(sub_label)
-        local_rows = local_rows_by_key.get(sub_k, [])
+            return False, [], "force_refresh", f"local={len(local_rows)}, tcdb={expected_cards}"
+        if not local_rows:
+            return False, [], "missing_locally", f"local=0 vs tcdb={expected_cards}"
         cp_entry = (checkpoint.get("subsets") or {}).get(str(sid_key))
         if cp_entry is None and local_rows:
             cp_entry = _try_bootstrap_subset_checkpoint(
@@ -4500,23 +4878,41 @@ def scrape_tcdb_checklist_set(
             )
             if cp_entry is not None:
                 save_set_checkpoint(checklist_set_name, checkpoint)
-        if not isinstance(cp_entry, dict) or cp_entry.get("status") != "complete" or not local_rows:
-            return False, []
-        if expected_cards > 0 and len(local_rows) != expected_cards:
-            return False, []
+        if not isinstance(cp_entry, dict) or cp_entry.get("status") != "complete":
+            if expected_cards > 0 and len(local_rows) != expected_cards:
+                return False, [], "count_mismatch", f"local_raw={len(local_rows)} vs tcdb={expected_cards}"
+            return False, [], "missing_checkpoint", f"local={len(local_rows)}, tcdb={expected_cards}"
+
+        saved_tcdb_reported = int(cp_entry.get("tcdb_reported_count") or cp_entry.get("expected_cards") or 0)
+        saved_deduped = int(cp_entry.get("local_deduped_count") or cp_entry.get("scraped_cards") or 0)
+        count_matches = (
+            expected_cards <= 0
+            or len(local_rows) == expected_cards
+            or (
+                saved_tcdb_reported > 0
+                and saved_tcdb_reported == expected_cards
+                and (saved_deduped <= 0 or len(local_rows) == saved_deduped)
+            )
+        )
+        if not count_matches:
+            return False, [], "count_mismatch", f"local_raw={len(local_rows)} vs tcdb={expected_cards}"
         if compute_subset_rows_checksum(local_rows) != cp_entry.get("rows_sha256"):
-            return False, []
-        return True, local_rows
+            return False, [], "checksum_changed", f"local={len(local_rows)}, tcdb={expected_cards}"
+        reported_disp = expected_cards or saved_tcdb_reported or len(local_rows)
+        return True, local_rows, "unchanged", f"local={len(local_rows)}, tcdb_reported={reported_disp}"
 
     def _record_subset_checkpoint(sid_key: str, sub_url: str, sub_label: str, expected_cards: int, rows_list: list[dict], is_base: bool = False):
         imaged_f = sum(1 for r in rows_list if "front" in str(r.get("TCDB_Image_Status") or "").lower())
         imaged_b = sum(1 for r in rows_list if "back" in str(r.get("TCDB_Image_Status") or "").lower() and "no back" not in str(r.get("TCDB_Image_Status") or "").lower())
+        tcdb_rep = int(expected_cards or len(rows_list))
         checkpoint.setdefault("subsets", {})[str(sid_key)] = {
             "subset_name": str(sub_label),
             "subset_url": str(sub_url),
             "is_base": bool(is_base),
-            "expected_cards": int(expected_cards or len(rows_list)),
+            "expected_cards": tcdb_rep,
+            "tcdb_reported_count": tcdb_rep,
             "scraped_cards": len(rows_list),
+            "local_deduped_count": len(rows_list),
             "imaged_fronts_on_tcdb": imaged_f,
             "imaged_backs_on_tcdb": imaged_b,
             "rows_sha256": compute_subset_rows_checksum(rows_list),
@@ -4528,16 +4924,21 @@ def scrape_tcdb_checklist_set(
 
     base_sid = extract_tcdb_sid(urls["checklist"]) or "base"
     base_expected = int(p_ctx.get("active_set_base_cards") or known_sub_counts.get("Base", 0) or 0)
-    base_skip, local_base_rows = _subset_is_complete_and_unchanged(base_sid, urls["checklist"], "Base", base_expected, is_base=True)
+    base_skip_t0 = time.time()
+    base_skip, local_base_rows, base_reason, base_detail = _subset_is_complete_and_unchanged(base_sid, urls["checklist"], "Base", base_expected, is_base=True)
     if base_skip:
         subsets_skipped += 1
         p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
         p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_base_rows)
         subset_rows_store[canonical_subset_key("Base")] = local_base_rows
-        if download_images_card_by_card:
-            _download_missing_images_for_skipped_subset("Base")
-        log_msg(f"  [SKIP-UNCHANGED] Base Set: {len(local_base_rows)} cards verified from checkpoint/CSV.")
+        pend_imgs = _download_missing_images_for_skipped_subset("Base") if download_images_card_by_card else 0
+        learner.record_subset_duration(mode_key_cur, time.time() - base_skip_t0, card_count=len(local_base_rows), was_skipped=True)
+        if pend_imgs > 0:
+            log_msg(f"  [QUEUE: new_images] Base ({pend_imgs} pending image(s); {base_detail})")
+        else:
+            log_msg(f"  [SKIP] Base ({base_detail})")
     else:
+        log_msg(f"  [QUEUE: {base_reason}] Base ({base_detail})")
         subsets_fetched += 1
         base_rows = _run_subset_with_telemetry(urls["checklist"], "Base", expected_cards=base_expected, pre_page1_html=prefetched_base_html)
         subset_rows_store[canonical_subset_key("Base")] = base_rows
@@ -4597,20 +4998,26 @@ def scrape_tcdb_checklist_set(
             log_msg(f"  📑 Processing {len(insert_by_sid)} TCDB Insert/Parallel/Auto/Relic checklists for '{checklist_set_name}'.")
             flush_every = 5 if download_images_card_by_card else 10
             for idx, (sid_k, (ins_url, sub_label)) in enumerate(insert_by_sid.items(), 1):
+                if is_stop_requested() or not wait_if_paused(reason="Paused between subsets"):
+                    break
                 fallback_label = clean_tcdb_subset_title(sub_label, checklist_set_name=checklist_set_name) or f"Subset_{sid_k}"
                 exp_ins_cards = int(ins_counts_map.get(sid_k, 0) or known_sub_counts.get(fallback_label, 0) or 0)
-                sub_skip, local_sub_rows = _subset_is_complete_and_unchanged(sid_k, ins_url, fallback_label, exp_ins_cards)
+                sub_skip_t0 = time.time()
+                sub_skip, local_sub_rows, sub_reason, sub_detail = _subset_is_complete_and_unchanged(sid_k, ins_url, fallback_label, exp_ins_cards)
                 if sub_skip:
                     subsets_skipped += 1
                     p_ctx["completed_subsets"] = int(p_ctx.get("completed_subsets", 0)) + 1
                     p_ctx["completed_cards"] = int(p_ctx.get("completed_cards", 0)) + len(local_sub_rows)
                     subset_rows_store[canonical_subset_key(fallback_label)] = local_sub_rows
-                    if download_images_card_by_card:
-                        _download_missing_images_for_skipped_subset(fallback_label)
-                    if idx % 25 == 0 or idx == len(insert_by_sid):
-                        log_msg(f"    [{idx}/{len(insert_by_sid)}] [SKIP-UNCHANGED] {fallback_label}: {len(local_sub_rows)} rows verified.")
+                    pend_ins_imgs = _download_missing_images_for_skipped_subset(fallback_label) if download_images_card_by_card else 0
+                    learner.record_subset_duration(mode_key_cur, time.time() - sub_skip_t0, card_count=len(local_sub_rows), was_skipped=True)
+                    if pend_ins_imgs > 0:
+                        log_msg(f"    [{idx}/{len(insert_by_sid)}] [QUEUE: new_images] {fallback_label} ({pend_ins_imgs} pending image(s); {sub_detail})")
+                    else:
+                        log_msg(f"    [{idx}/{len(insert_by_sid)}] [SKIP] {fallback_label} ({sub_detail})")
                     continue
 
+                log_msg(f"    [{idx}/{len(insert_by_sid)}] [QUEUE: {sub_reason}] {fallback_label} ({sub_detail})")
                 subsets_fetched += 1
                 sub_rows = _run_subset_with_telemetry(ins_url, fallback_label, expected_cards=exp_ins_cards)
                 resolved_lbl = sub_rows[0]["Subset"] if sub_rows else fallback_label
@@ -4643,6 +5050,29 @@ def scrape_tcdb_checklist_set(
         save_dead_fronts_cache(dead_fronts)
 
     final_df = apply_excel_formulas_and_combine(all_raw_rows, checklist_set_name)
+    # Reconcile checkpoint local_deduped_count & rows_sha256 against final deduped CSV rows
+    # while preserving TCDB's raw reported count (`tcdb_reported_count`) so multiline/combo
+    # deduplication never triggers false `count_mismatch` deep-dives on subsequent runs.
+    if not final_df.empty and isinstance(checkpoint.get("subsets"), dict):
+        deduped_by_canon: dict[str, list[dict]] = defaultdict(list)
+        deduped_by_norm: dict[str, list[dict]] = defaultdict(list)
+        for rec in final_df.to_dict(orient="records"):
+            sub_disp = str(rec.get("Subset") or "Base").strip() or "Base"
+            deduped_by_canon[canonical_subset_key(sub_disp)].append(rec)
+            deduped_by_norm[normalize_subset_name_for_diff(sub_disp)].append(rec)
+        cp_reconciled = False
+        for cp_ent in checkpoint["subsets"].values():
+            if not isinstance(cp_ent, dict):
+                continue
+            s_name = str(cp_ent.get("subset_name") or "Base")
+            d_rows = deduped_by_canon.get(canonical_subset_key(s_name)) or deduped_by_norm.get(normalize_subset_name_for_diff(s_name))
+            if d_rows:
+                cp_ent.setdefault("tcdb_reported_count", int(cp_ent.get("expected_cards") or len(d_rows)))
+                cp_ent["local_deduped_count"] = len(d_rows)
+                cp_ent["rows_sha256"] = compute_subset_rows_checksum(d_rows)
+                cp_reconciled = True
+        if cp_reconciled:
+            save_set_checkpoint(checklist_set_name, checkpoint)
     # Persist exact set-level card counts and historical run duration into the ETA cache
     try:
         sub_vc_fin = {str(k): int(v) for k, v in final_df["Subset"].value_counts().items() if str(k).strip()} if not final_df.empty else {}
@@ -4830,8 +5260,12 @@ def _download_single_template_side(
                 outcome_out["outcome"] = "ok"
             return tier_code
         code = -1 if (res is not None and res.status_code == 200) else int(st.get("status_code", 0) or 0)
+        err_str = str(st.get("error") or "").lower()
+        is_timeout = (code == 0) or ("timed out" in err_str) or ("timeout" in err_str) or ("(28)" in err_str)
         probed_codes.append(code)
-        if code in (403, 429):
+        if code in (403, 429, 503) or is_timeout:
+            if isinstance(outcome_out, dict) and (code == 503 or is_timeout):
+                outcome_out["transient_overload"] = True
             break
 
     confirmed_404 = bool(probed_codes) and all(c == 404 for c in probed_codes)
@@ -4950,11 +5384,12 @@ def mode_download_all_catalog_images(
         total_subsets_all = int(pre["total_subsets"])
         est_rem_dl_all = int(pre["est_remaining_dl_cards"])
         downloaded_cards_this_run = 0
+        consecutive_overload_cards = 0
         need_card_jitter = False
         stop_run = False
 
         for idx, (set_url, folder_name) in enumerate(queue_items, 1):
-            if stop_run or is_stop_requested():
+            if stop_run or is_stop_requested() or not wait_if_paused(reason="Paused between sets"):
                 break
             set_t0 = time.time()
             chk_title = canonicalize_checklist_set_title(folder_name.replace("_", " ").strip())
@@ -5038,7 +5473,7 @@ def mode_download_all_catalog_images(
                         continue
 
                     for sub_pos, (cid, entry) in enumerate(sub_items, 1):
-                        if stop_run or is_stop_requested():
+                        if stop_run or is_stop_requested() or not wait_if_paused(reason="Paused during image download"):
                             stop_run = True
                             break
                         c_idx += 1
@@ -5092,6 +5527,8 @@ def mode_download_all_catalog_images(
                         q_f_winner = ""
                         has_front = False
                         card_downloaded = False
+                        f_out: dict = {}
+                        b_out: dict = {}
                         if existing_f:
                             has_front = True
                             skip_f += 1
@@ -5102,7 +5539,6 @@ def mode_download_all_catalog_images(
                             skip_noback += 1
                             f_status = "Skip(DeadFrontCached)"
                         elif url_rep_f or url_std_f:
-                            f_out: dict = {}
                             q_f = _download_single_template_side(
                                 req_session, url_rep_f, url_std_f, referer, f_path,
                                 set_key=folder_name, thumb_url=f_thumb_u, preferred_tier=f_hint_t,
@@ -5142,7 +5578,6 @@ def mode_download_all_catalog_images(
                             skip_noback += 1
                             b_status = "Skip(DeadBackCached)"
                         else:
-                            b_out: dict = {}
                             q_b = _download_single_template_side(
                                 req_session, url_rep_b, url_std_b, referer, b_path,
                                 set_key=folder_name, thumb_url=b_thumb_u, preferred_tier=b_hint_t or q_f_winner,
@@ -5166,6 +5601,18 @@ def mode_download_all_catalog_images(
 
                         if will_hit_network:
                             need_card_jitter = True
+
+                        if f_out.get("transient_overload") or b_out.get("transient_overload"):
+                            consecutive_overload_cards += 1
+                            if consecutive_overload_cards >= 3:
+                                log_msg("⏳ [Origin Overload Breather] 3 consecutive cards hit HTTP 503/timeout — resting 15s...")
+                                need_card_jitter = False
+                                consecutive_overload_cards = 0
+                                if not cb.interruptible_sleep(15.0, reason="503/timeout breather"):
+                                    stop_run = True
+                                    break
+                        elif f_out.get("outcome") in ("ok", "404") or b_out.get("outcome") in ("ok", "404"):
+                            consecutive_overload_cards = 0
 
                         if not f_status.startswith("Skip") or not b_status.startswith("Skip") or sub_pos == sub_tot or c_idx % 25 == 0:
                             emit_progress(
@@ -5777,11 +6224,13 @@ def _compute_set_plan_metrics_cached(
                 continue
             sk = canonical_subset_key(str(cp_ent.get("subset_name") or ""))
             loc_info = csv_by_key.get(sk)
-            exp_c = int(cp_ent.get("expected_cards") or 0)
+            exp_c = int(cp_ent.get("tcdb_reported_count") or cp_ent.get("expected_cards") or 0)
+            deduped_c = int(cp_ent.get("local_deduped_count") or cp_ent.get("scraped_cards") or 0)
+            count_ok = (exp_c <= 0 or (loc_info and (loc_info["count"] == exp_c or (deduped_c > 0 and loc_info["count"] == deduped_c))))
             if (
                 loc_info
                 and cp_ent.get("status") == "complete"
-                and (exp_c <= 0 or loc_info["count"] == exp_c)
+                and count_ok
                 and loc_info["rows_sha256"] == cp_ent.get("rows_sha256")
             ):
                 complete_keys.add(sk)
@@ -5989,6 +6438,12 @@ def build_scraper_execution_plan(
             a["skipped_dead_cached"] += m["dead_cached_skipped"]
             a["estimated_http_requests"] += m["estimated_requests"]
             set_eta_s = (m["estimated_requests"] / safe_rpm) * 60.0 if m["estimated_requests"] > 0 else 0.0
+            if mk in ("checklist_only", "checklist_and_images"):
+                inc_eta_s = learner.estimate_incremental_subsets_eta(mk, m["subsets_skipped"], m["subsets_to_update"])
+                if m["subsets_to_update"] == 0 and m["missing_fronts"] == 0 and m["missing_backs"] == 0:
+                    set_eta_s = inc_eta_s
+                else:
+                    set_eta_s = max(set_eta_s, inc_eta_s) if m["missing_fronts"] == 0 and m["missing_backs"] == 0 else set_eta_s + (m["subsets_skipped"] * float(learner.get_eta_priors(mk).get("ema_sec_per_skipped_subset", 0.2)))
             a["per_set"].append({
                 "set_url": set_url,
                 "folder_name": folder_name,
@@ -6009,7 +6464,7 @@ def build_scraper_execution_plan(
     for mk in _PLAN_MODES_CANON:
         a = agg[mk]
         reqs = a["estimated_http_requests"]
-        total_eta_s = (reqs / safe_rpm) * 60.0 if reqs > 0 else 0.0
+        total_eta_s = sum(float(ps.get("estimated_eta_seconds", 0) or 0) for ps in a["per_set"]) if a["per_set"] else ((reqs / safe_rpm) * 60.0 if reqs > 0 else 0.0)
         plans_by_mode[mk] = {
             "mode": mk,
             "force_refresh": bool(force_refresh),

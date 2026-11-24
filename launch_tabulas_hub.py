@@ -3337,6 +3337,21 @@ class _TabulasPythonApiAndReactHandler(BaseHTTPRequestHandler):
             self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
             return
 
+        if route == "/api/jobs/pause" and isinstance(payload, dict):
+            import cli
+            cli.pause_active_job(
+                lane=str(payload.get("lane") or "slot_1"),
+                reason=str(payload.get("reason") or ""),
+            )
+            self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
+            return
+
+        if route == "/api/jobs/resume" and isinstance(payload, dict):
+            import cli
+            cli.resume_active_job(lane=str(payload.get("lane") or "slot_1"))
+            self._send_json({"success": True, "lanes": _get_live_lanes_and_logs()})
+            return
+
         if route == "/api/lanes/clear" and isinstance(payload, dict):
             import cli
             lane_k = str(payload.get("lane") or "slot_1")

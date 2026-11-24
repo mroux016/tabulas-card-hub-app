@@ -5526,7 +5526,7 @@ export default function App() {
         {(() => {
           const isSlotInUse = (lk) => {
             const st = liveLanes[lk] || {};
-            return st.status === 'RUNNING' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
+            return st.status === 'RUNNING' || st.status === 'PAUSED' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
           };
           const activeEntries = ordered.filter(([lk]) => isSlotInUse(lk));
           const recentLogEntries = ordered.filter(([lk]) => {
@@ -5537,20 +5537,24 @@ export default function App() {
           const renderLaneCard = ([lk, meta], layoutMode = 'sidebar') => {
             const st = liveLanes[lk] || {};
             const isRun = st.status === 'RUNNING';
+            const isPaused = st.status === 'PAUSED';
+            const isActiveOrPaused = isRun || isPaused;
             const isPrimaryRun = isRun && lk === primaryRunningKey;
             const isSel = selectedMonitorLane === lk;
-            const hasSub = isRun && safeNum(st.sub_total, 0) > 0;
+            const hasSub = isActiveOrPaused && safeNum(st.sub_total, 0) > 0;
             const hasCards = safeNum(st.total_cards, 0) > 0;
             const hasSubsets = safeNum(st.total_subsets, 0) > 0;
             const cpsVal = safeNum(st.cards_per_sec, 0);
             const speedBadge = cpsVal >= 1 ? `${cpsVal.toFixed(1)} cards/s` : (cpsVal > 0 ? `${(cpsVal * 60).toFixed(1)} cards/min` : '');
             const hasRealTitle = Boolean(st.process_name || (st.title && !String(st.title).endsWith(': Idle')));
-            const procIcon = (isRun || hasRealTitle) && st.job_icon ? st.job_icon : meta.icon;
-            const procTitle = (isRun || hasRealTitle) ? (st.process_name || st.title || meta.shortName) : meta.shortName;
+            const procIcon = (isActiveOrPaused || hasRealTitle) && st.job_icon ? st.job_icon : meta.icon;
+            const procTitle = (isActiveOrPaused || hasRealTitle) ? (st.process_name || st.title || meta.shortName) : meta.shortName;
             const activeSetLbl = st.active_set_name && st.active_set_name !== procTitle ? st.active_set_name : '';
             const subDisplayName = st.sub_name || st.sub_label || 'Active Subset';
 
-            const cardVisualClass = isPrimaryRun
+            const cardVisualClass = isPaused
+              ? 'bg-amber-950/45 border-amber-500/60 text-amber-100 ring-1 ring-amber-400/40 shadow-lg'
+              : isPrimaryRun
               ? `${skin.accentActive} ring-1 ring-cyan-400/50 shadow-lg`
               : isRun
               ? (isSel ? 'bg-emerald-950/55 border-emerald-400/70 text-emerald-100 ring-1 ring-emerald-400/40 shadow-lg' : 'bg-emerald-950/35 border-emerald-500/40 text-emerald-100 shadow')
@@ -5591,15 +5595,15 @@ export default function App() {
                 className={`${widthCls} min-w-0 overflow-hidden p-3 rounded-xl border cursor-pointer transition-all duration-200 flex flex-col justify-start gap-2 ${cardVisualClass}`}
               >
                 <div className="flex items-start justify-between gap-2 text-[11px] min-w-0">
-                  <span className={`font-bold leading-snug break-words whitespace-normal min-w-0 ${isRun ? 'text-white' : 'text-slate-300'}`}>
+                  <span className={`font-bold leading-snug break-words whitespace-normal min-w-0 ${isActiveOrPaused ? 'text-white' : 'text-slate-300'}`}>
                     {procIcon} {procTitle}
                   </span>
-                  <span className={`font-mono text-[10px] shrink-0 ${isRun ? 'text-emerald-300 font-extrabold' : 'text-slate-500'}`}>
-                    {isRun ? `🟢 ${st.percent || 0}%` : (st.status || 'IDLE')}
+                  <span className={`font-mono text-[10px] shrink-0 ${isPaused ? 'text-amber-300 font-extrabold' : isRun ? 'text-emerald-300 font-extrabold' : 'text-slate-500'}`}>
+                    {isPaused ? `⏸️ PAUSED (${st.percent || 0}%)` : isRun ? `🟢 ${st.percent || 0}%` : (st.status || 'IDLE')}
                   </span>
                 </div>
 
-                {isRun ? (
+                {isActiveOrPaused ? (
                   <div className="space-y-2 min-w-0">
                     {/* TIER 1: OVERALL CARD-BASED PROGRESS + ACTIVE SET NAME */}
                     <div className="space-y-1 min-w-0">
@@ -5653,20 +5657,50 @@ export default function App() {
                       </div>
                     )}
 
-                    {/* CURRENT CARD / URL (WRAPS CLEANLY INSIDE CARD) + STOP BUTTON */}
+                    {isPaused && (st.pause_reason || st.current_item) && (
+                      <div className="px-2 py-1.5 rounded-lg bg-amber-950/80 border border-amber-500/50 text-[10px] text-amber-200 leading-snug break-words whitespace-normal">
+                        ⏸️ {st.pause_reason || st.current_item}
+                      </div>
+                    )}
+
+                    {/* CURRENT CARD / URL (WRAPS CLEANLY INSIDE CARD) + PAUSE/RESUME + STOP BUTTONS */}
                     <div className="flex items-start justify-between gap-2 text-[10px] text-slate-300 pt-0.5 min-w-0">
                       <span className="flex-1 min-w-0 leading-snug [overflow-wrap:anywhere] whitespace-normal">
                         {st.current_item}
                       </span>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          fetch(`${NODE_API_BASE}/jobs/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
-                        }}
-                        className="px-2 py-0.5 rounded bg-rose-900/90 text-rose-100 hover:bg-rose-700 font-bold shrink-0"
-                      >
-                        Stop
-                      </button>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {isRun && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              fetch(`${NODE_API_BASE}/jobs/pause`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
+                            }}
+                            className="px-2 py-0.5 rounded bg-amber-700/90 text-amber-50 hover:bg-amber-600 font-bold shrink-0"
+                          >
+                            Pause
+                          </button>
+                        )}
+                        {isPaused && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              fetch(`${NODE_API_BASE}/jobs/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
+                            }}
+                            className="px-2 py-0.5 rounded bg-emerald-700/90 text-emerald-50 hover:bg-emerald-600 font-bold shrink-0"
+                          >
+                            Resume
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            fetch(`${NODE_API_BASE}/jobs/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: lk }) }).catch(() => {});
+                          }}
+                          className="px-2 py-0.5 rounded bg-rose-900/90 text-rose-100 hover:bg-rose-700 font-bold shrink-0"
+                        >
+                          Stop
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ) : (
@@ -6019,23 +6053,26 @@ export default function App() {
                 const { ordered, primaryRunningKey } = getOrderedLanes();
                 const activeTopBar = ordered.filter(([lk]) => {
                   const st = liveLanes[lk] || {};
-                  return st.status === 'RUNNING' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
+                  return st.status === 'RUNNING' || st.status === 'PAUSED' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
                 });
                 if (activeTopBar.length === 0) return null;
                 return activeTopBar.map(([lk, meta]) => {
                   const st = liveLanes[lk] || {};
                   const isRun = st.status === 'RUNNING';
+                  const isPausedTop = st.status === 'PAUSED';
                   const isPrim = isRun && lk === primaryRunningKey;
-                  const bIcon = st.job_icon || meta.icon;
+                  const bIcon = isPausedTop ? '⏸️' : (st.job_icon || meta.icon);
                   const bTitle = st.process_name || st.title || meta.shortName;
-                  const tip = `${bTitle}: ${st.percent || 0}%${safeNum(st.total_cards, 0) > 0 ? ` (${Number(st.completed_cards || 0).toLocaleString()}/${Number(st.total_cards).toLocaleString()} Cards)` : ''}${st.sub_name ? ` | ${st.sub_name} (${Number(st.sub_current || 0).toLocaleString()}/${Number(st.sub_total).toLocaleString()})` : ''} | Elapsed ${fmtEta(getLaneElapsedSec(st))} | ETA ${fmtEta(st.eta_seconds)}`;
+                  const tip = `${bTitle}: ${isPausedTop ? 'PAUSED' : `${st.percent || 0}%`}${safeNum(st.total_cards, 0) > 0 ? ` (${Number(st.completed_cards || 0).toLocaleString()}/${Number(st.total_cards).toLocaleString()} Cards)` : ''}${st.sub_name ? ` | ${st.sub_name} (${Number(st.sub_current || 0).toLocaleString()}/${Number(st.sub_total).toLocaleString()})` : ''} | Elapsed ${fmtEta(getLaneElapsedSec(st))} | ETA ${fmtEta(st.eta_seconds)}`;
                   return (
                     <button
                       key={lk}
                       title={`${tip} — Click to open Full-Page Monitor`}
                       onClick={() => openMonitorPage(lk)}
                       className={`rounded-xl border transition-all flex items-center gap-1.5 shrink-0 ${
-                        isPrim
+                        isPausedTop
+                          ? 'bg-amber-950/60 border-amber-500/60 text-amber-200 px-2.5 py-1'
+                          : isPrim
                           ? `${skin.accentActive} px-2.5 py-1 shadow-md`
                           : 'bg-emerald-950/60 border-emerald-600/60 text-emerald-200 px-2.5 py-1'
                       }`}
@@ -6365,7 +6402,7 @@ export default function App() {
               const { ordered: dashOrderedLanes } = getOrderedLanes();
               const runningDashLanes = dashOrderedLanes.filter(([lk]) => {
                 const st = liveLanes[lk] || {};
-                return st.status === 'RUNNING' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
+                return st.status === 'RUNNING' || st.status === 'PAUSED' || (Array.isArray(st.queued_jobs) && st.queued_jobs.length > 0);
               });
 
               // Smart Interactive Task To-Do Hub (Priority-Sorted: urgent -> action -> maintenance)

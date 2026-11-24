@@ -97,6 +97,8 @@ from Core.scraper_engine import (
     run_breakninja_pipeline,
     run_tcdb_checklist_pipeline,
     set_log_callback,
+    set_pause_check_callback,
+    set_pause_state_callback,
     set_progress_callback,
     set_stop_check_callback,
     sync_set_library_download_status,
@@ -302,7 +304,7 @@ def _is_slot_currently_busy(slot_key: str) -> tuple[bool, dict]:
     Does not treat an orphaned queue file on a stopped/dead slot as permanently busy.
     """
     st = get_active_job_state(lane=slot_key)
-    if st.get("status") == "RUNNING":
+    if st.get("status") in ("RUNNING", "PAUSED"):
         return True, st
     pid = int(st.get("pid", 0) or 0)
     if pid > 0 and _is_pid_running(pid):
@@ -312,7 +314,7 @@ def _is_slot_currently_busy(slot_key: str) -> tuple[bool, dict]:
 
 def _find_running_heavy_tcdb_slot(exclude_slot: Optional[str] = None) -> tuple[Optional[str], int]:
     """
-    Returns `(slot_key, pid)` if any worker slot is currently running OR has queued
+    Returns `(slot_key, pid)` if any worker slot is currently running/paused OR has queued
     a TCDB rate-limited scraper.
     """
     excl = base_lane_from_slot(exclude_slot) if exclude_slot else None
@@ -320,7 +322,7 @@ def _find_running_heavy_tcdb_slot(exclude_slot: Optional[str] = None) -> tuple[O
         if excl and sk == excl:
             continue
         st = get_active_job_state(lane=sk)
-        if st.get("status") == "RUNNING":
+        if st.get("status") in ("RUNNING", "PAUSED"):
             if _is_tcdb_rate_limited_job(st.get("job_type", ""), title=st.get("title", "")):
                 return sk, int(st.get("pid", 0))
         for q_item in load_lane_job_queue(sk):
@@ -364,6 +366,63 @@ def get_lane_log_file(lane: str) -> Path:
     base = base_lane_from_slot(s)
     suffix = s if s.startswith(base + "__p") else base
     return LOGS_DIR / f"job_log_{suffix}.log"
+
+
+def get_lane_pause_file(lane: str) -> Path:
+    s = str(lane or "slot_1").strip()
+    base = base_lane_from_slot(s)
+    suffix = s if s.startswith(base + "__p") else base
+    return LOGS_DIR / f"job_pause_{suffix}.flag"
+
+
+def is_lane_paused(lane: str) -> bool:
+    return get_lane_pause_file(lane).exists()
+
+
+def pause_active_job(lane: Optional[str] = None, reason: str = "") -> bool:
+    ensure_directories()
+    target_lane = str(lane or "slot_1").strip()
+    pause_msg = str(reason or "Paused by user — click Resume to continue").strip()
+    pause_file = get_lane_pause_file(target_lane)
+    atomic_write_text(
+        pause_file,
+        json.dumps({"paused_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "reason": pause_msg, "lane": target_lane}),
+        encoding="utf-8",
+    )
+    state = get_active_job_state(lane=target_lane)
+    if state.get("status") == "RUNNING":
+        state["status"] = "PAUSED"
+        state["pause_reason"] = pause_msg
+        state["current_item"] = pause_msg[:180]
+        state["updated_epoch"] = time.time()
+        state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _atomic_write_json_file(get_lane_state_file(target_lane), state)
+        _atomic_write_json_file(ACTIVE_JOB_STATE_FILE, state)
+    append_job_log(f"⏸️ Pause requested ({pause_msg}).", lane=target_lane)
+    return True
+
+
+def resume_active_job(lane: Optional[str] = None) -> bool:
+    ensure_directories()
+    target_lane = str(lane or "slot_1").strip()
+    pause_file = get_lane_pause_file(target_lane)
+    try:
+        pause_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+    state = get_active_job_state(lane=target_lane)
+    if state.get("status") == "PAUSED":
+        pid = int(state.get("pid", 0) or 0)
+        if pid == 0 or _is_pid_running(pid):
+            state["status"] = "RUNNING"
+            state["pause_reason"] = ""
+            state["current_item"] = "Resuming..."
+            state["updated_epoch"] = time.time()
+            state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _atomic_write_json_file(get_lane_state_file(target_lane), state)
+            _atomic_write_json_file(ACTIVE_JOB_STATE_FILE, state)
+    append_job_log("▶️ Resume requested.", lane=target_lane)
+    return True
 
 
 def get_lane_queue_file(lane: str) -> Path:
@@ -524,6 +583,10 @@ def get_active_job_logs(max_lines: int = 500, lane: Optional[str] = None) -> str
 def stop_active_job(lane: Optional[str] = None) -> bool:
     state = get_active_job_state(lane=lane)
     target_lane = state.get("lane", lane or "slot_1")
+    try:
+        get_lane_pause_file(target_lane).unlink(missing_ok=True)
+    except Exception:
+        pass
     pid = int(state.get("pid", 0))
     if pid > 0 and _is_pid_running(pid):
         try:
@@ -640,6 +703,10 @@ def start_or_queue_background_job(
 
         target_slot = idle_slot
         base_lane = idle_slot
+        try:
+            get_lane_pause_file(target_slot).unlink(missing_ok=True)
+        except Exception:
+            pass
 
         lane_log_file = get_lane_log_file(target_slot)
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1115,7 +1182,7 @@ def get_active_job_state(lane: Optional[str] = None) -> dict:
     if not isinstance(state, dict):
         return _default_idle_state(clean_lane)
 
-    if state.get("status") == "RUNNING":
+    if state.get("status") in ("RUNNING", "PAUSED"):
         now_t = time.time()
         s_ep = float(state.get("start_epoch", now_t))
         upd_ep = float(state.get("updated_epoch", s_ep))
@@ -1127,6 +1194,10 @@ def get_active_job_state(lane: Optional[str] = None) -> dict:
             state["pid"] = 0
             state["current_item"] = "Worker exited unexpectedly."
             _atomic_write_json_file(sf, state)
+            try:
+                get_lane_pause_file(clean_lane).unlink(missing_ok=True)
+            except Exception:
+                pass
         else:
             state["elapsed_seconds"] = round(max(0.0, now_t - s_ep), 1)
             if state.get("sub_start_epoch"):
@@ -1160,6 +1231,7 @@ def write_job_state(
     eta_override: Optional[float] = None,
     sub_eta_override: Optional[float] = None,
     percent_override: Optional[float] = None,
+    pause_reason: str = "",
 ):
     """Atomic job state writer preventing half-written JSON reads by the live UI poller."""
     ensure_directories()
@@ -1223,6 +1295,7 @@ def write_job_state(
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "pid": int(pid),
         "error_msg": str(error_msg),
+        "pause_reason": str(pause_reason or ""),
     }
     _atomic_write_json_file(get_lane_state_file(lane), state_payload)
     _atomic_write_json_file(ACTIVE_JOB_STATE_FILE, state_payload)
@@ -1401,7 +1474,7 @@ def run_background_job_from_file(payload_path: Path):
             try:
                 if sf_hb.exists():
                     st_now = json.loads(sf_hb.read_text(encoding="utf-8-sig"))
-                    if st_now.get("status") == "RUNNING" and int(st_now.get("pid", 0)) in (my_pid, 0):
+                    if st_now.get("status") in ("RUNNING", "PAUSED") and int(st_now.get("pid", 0)) in (my_pid, 0):
                         now_h = time.time()
                         st_now["pid"] = my_pid
                         st_now["updated_epoch"] = now_h
@@ -1426,9 +1499,20 @@ def run_background_job_from_file(payload_path: Path):
             pass
         return False
 
+    def _pause_check_cb() -> bool:
+        return is_lane_paused(target_lane)
+
+    def _pause_state_cb(paused: bool, reason: str = ""):
+        if paused:
+            pause_active_job(lane=target_lane, reason=reason)
+        else:
+            resume_active_job(lane=target_lane)
+
     set_log_callback(_worker_log_cb)
     set_progress_callback(_structured_progress_cb)
     set_stop_check_callback(_stop_check_cb)
+    set_pause_check_callback(_pause_check_cb)
+    set_pause_state_callback(_pause_state_cb)
 
     # Initialize GPU acceleration (DirectML/CUDA OCR + OpenCL UMat) & claim VRAM guardrail slot for vision jobs
     init_worker_compute_backend(job_type=job_type, log_cb=_worker_log_cb)
@@ -2065,6 +2149,12 @@ def run_background_job_from_file(payload_path: Path):
         set_log_callback(None)
         set_progress_callback(None)
         set_stop_check_callback(None)
+        set_pause_check_callback(None)
+        set_pause_state_callback(None)
+        try:
+            get_lane_pause_file(target_lane).unlink(missing_ok=True)
+        except Exception:
+            pass
         base_lane = base_lane_from_slot(target_lane)
         if not was_stopped:
             next_item = pop_next_queued_job(base_lane)

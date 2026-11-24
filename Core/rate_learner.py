@@ -71,42 +71,62 @@ DEFAULT_ENDPOINT_PROFILES: dict[str, dict] = {
 DEFAULT_ETA_MODELS: dict[str, dict] = {
     "checklist_only": {
         "ema_sec_per_subset": 3.0,
+        "ema_sec_per_skipped_subset": 0.15,
+        "ema_sec_per_deep_dived_subset": 3.0,
         "ema_sec_per_card": 0.032,
         "ema_sec_per_dl_card": 0.032,
         "ema_sec_per_skip_card": 0.015,
         "subset_samples": 0,
+        "skipped_subset_samples": 0,
+        "deep_dived_subset_samples": 0,
         "card_samples": 0,
     },
     "checklist_and_images": {
         "ema_sec_per_subset": 32.0,
+        "ema_sec_per_skipped_subset": 0.25,
+        "ema_sec_per_deep_dived_subset": 32.0,
         "ema_sec_per_card": 0.85,
         "ema_sec_per_dl_card": 4.80,
         "ema_sec_per_skip_card": 0.035,
         "subset_samples": 0,
+        "skipped_subset_samples": 0,
+        "deep_dived_subset_samples": 0,
         "card_samples": 0,
     },
     "images_only": {
         "ema_sec_per_subset": 28.0,
+        "ema_sec_per_skipped_subset": 0.25,
+        "ema_sec_per_deep_dived_subset": 28.0,
         "ema_sec_per_card": 0.65,
         "ema_sec_per_dl_card": 4.60,
         "ema_sec_per_skip_card": 0.006,
         "subset_samples": 0,
+        "skipped_subset_samples": 0,
+        "deep_dived_subset_samples": 0,
         "card_samples": 0,
     },
     "upgrade": {
         "ema_sec_per_subset": 4.5,
+        "ema_sec_per_skipped_subset": 0.15,
+        "ema_sec_per_deep_dived_subset": 4.5,
         "ema_sec_per_card": 0.08,
         "ema_sec_per_dl_card": 2.60,
         "ema_sec_per_skip_card": 0.025,
         "subset_samples": 0,
+        "skipped_subset_samples": 0,
+        "deep_dived_subset_samples": 0,
         "card_samples": 0,
     },
     "missing_back": {
         "ema_sec_per_subset": 12.0,
+        "ema_sec_per_skipped_subset": 0.15,
+        "ema_sec_per_deep_dived_subset": 12.0,
         "ema_sec_per_card": 0.45,
         "ema_sec_per_dl_card": 2.60,
         "ema_sec_per_skip_card": 0.01,
         "subset_samples": 0,
+        "skipped_subset_samples": 0,
+        "deep_dived_subset_samples": 0,
         "card_samples": 0,
     },
 }
@@ -491,17 +511,34 @@ class AdaptiveRateLearner:
         card_count: int = 0,
         downloaded_cards: int = 0,
         skipped_cards: int = 0,
+        was_skipped: bool = False,
     ):
-        dur = max(0.05, float(duration_sec or 0.0))
+        dur = max(0.01 if was_skipped else 0.05, float(duration_sec or 0.0))
         mk = str(mode_key or "checklist_and_images")
         with self._lock:
             models = self._state.setdefault("eta_models", {})
             m = models.setdefault(mk, dict(DEFAULT_ETA_MODELS.get(mk, DEFAULT_ETA_MODELS["checklist_and_images"])))
+
+            if was_skipped:
+                sk_cnt = int(m.get("skipped_subset_samples", 0))
+                alpha_sk = 0.35 if sk_cnt < 10 else 0.12
+                prev_sk_sub = float(m.get("ema_sec_per_skipped_subset", 0.20))
+                m["ema_sec_per_skipped_subset"] = round((1.0 - alpha_sk) * prev_sk_sub + alpha_sk * dur, 4)
+                m["skipped_subset_samples"] = sk_cnt + 1
+                self._save_state(force=False)
+                return
+
             s_cnt = int(m.get("subset_samples", 0))
             alpha_s = 0.35 if s_cnt < 10 else 0.12
             prev_s = float(m.get("ema_sec_per_subset", 25.0))
             m["ema_sec_per_subset"] = round((1.0 - alpha_s) * prev_s + alpha_s * dur, 3)
             m["subset_samples"] = s_cnt + 1
+
+            dd_cnt = int(m.get("deep_dived_subset_samples", 0))
+            alpha_dd = 0.35 if dd_cnt < 10 else 0.12
+            prev_dd = float(m.get("ema_sec_per_deep_dived_subset", prev_s))
+            m["ema_sec_per_deep_dived_subset"] = round((1.0 - alpha_dd) * prev_dd + alpha_dd * dur, 3)
+            m["deep_dived_subset_samples"] = dd_cnt + 1
 
             if card_count > 0:
                 obs_spc = dur / float(card_count)
@@ -520,6 +557,21 @@ class AdaptiveRateLearner:
                     m["ema_sec_per_skip_card"] = round(0.80 * prev_sk + 0.20 * (dur / float(skipped_cards)), 4)
 
             self._save_state(force=True)
+
+    def estimate_incremental_subsets_eta(
+        self,
+        mode_key: str,
+        remaining_skipped_subsets: int,
+        remaining_deep_dived_subsets: int,
+    ) -> float:
+        priors = self.get_eta_priors(mode_key)
+        ema_sk = max(0.01, float(priors.get("ema_sec_per_skipped_subset", 0.20)))
+        ema_dd = max(0.1, float(priors.get("ema_sec_per_deep_dived_subset", priors.get("ema_sec_per_subset", 10.0))))
+        return round(
+            max(0, int(remaining_skipped_subsets)) * ema_sk
+            + max(0, int(remaining_deep_dived_subsets)) * ema_dd,
+            2,
+        )
 
     def estimate_card_based_etas(
         self,
